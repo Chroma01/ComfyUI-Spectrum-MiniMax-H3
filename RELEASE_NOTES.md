@@ -1,6 +1,12 @@
-# Spectrum MiniMax H3 v0.1.0
+# Spectrum MiniMax H3 v0.1.1
 
-Initial alpha release of the standalone Spectrum-style acceleration node for ComfyUI's native MiniMax H3 audio-video model.
+Corrective release for the ComfyUI custom-node entry point.
+
+## Fixed
+
+- Load the bundled `comfyui_spectrum_h3` implementation through the custom-node package itself, matching ComfyUI's isolated directory loader.
+- Preserve direct source-checkout imports used by development and packaging checks.
+- Add a regression test that loads the node from an isolated, hyphenated custom-node directory without placing that directory on `sys.path`.
 
 ## Highlights
 
@@ -13,7 +19,7 @@ Initial alpha release of the standalone Spectrum-style acceleration node for Com
 ## Validation
 
 - GitHub Actions passes against native ComfyUI commit `e377e263049f9338b4d12a3dd417b36ae62948ff`.
-- 37 automated tests cover forecasting mathematics, scheduling, rollback, clone isolation, native-path equivalence, and zero transformer-block execution on forecast steps.
+- Automated tests cover forecasting mathematics, scheduling, rollback, clone isolation, the actual ComfyUI loader shape, native-path equivalence, and zero transformer-block execution on forecast steps.
 - CodeRabbit review feedback was evaluated and all review threads were resolved.
 
 ## Current limits
