@@ -1,0 +1,54 @@
+# MiniMax H3 integration notes
+
+Source review date: 2026-08-03
+
+Reviewed native ComfyUI commit: `e377e263049f9338b4d12a3dd417b36ae62948ff`
+
+Reviewed Spectrum paper: arXiv `2603.01623v1`
+
+Reviewed official Spectrum implementation commit: `11f317a87352e2c67daa2fac5a971cf04233d7d1`
+
+The separate `ComfyUI-Spectrum-Proper` repository was inspected only for ComfyUI wrapper and clone-lifetime lessons. This repository does not import it, depend on it, or share code or runtime state with it.
+
+## Native execution path
+
+1. `comfy.samplers.CFGGuider.sample` packs the nested MiniMax H3 video/audio latent pair for sampler integration.
+2. `CFGGuider.outer_sample` prepares the cloned `ModelPatcher`, then `CFGGuider.inner_sample` copies model options and writes the supplied sigma sequence to `transformer_options["sample_sigmas"]`.
+3. A stock k-diffusion sampler calls `KSamplerX0Inpaint`, then `CFGGuider.outer_predict_noise` invokes `PREDICT_NOISE` wrappers around `CFGGuider.predict_noise`.
+4. `sampling_function` and `calc_cond_batch` form conditional/unconditional model calls. Each call receives copied/merged transformer options containing `cond_or_uncond`, `uuids`, the current `sigmas`, the full `sample_sigmas`, user patches, replacement patches, hooks, and model-management data.
+5. `comfy.model_base.MiniMaxH3._apply_model` converts the flat sampler latent back to the native pair `[video, audio]`, maps sampler sigma through `model_sampling.timestep`, copies transformer options, and calls `MiniMaxH3Model.forward`.
+6. `MiniMaxH3Model.forward` invokes ComfyUI `DIFFUSION_MODEL` wrappers around `MiniMaxH3Model._forward`.
+7. `_forward` pads video to the model patch geometry, resolves or constructs `PackedLayout`, derives video and audio timesteps from the current video sigma and both sigma shifts, builds modality/timestep modulation segments, embeds target and conditioning rows, builds RoPE, and runs every transformer block. Per-block replacement patches and the native prefetch queue are applied inside this loop.
+8. The packed sequence is `[text | optional keyframe/reference segments | target audio | target video]`. `PackedLayout.segments` proves that the target audio and target video spans are the final two contiguous segments, in that order.
+9. Immediately after the final transformer block, the packed hidden tensor contains the desired forecast target. Only the target audio and target video rows are cached, as a compact tensor ordered `[target audio rows | target video rows]`. Text, keyframe, image-reference, video-reference, and audio-reference rows are excluded.
+10. `FinalLayer.forward` consumes the current hidden rows plus the current exact timestep embeddings. It independently normalizes/modulates target video and target audio rows, then executes the checkpoint's FP32 output heads.
+11. Native reconstruction unpatchifies video, unpacks stereo channel-major audio, applies the video-to-audio sigma-map derivative, and returns `[-video_velocity, -audio_slope * audio_velocity]`. `BaseModel._apply_model` packs this native pair again for the sampler and applies the native denoised conversion.
+
+## Integration invariant
+
+The acceleration boundary is the post-final-block hidden feature immediately before `FinalLayer`. Actual steps run the native `_forward` unchanged, with a call-local wrapper around the existing final-block replacement solely to observe its output. Forecast steps compute only current layout and output-head timestep state, predict the compact target feature, remap its audio/video segments to the compact tensor, then call the native final layer and native reconstruction helpers.
+
+This preserves:
+
+- current video and audio timestep conditioning;
+- sigma-shift mapping and audio derivative scaling;
+- output-head weights and FP32 islands;
+- video unpatchification and audio unpacking;
+- native return structure;
+- existing transformer replacement patches on actual steps;
+- native prefetch/model-management behavior on actual steps;
+- clone-local runtime selection through call-local transformer options.
+
+## Sampler contract
+
+Solver-step IDs are assigned by a `PREDICT_NOISE` wrapper inside an `OUTER_SAMPLE` run transaction. Forecasting is initially allowlisted only for native `sample_euler` and `sample_euler_ancestral`, whose current implementations perform exactly one `predict_noise` call per solver iteration. Other samplers remain native and report a debug fallback reason.
+
+Coordinates are derived from the actual supplied sigma sequence. Evaluated sigma values are affinely normalized between the run's evaluated minimum and maximum into `[-1, 1]`; no fixed step count is assumed.
+
+## Forecast memory model
+
+The forecaster stores at most `max_history` detached model-dtype snapshots on CPU. It solves only for history weights:
+
+`w(t*) = phi(t*) (Phi^T Phi + lambda I)^-1 Phi^T`
+
+Spectral and two-point linear weights are combined before feature streaming. Prediction reads one bounded chunk from one history snapshot at a time, accumulates that chunk in FP32 on the output device, and writes the final model-dtype feature. No persistent full-feature FP32 right-hand side or coefficient tensor is created.
