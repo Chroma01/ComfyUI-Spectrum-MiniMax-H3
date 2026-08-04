@@ -115,8 +115,12 @@ Forecasting is currently allowlisted for:
 
 - Euler (`sample_euler`)
 - Euler ancestral (`sample_euler_ancestral`, including ComfyUI's flow-model path)
+- RES multistep (`sample_res_multistep`)
+- RES multistep CFG++ (`sample_res_multistep_cfg_pp`)
+- RES multistep ancestral (`sample_res_multistep_ancestral`)
+- RES multistep ancestral CFG++ (`sample_res_multistep_ancestral_cfg_pp`)
 
-The reviewed implementations make one `predict_noise` call per solver iteration. Other samplers execute native MiniMax H3. Debug mode logs the exact fallback reason. Multi-GPU parallel sampling also remains native because distributed forecast-row transactions are not yet validated.
+The reviewed implementations make one `predict_noise` call per solver iteration. RES multistep reuses the previous denoised result in its solver update without making an additional model call. Other samplers execute native MiniMax H3. Debug mode logs the exact fallback reason. Multi-GPU parallel sampling also remains native because distributed forecast-row transactions are not yet validated.
 
 ## Memory design
 

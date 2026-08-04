@@ -17,7 +17,16 @@ ACTUAL_KEY = "spectrum_h3_actual"
 REASON_KEY = "spectrum_h3_reason"
 WRAPPER_KEY = "spectrum_minimax_h3"
 
-SUPPORTED_SINGLE_CALL_SAMPLERS = frozenset({"sample_euler", "sample_euler_ancestral"})
+SUPPORTED_SINGLE_CALL_SAMPLERS = frozenset(
+    {
+        "sample_euler",
+        "sample_euler_ancestral",
+        "sample_res_multistep",
+        "sample_res_multistep_cfg_pp",
+        "sample_res_multistep_ancestral",
+        "sample_res_multistep_ancestral_cfg_pp",
+    }
+)
 
 
 @dataclass(slots=True)

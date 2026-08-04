@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfyui-spectrum-minimax-h3"
-version = "0.1.1"
+version = "0.1.2"
 description = "Spectrum-style spectral feature forecasting for native ComfyUI MiniMax H3"
 readme = "README.md"
 requires-python = ">=3.10"
