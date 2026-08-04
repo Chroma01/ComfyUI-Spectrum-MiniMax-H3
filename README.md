@@ -13,9 +13,9 @@ Spectrum is an approximate accelerator, not a lossless or bit-identical executio
 Initial testing did not reveal obvious differences in several outputs, but broader exact-seed A/B testing has since exposed two distinct kinds of changes:
 
 - **Trajectory deviations:** during fast or brief actions, the motion, pose, timing, gaze, or action path can diverge from the fully native run. For example, a subject may look up, move differently, or follow a different short motion than in the native output.
-- **Localized quality degradation:** some outputs show malformed or unstable fine details, especially eyes, fingers, fingernails, and other small articulated features.
+- **Localized quality degradation during fast motion:** when eyes, fingers, fingernails, or other small articulated details move quickly or are visible only briefly, those details can become malformed or unstable.
 
-These effects can occur independently or together. A rapid action may simply follow a different trajectory without obvious local artifacting, while another output may also show visible degradation in the affected details. Further local testing and user reports have shown both behaviors. These are qualitative observations rather than a controlled quality benchmark; the effect varies with the prompt, motion, sampler, resolution, references, and Spectrum settings.
+These effects can occur independently or together. A rapid action may simply follow a different trajectory without obvious artifacting, while in another output the fast-moving or briefly visible details may also degrade. Further local testing and user reports have shown both behaviors. These are qualitative observations rather than a controlled quality benchmark; the effect varies with the prompt, motion, sampler, resolution, references, and Spectrum settings.
 
 Use Spectrum when the speed benefit is worth possible output differences. Disable it when maximum fidelity to the native MiniMax H3 trajectory is more important. For quality-critical work, compare the same prompt and seed with Spectrum enabled and disabled.
 
@@ -197,7 +197,7 @@ Automated tests cover:
 - exact native versus wrapped forced-actual video/audio output on a deterministic tiny native H3 fixture;
 - proof that a forecast fixture invokes zero H3 transformer blocks.
 
-No full MiniMax H3 checkpoint is available in the automated environment. The supplied real-checkpoint A/B runs validate the 0.5 MP VRAM allocation and show a small, variable timing benefit. Exact-seed full-checkpoint comparisons have also shown both trajectory deviations during fast or brief actions and localized degradation in details such as eyes, fingers, and fingernails. These effects can occur separately or together. Other resolutions, durations, CFG topologies, reference modes, hardware, decoded video metrics, audio metrics, and audiovisual synchronization remain unverified. Spectrum must not be treated as lossless or output-identical to native sampling.
+No full MiniMax H3 checkpoint is available in the automated environment. The supplied real-checkpoint A/B runs validate the 0.5 MP VRAM allocation and show a small, variable timing benefit. Exact-seed full-checkpoint comparisons have also shown both trajectory deviations during fast or brief actions and localized degradation in rapidly moving or briefly visible details such as eyes, fingers, and fingernails. These effects can occur separately or together. Other resolutions, durations, CFG topologies, reference modes, hardware, decoded video metrics, audio metrics, and audiovisual synchronization remain unverified. Spectrum must not be treated as lossless or output-identical to native sampling.
 
 ## Tests
 
