@@ -4,16 +4,17 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "comfyui-spectrum-minimax-h3"
-version = "0.1.2"
-description = "Spectrum-style spectral feature forecasting for native ComfyUI MiniMax H3"
+description = "A ComfyUI custom node implementing Spectrum spectral feature forecasting for native MiniMax H3 audio-video generation."
+version = "0.1.3"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "GPL-3.0-or-later" }
+license = { file = "LICENSE" }
 authors = [{ name = "xmarre" }]
 keywords = ["comfyui", "minimax-h3", "spectrum", "diffusion", "video", "audio"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: GNU General Public License v3 or later (GPLv3+)",
+  "Operating System :: OS Independent",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
@@ -23,12 +24,14 @@ dependencies = []
 
 [project.urls]
 Repository = "https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3"
-Issues = "https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues"
+Documentation = "https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/wiki"
+"Bug Tracker" = "https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues"
 
 [tool.comfy]
 PublisherId = "xmarre"
-DisplayName = "Spectrum MiniMax H3"
+DisplayName = "ComfyUI-Spectrum-MiniMax-H3"
 Icon = ""
+includes = []
 
 [tool.setuptools.packages.find]
 include = ["comfyui_spectrum_h3*"]

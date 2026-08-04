@@ -20,11 +20,15 @@ WRAPPER_KEY = "spectrum_minimax_h3"
 SUPPORTED_SINGLE_CALL_SAMPLERS = frozenset(
     {
         "sample_euler",
-        "sample_euler_ancestral",
         "sample_res_multistep",
         "sample_res_multistep_cfg_pp",
-        "sample_res_multistep_ancestral",
-        "sample_res_multistep_ancestral_cfg_pp",
+    }
+)
+
+RES_MULTISTEP_SAMPLERS = frozenset(
+    {
+        "sample_res_multistep",
+        "sample_res_multistep_cfg_pp",
     }
 )
 
@@ -41,6 +45,19 @@ def sampler_name(sampler: Any) -> str:
 
 def sampler_is_supported(sampler: Any) -> bool:
     return sampler_name(sampler) in SUPPORTED_SINGLE_CALL_SAMPLERS
+
+
+def max_consecutive_forecasts(sampler: Any) -> int | None:
+    return 1 if sampler_is_supported(sampler) else None
+
+
+def min_actual_steps_after_forecast(sampler: Any) -> int:
+    name = sampler_name(sampler)
+    return 1 if name in SUPPORTED_SINGLE_CALL_SAMPLERS else 0
+
+
+def min_tail_actual_steps(sampler: Any) -> int:
+    return 3 if sampler_name(sampler) in RES_MULTISTEP_SAMPLERS else 0
 
 
 def _binding_from_model_options(model_options: dict[str, Any] | None) -> SpectrumH3Binding | None:
@@ -94,7 +111,14 @@ def outer_sample_wrapper(
 
     runtime = binding.runtime
     name = sampler_name(sampler)
-    run_id = runtime.start_run(sigmas, name, supported_sampler=sampler_is_supported(sampler))
+    run_id = runtime.start_run(
+        sigmas,
+        name,
+        supported_sampler=sampler_is_supported(sampler),
+        max_consecutive_forecasts=max_consecutive_forecasts(sampler),
+        min_actual_steps_after_forecast=min_actual_steps_after_forecast(sampler),
+        min_tail_actual_steps=min_tail_actual_steps(sampler),
+    )
     if runtime.config.debug:
         LOG.warning(
             "Spectrum H3 run start run_id=%s sampler=%s steps=%s supported=%s",

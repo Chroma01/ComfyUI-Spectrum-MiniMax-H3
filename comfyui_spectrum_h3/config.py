@@ -13,7 +13,7 @@ class SpectrumH3Config:
     window_size: float = 2.0
     flex_window: float = 0.75
     warmup_steps: int = 5
-    tail_actual_steps: int = 3
+    tail_actual_steps: int = 1
     max_history: int = 8
     debug: bool = False
     force_actual: bool = False
@@ -66,5 +66,5 @@ CONSERVATIVE_PRESET = SpectrumH3Config()
 AGGRESSIVE_PRESET = SpectrumH3Config(
     blend_weight=0.75,
     flex_window=3.0,
-    tail_actual_steps=2,
+    tail_actual_steps=1,
 )

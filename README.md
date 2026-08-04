@@ -56,7 +56,7 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 | `window_size` | `2.0` | Initial adaptive interval. |
 | `flex_window` | `0.75` | Amount added to the interval after a scheduled post-warmup actual step. |
 | `warmup_steps` | `5` | Initial solver steps forced to native transformer evaluation. |
-| `tail_actual_steps` | `3` | Final solver steps forced to native transformer evaluation. |
+| `tail_actual_steps` | `1` | Requested final native tail. Deterministic RES enforces a sampler-safe minimum of `3`. |
 | `max_history` | `8` | Maximum model-dtype actual feature snapshots retained on CPU. |
 | `debug` | `false` | Enables concise run, step, topology, fallback, sanitization, chunk, and teardown logs. |
 
@@ -71,7 +71,7 @@ ridge_lambda = 0.10
 window_size = 2.0
 flex_window = 0.75
 warmup_steps = 5
-tail_actual_steps = 3
+tail_actual_steps = 1
 max_history = 8
 ```
 
@@ -84,11 +84,11 @@ ridge_lambda = 0.10
 window_size = 2.0
 flex_window = 3.0
 warmup_steps = 5
-tail_actual_steps = 2
+tail_actual_steps = 1
 max_history = 8
 ```
 
-Both presets remain provisional for MiniMax H3 until real-checkpoint quality and performance measurements are available.
+Both presets remain provisional pending broader prompt, sampler, and quality coverage.
 
 ## Adaptive schedule
 
@@ -100,12 +100,12 @@ Warmup and final-tail steps are actual. After warmup, with current interval `W`,
 
 After a successfully completed scheduled actual step, `W` increases by `flex_window`. A fallback actual step does not increase it. Forecasting also waits until at least `max(2, degree + 1)` actual history points exist.
 
-For a 20-step Euler run, the deterministic scheduler tests currently produce:
+For a 20-step run with the conservative settings, the sampler-aware scheduler currently produces:
 
-| Preset | Actual H3 solver steps | Forecasted solver steps | Transformer-step reduction |
-|---|---:|---:|---:|
-| Conservative | 12 | 8 | 40% |
-| Aggressive | 9 | 11 | 55% |
+| Sampler | Actual H3 solver steps | Forecasted solver steps | Forecast indices | Transformer-step reduction |
+|---|---:|---:|---|---:|
+| Euler | 13 | 7 | `5, 7, 9, 11, 13, 15, 17` | 35% |
+| RES multistep / CFG++ | 14 | 6 | `5, 7, 9, 11, 13, 15` | 30% |
 
 These counts are solver-step counts. CFG can execute separate conditional and unconditional H3 transformer calls on each actual solver step. End-to-end wall-clock speedup depends on output-head cost, CPU transfers, model offload, references, CFG branching, latent size, and hardware.
 
@@ -114,13 +114,10 @@ These counts are solver-step counts. CFG can execute separate conditional and un
 Forecasting is currently allowlisted for:
 
 - Euler (`sample_euler`)
-- Euler ancestral (`sample_euler_ancestral`, including ComfyUI's flow-model path)
 - RES multistep (`sample_res_multistep`)
 - RES multistep CFG++ (`sample_res_multistep_cfg_pp`)
-- RES multistep ancestral (`sample_res_multistep_ancestral`)
-- RES multistep ancestral CFG++ (`sample_res_multistep_ancestral_cfg_pp`)
 
-The reviewed implementations make one `predict_noise` call per solver iteration. RES multistep reuses the previous denoised result in its solver update without making an additional model call. Other samplers execute native MiniMax H3. Debug mode logs the exact fallback reason. Multi-GPU parallel sampling also remains native because distributed forecast-row transactions are not yet validated.
+The reviewed implementations make one `predict_noise` call per solver iteration. Euler feeds each approximate denoised result into the latent used by the next evaluation, so it requires one completed actual H3 evaluation after every forecast. RES multistep stores each current denoised result as `old_denoised` for the following second-order update. The actual evaluation immediately after a forecast still consumes forecast-derived history, then replaces `old_denoised` with its native result before another forecast is allowed. This prevents any RES update from combining two forecasted denoised results. RES also keeps its final three solver steps native; this tail floor applies even when a saved workflow supplies a smaller `tail_actual_steps` value. Ancestral samplers execute native MiniMax H3 because injected noise invalidates the smooth deterministic feature trajectory used by the forecaster. Debug mode logs the exact fallback, tail, or post-forecast refresh reason. Multi-GPU parallel sampling also remains native because distributed forecast-row transactions are not yet validated.
 
 ## Memory design
 
@@ -142,7 +139,7 @@ branch_count * max_history * (target_audio_rows + target_video_rows)
 
 At the native 1344x768, 124-frame example, the reviewed layout has about 37,710 target rows. With hidden width 5,376 and BF16/FP16 history, one snapshot is roughly 387 MiB per branch. Eight conditional/unconditional snapshots can therefore approach 6.1 GiB of CPU RAM. Reference tokens do not enter the cached target, while longer duration and larger target geometry increase the cost. Lower `max_history` is valid only while it remains at least `degree + 1`.
 
-Forecast VRAM includes one model-dtype target feature for the current model call plus a bounded FP32 accumulation chunk. Cached history does not remain on the GPU. Actual-step device-to-CPU history transfers can reduce the theoretical speedup.
+Forecast VRAM includes one model-dtype target feature for the current model call plus a bounded FP32 accumulation chunk. Cached history does not remain on the GPU. Actual-step device-to-CPU history transfers can reduce the theoretical speedup. The native single-call path archives the already-contiguous audio/video target view directly and transfers ownership of that snapshot into history without assembling a second full CPU tensor. Debug run summaries report archive, history-update, and forecast-prediction wall time separately; CUDA synchronization can be charged to the archive counter, so these counters diagnose the runtime path rather than serving as isolated kernel benchmarks.
 
 ## Fallback and transaction behavior
 
@@ -167,7 +164,7 @@ Automated tests cover:
 - exact native versus wrapped forced-actual video/audio output on a deterministic tiny native H3 fixture;
 - proof that a forecast fixture invokes zero H3 transformer blocks.
 
-No full MiniMax H3 checkpoint is available in the automated environment. Real text-to-video/audio generation, reference modes, long-duration memory behavior, wall-clock speedup, VRAM/RSS peaks, decoded video metrics, audio metrics, and audiovisual synchronization remain unverified. No claim of lossless quality or production speedup is made yet.
+No full MiniMax H3 checkpoint is available in the automated environment. Real text-to-video/audio generation, reference modes, long-duration memory behavior, wall-clock speedup, VRAM/RSS peaks, decoded video metrics, audio metrics, and audiovisual synchronization remain unverified by the automated suite. No claim of lossless quality is made.
 
 ## Tests
 

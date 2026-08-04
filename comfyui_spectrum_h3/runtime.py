@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -27,6 +28,10 @@ class RuntimeStats:
     actual_transformer_calls: int = 0
     forecast_model_calls: int = 0
     forecast_fallbacks: int = 0
+    history_archive_seconds: float = 0.0
+    history_update_seconds: float = 0.0
+    forecast_prediction_seconds: float = 0.0
+    direct_history_updates: int = 0
     current_window: float = 0.0
     disabled: bool = False
     disable_reason: str | None = None
@@ -51,7 +56,7 @@ class _CallState:
 class _StepState:
     step_id: int
     coordinate: float
-    scheduled_actual: bool
+    adaptive_recompute: bool
     mode: str
     reason: str
     calls: list[_CallState] = field(default_factory=list)
@@ -68,6 +73,9 @@ class _RunState:
     sigma_min: float
     sigma_max: float
     supported_sampler: bool
+    max_consecutive_forecasts: int | None
+    min_actual_steps_after_forecast: int
+    min_tail_actual_steps: int
     next_step_id: int = 0
 
 
@@ -87,6 +95,7 @@ class SpectrumH3Runtime:
         self._history_labels: tuple[Any, ...] | None = None
         self._current_window = float(self.config.window_size)
         self._consecutive_forecasts = 0
+        self._required_actual_refreshes = 0
         self._disabled = False
         self._disable_reason: str | None = None
 
@@ -110,9 +119,30 @@ class SpectrumH3Runtime:
     def history_labels(self) -> tuple[Any, ...] | None:
         return self._history_labels
 
-    def start_run(self, sigmas: torch.Tensor, sampler_name: str, *, supported_sampler: bool) -> int:
+    def start_run(
+        self,
+        sigmas: torch.Tensor,
+        sampler_name: str,
+        *,
+        supported_sampler: bool,
+        max_consecutive_forecasts: int | None = None,
+        min_actual_steps_after_forecast: int = 0,
+        min_tail_actual_steps: int = 0,
+    ) -> int:
         if self._run is not None:
             raise RuntimeError("Spectrum H3 runtime already has an active run")
+        if max_consecutive_forecasts is not None and (
+            isinstance(max_consecutive_forecasts, bool)
+            or not isinstance(max_consecutive_forecasts, int)
+            or max_consecutive_forecasts < 1
+        ):
+            raise ValueError("max_consecutive_forecasts must be None or an integer >= 1")
+        for name, value in (
+            ("min_actual_steps_after_forecast", min_actual_steps_after_forecast),
+            ("min_tail_actual_steps", min_tail_actual_steps),
+        ):
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{name} must be an integer >= 0")
         sigma_values = torch.as_tensor(sigmas).detach().to(device="cpu", dtype=torch.float64).reshape(-1)
         total_steps = max(0, sigma_values.numel() - 1)
         evaluated = sigma_values[:-1]
@@ -130,6 +160,9 @@ class SpectrumH3Runtime:
             sigma_min=sigma_min,
             sigma_max=sigma_max,
             supported_sampler=effective_supported,
+            max_consecutive_forecasts=max_consecutive_forecasts,
+            min_actual_steps_after_forecast=min_actual_steps_after_forecast,
+            min_tail_actual_steps=min_tail_actual_steps,
         )
         self._step = None
         self.forecaster.reset()
@@ -137,6 +170,7 @@ class SpectrumH3Runtime:
         self._history_labels = None
         self._current_window = float(self.config.window_size)
         self._consecutive_forecasts = 0
+        self._required_actual_refreshes = 0
         self._disabled = not effective_supported
         if not supported_sampler:
             self._disable_reason = f"sampler {sampler_name!r} is not allowlisted for one-call solver-step tracking"
@@ -167,6 +201,7 @@ class SpectrumH3Runtime:
         self._history_topology = None
         self._history_labels = None
         self._consecutive_forecasts = 0
+        self._required_actual_refreshes = 0
 
     def coordinate_for_timestep(self, timestep: torch.Tensor | float) -> float:
         if self._run is None:
@@ -193,7 +228,9 @@ class SpectrumH3Runtime:
             raise RuntimeError("predict_noise call count exceeded the supplied sigma schedule")
         coordinate = self.coordinate_for_timestep(timestep)
 
-        tail_start = max(0, self._run.total_steps - self.config.tail_actual_steps)
+        effective_tail = max(self.config.tail_actual_steps, self._run.min_tail_actual_steps)
+        tail_start = max(0, self._run.total_steps - effective_tail)
+        advances_window = False
         if self.config.force_actual:
             actual, reason = True, "forced-actual validation mode"
         elif self._disabled:
@@ -208,11 +245,22 @@ class SpectrumH3Runtime:
             interval = max(1, math.floor(self._current_window))
             actual = ((self._consecutive_forecasts + 1) % interval) == 0
             reason = "adaptive recompute" if actual else "adaptive forecast"
+            advances_window = actual
+
+        forecast_limit = self._run.max_consecutive_forecasts
+        if not actual and forecast_limit is not None and self._consecutive_forecasts >= forecast_limit:
+            actual = True
+            reason = "post-forecast sampler refresh"
+            advances_window = False
+        if not actual and self._required_actual_refreshes > 0:
+            actual = True
+            reason = "post-forecast sampler refresh"
+            advances_window = False
 
         self._step = _StepState(
             step_id=step_id,
             coordinate=coordinate,
-            scheduled_actual=actual,
+            adaptive_recompute=advances_window,
             mode="actual" if actual else "forecast",
             reason=reason,
         )
@@ -290,7 +338,11 @@ class SpectrumH3Runtime:
             raise RuntimeError(
                 f"actual H3 feature shape {tuple(feature.shape)} does not match {call.expected_shape}"
             )
-        archived = feature.detach().to(device="cpu", dtype=feature.dtype, copy=True).contiguous()
+        started = time.perf_counter()
+        try:
+            archived = feature.detach().to(device="cpu", dtype=feature.dtype, copy=True).contiguous()
+        finally:
+            self.stats.history_archive_seconds += time.perf_counter() - started
         call.observed_actual = True
         step.actual_records.append(_ActualRecord(archived, call.labels))
 
@@ -329,13 +381,17 @@ class SpectrumH3Runtime:
         if history_shape is None or tuple(call.expected_shape[1:]) != tuple(history_shape[1:]):
             self._fallback_or_retry(step, "target audio/video row count or hidden width changed")
             return None
-        predicted = self.forecaster.predict(
-            step.coordinate,
-            self.config.blend_weight,
-            rows=positions,
-            device=device,
-            dtype=dtype,
-        )
+        started = time.perf_counter()
+        try:
+            predicted = self.forecaster.predict(
+                step.coordinate,
+                self.config.blend_weight,
+                rows=positions,
+                device=device,
+                dtype=dtype,
+            )
+        finally:
+            self.stats.forecast_prediction_seconds += time.perf_counter() - started
         if tuple(predicted.shape) != call.expected_shape:
             self._fallback_or_retry(step, "predicted target feature shape is invalid")
             return None
@@ -389,8 +445,12 @@ class SpectrumH3Runtime:
             if set(labels) != set(canonical_labels) or len(labels) != len(canonical_labels):
                 self._disable_forecasting("conditional branch set changed across actual solver steps")
                 return None
-        row_map = {label: feature for label, feature in rows}
-        combined = torch.stack([row_map[label] for label in canonical_labels], dim=0).contiguous()
+        if len(step.actual_records) == 1 and step.actual_records[0].labels == canonical_labels:
+            combined = step.actual_records[0].feature
+            self.stats.direct_history_updates += 1
+        else:
+            row_map = {label: feature for label, feature in rows}
+            combined = torch.stack([row_map[label] for label in canonical_labels], dim=0).contiguous()
 
         if self._history_topology is None:
             self._history_topology = topology
@@ -419,22 +479,28 @@ class SpectrumH3Runtime:
             if step.used_history_rows != expected_rows:
                 raise ForecastRetryActual("forecast branch-row allocation was incomplete")
             self._consecutive_forecasts += 1
+            self._required_actual_refreshes = self._run.min_actual_steps_after_forecast
             self.stats.forecast_steps += 1
             self.stats.forecast_model_calls += len(step.calls)
         else:
             if any(call.used_forecast for call in step.calls):
                 raise RuntimeError("actual solver step retained a forecasted subcall")
-            combined = self._aggregate_actual(step)
-            if combined is not None and not self._disabled:
-                try:
-                    self.forecaster.update(step.coordinate, combined, take_ownership=True)
-                except ValueError as exc:
-                    self._disable_forecasting(f"actual H3 feature is incompatible with history: {exc}")
+            started = time.perf_counter()
+            try:
+                combined = self._aggregate_actual(step)
+                if combined is not None and not self._disabled:
+                    try:
+                        self.forecaster.update(step.coordinate, combined, take_ownership=True)
+                    except ValueError as exc:
+                        self._disable_forecasting(f"actual H3 feature is incompatible with history: {exc}")
+            finally:
+                self.stats.history_update_seconds += time.perf_counter() - started
             self._consecutive_forecasts = 0
+            self._required_actual_refreshes = max(0, self._required_actual_refreshes - 1)
             self.stats.actual_steps += 1
             self.stats.actual_transformer_calls += len(step.actual_records)
             if (
-                step.scheduled_actual
+                step.adaptive_recompute
                 and not step.fallback
                 and not self._disabled
                 and step.step_id >= self.config.warmup_steps
@@ -462,5 +528,10 @@ class SpectrumH3Runtime:
             f"actual_transformer_calls={self.stats.actual_transformer_calls} "
             f"forecast_calls={self.stats.forecast_model_calls} "
             f"fallbacks={self.stats.forecast_fallbacks} disabled={self.stats.disabled} "
+            f"history_archive_s={self.stats.history_archive_seconds:.3f} "
+            f"history_update_s={self.stats.history_update_seconds:.3f} "
+            f"forecast_predict_s={self.stats.forecast_prediction_seconds:.3f} "
+            f"direct_history_updates={self.stats.direct_history_updates} "
+            f"history_mib={self.forecaster.history_tensor_bytes / (1024 * 1024):.1f} "
             f"reason={self.stats.disable_reason!r}"
         )
