@@ -17,7 +17,7 @@ Initial testing did not reveal obvious degradation in several outputs, but broad
 - rapid actions and short pose changes;
 - motion timing or action trajectories that diverge from the fully native run.
 
-A community same-prompt and same-seed comparison reported an end-to-end time change from 540.87 s without Spectrum to 450.68 s with Spectrum, or about 16.7% lower wall time, while also finding visible eye and finger degradation. Comparison videos: [Spectrum enabled](https://imgur.com/IN2i4Jx) and [Spectrum disabled](https://imgur.com/n7g1fYp). Additional local testing reproduced similar sensitivity around fast-moving fingers and action changes. These are individual observations rather than a controlled quality benchmark; the effect varies with the prompt, motion, sampler, resolution, references, and Spectrum settings.
+Further local testing and user reports have shown similar sensitivity around fast-moving fingers and action changes. These are qualitative observations rather than a controlled quality benchmark; the effect varies with the prompt, motion, sampler, resolution, references, and Spectrum settings.
 
 Use Spectrum when the speed benefit is worth possible output differences. Disable it when maximum fidelity to the native MiniMax H3 trajectory is more important. For quality-critical work, compare the same prompt and seed with Spectrum enabled and disabled.
 
