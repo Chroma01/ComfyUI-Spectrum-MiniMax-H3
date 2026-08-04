@@ -6,6 +6,21 @@ This custom node reduces expensive H3 transformer evaluations during sampling. I
 
 This repository is independent from [ComfyUI-Spectrum-Proper](https://github.com/xmarre/ComfyUI-Spectrum-Proper), which remains a dedicated FLUX implementation.
 
+## Quality and output fidelity
+
+Spectrum is an approximate accelerator, not a lossless or bit-identical execution path. Forecasted steps change the denoising trajectory, so outputs can differ even when the prompt, seed, model, sampler, and workflow are otherwise identical.
+
+Initial testing did not reveal obvious degradation in several outputs, but broader exact-seed A/B testing has since exposed visible differences in some generations. The most sensitive cases observed so far include:
+
+- fast or very brief facial and eye motion;
+- fingers, fingernails, and other small articulated details;
+- rapid actions and short pose changes;
+- motion timing or action trajectories that diverge from the fully native run.
+
+A community same-prompt and same-seed comparison reported an end-to-end time change from 540.87 s without Spectrum to 450.68 s with Spectrum, or about 16.7% lower wall time, while also finding visible eye and finger degradation. Comparison videos: [Spectrum enabled](https://imgur.com/IN2i4Jx) and [Spectrum disabled](https://imgur.com/n7g1fYp). Additional local testing reproduced similar sensitivity around fast-moving fingers and action changes. These are individual observations rather than a controlled quality benchmark; the effect varies with the prompt, motion, sampler, resolution, references, and Spectrum settings.
+
+Use Spectrum when the speed benefit is worth possible output differences. Disable it when maximum fidelity to the native MiniMax H3 trajectory is more important. For quality-critical work, compare the same prompt and seed with Spectrum enabled and disabled.
+
 ## Supported native path
 
 The integration targets `comfy.ldm.minimax.model.MiniMaxH3Model` in native ComfyUI. It requires the MiniMax H3 and packed-latent sampler APIs present at ComfyUI commit `e377e263049f9338b4d12a3dd417b36ae62948ff` from August 3, 2026, including the `latent_shapes` argument on `outer_sample`. Older ComfyUI revisions are unsupported. Development and native-equivalence tests are pinned to that commit. Later revisions are unverified; required H3 attributes are checked when the node is applied, and replacement output shape is checked on actual steps so incompatible native changes fail with an explicit contract error.
@@ -184,7 +199,7 @@ Automated tests cover:
 - exact native versus wrapped forced-actual video/audio output on a deterministic tiny native H3 fixture;
 - proof that a forecast fixture invokes zero H3 transformer blocks.
 
-No full MiniMax H3 checkpoint is available in the automated environment. The supplied real-checkpoint A/B runs validate the 0.5 MP VRAM allocation and show a small, variable timing benefit. Other resolutions, durations, CFG topologies, reference modes, hardware, decoded video metrics, audio metrics, and audiovisual synchronization remain unverified. No claim of lossless quality is made.
+No full MiniMax H3 checkpoint is available in the automated environment. The supplied real-checkpoint A/B runs validate the 0.5 MP VRAM allocation and show a small, variable timing benefit. Exact-seed full-checkpoint comparisons have also shown that Spectrum can visibly alter fine motion, facial/eye behavior, fingers, and short action trajectories. Other resolutions, durations, CFG topologies, reference modes, hardware, decoded video metrics, audio metrics, and audiovisual synchronization remain unverified. Spectrum must not be treated as lossless or output-identical to native sampling.
 
 ## Tests
 
