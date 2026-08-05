@@ -1,35 +1,26 @@
-# Spectrum MiniMax H3 v0.1.4
+# Spectrum MiniMax H3 v0.1.5
 
-Adds optional device-resident history storage for systems with spare VRAM.
+Fixes MiniMax H3 sampling on Apple MPS and includes the documentation and licensing corrections made since v0.1.4.
 
-## Added
+## Fixed
 
-- Add `history_storage=system_ram|vram` to the Spectrum node, defaulting to the existing system-RAM behavior.
-- Keep model-dtype history on the producing device in VRAM mode, avoiding actual-step device-to-host copies and repeated forecast-time host-to-device reads.
-- Clone the target view into compact owned device storage so cached history does not retain the complete final-block hidden tensor.
-- Report the configured storage and resolved history device in debug summaries.
-
-## Highlights
-
-- System-RAM mode remains the default and preserves existing saved-workflow behavior.
-- VRAM mode preserves the forecasting math, model dtype, FP32 accumulation order, scheduler, and fallback semantics.
-- History is still bounded by `max_history` and released at run teardown.
-
-## Memory guidance
-
-- The supplied 0.5 MP single-branch workflow retained about 2.22-2.27 GiB at `max_history=8`; a two-branch topology at the same shape would use roughly twice that amount.
-- At the native 1344x768, 124-frame example, eight two-branch snapshots approach 6.1 GiB.
-- VRAM mode also needs headroom for native model execution, the current snapshot, the prediction result, an FP32 accumulation chunk, and allocator fragmentation.
-
-## Measured 0.5 MP A/B results
-
-Three supplied full-checkpoint Euler pairs measured total times of 112.43/105.55 s, 115.60/116.08 s, and 109.80/107.26 s for system RAM/VRAM respectively. The combined means were 112.61 s and 109.63 s, a 2.6% advantage for VRAM mode. Individual pairs ranged from 6.1% faster to 0.4% slower, so the performance benefit is workload- and system-dependent.
+- Move detached solver timestep tensors to CPU before converting them to `float64`, avoiding the unsupported MPS `float64` conversion that stopped sampling at step 0.
+- Apply the same transfer-before-cast ordering to sigma-schedule normalization, which contained the same latent defect.
+- Centralize the conversion path so run initialization and per-step coordinate calculation cannot diverge.
+- Correct the repository's GPL-3.0-or-later licensing files and package metadata.
 
 ## Validation
 
-- Automated tests cover setting validation, default compatibility, compact owned storage, storage-device tracking, and CPU/CUDA prediction equivalence.
-- Existing native-path equivalence, transaction, sampler-contract, scheduler, and bounded-memory tests remain in place.
+- Add regression coverage that explicitly enforces `detach -> CPU transfer -> float64 cast -> flatten`.
+- Preserve CPU values, output shape, device, and dtype through the shared conversion helper.
+- Confirm the fix on a physical Apple M4 Max system with a complete 20-step RES multistep run: 14 actual H3 transformer evaluations, 6 forecasted evaluations, and zero fallbacks.
+- Retain the existing native MiniMax H3 fixture, scheduler, transaction, fallback, and forecasting test coverage.
 
-## Current limits
+## Documentation
 
-The supplied 0.5 MP tests verify the expected additional allocation and show a small, variable timing benefit. Other resolutions, durations, CFG topologies, reference modes, and hardware remain unverified. Selecting VRAM storage with insufficient headroom can raise an out-of-memory error.
+- Clarify that Spectrum can produce trajectory deviations and localized degradation during fast or brief motion.
+- Record the community-tested Radeon AI PRO R9700 / ROCm configuration and its measured warm-run result as a scoped compatibility datapoint.
+
+## Scope
+
+The MPS hardware confirmation covers the reported Apple M4 Max, PyTorch 2.10.0, ComfyUI 0.30.0, RES multistep configuration. It does not establish compatibility for every Apple Silicon model, PyTorch release, sampler, workflow topology, or MiniMax H3 configuration.
