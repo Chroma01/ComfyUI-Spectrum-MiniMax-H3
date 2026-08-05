@@ -14,6 +14,17 @@ from .forecast import HistoryWeightForecaster
 LOG = logging.getLogger(__name__)
 
 
+def _as_cpu_float64_vector(value: Any) -> torch.Tensor:
+    """Detach a tensor-like value, move it to CPU, then cast to float64."""
+    return (
+        torch.as_tensor(value)
+        .detach()
+        .to(device="cpu")
+        .to(dtype=torch.float64)
+        .reshape(-1)
+    )
+
+
 class ForecastRetryActual(RuntimeError):
     """Internal signal used to discard a partial forecast attempt transactionally."""
 
@@ -144,7 +155,7 @@ class SpectrumH3Runtime:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be an integer >= 0")
-        sigma_values = torch.as_tensor(sigmas).detach().to(device="cpu", dtype=torch.float64).reshape(-1)
+        sigma_values = _as_cpu_float64_vector(sigmas)
         total_steps = max(0, sigma_values.numel() - 1)
         evaluated = sigma_values[:-1]
         finite_schedule = bool(evaluated.numel()) and bool(torch.isfinite(evaluated).all().item())
@@ -207,7 +218,7 @@ class SpectrumH3Runtime:
     def coordinate_for_timestep(self, timestep: torch.Tensor | float) -> float:
         if self._run is None:
             raise RuntimeError("Spectrum H3 runtime is outside a sampling run")
-        value_tensor = torch.as_tensor(timestep).detach().to(device="cpu", dtype=torch.float64).reshape(-1)
+        value_tensor = _as_cpu_float64_vector(timestep)
         if value_tensor.numel() == 0 or not bool(torch.isfinite(value_tensor).all().item()):
             raise RuntimeError("current solver timestep is empty or nonfinite")
         if not bool(torch.allclose(value_tensor, value_tensor[0].expand_as(value_tensor))):
