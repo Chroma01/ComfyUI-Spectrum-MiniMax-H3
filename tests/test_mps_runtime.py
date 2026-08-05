@@ -11,6 +11,7 @@ class _MpsLikeTensor:
         self.calls = []
 
     def detach(self):
+        self.calls.append(("detach",))
         return self
 
     def to(self, *args, **kwargs):
@@ -47,6 +48,7 @@ def test_cpu_float64_conversion_moves_off_mps_before_casting(monkeypatch):
 
     assert result is source
     assert source.calls == [
+        ("detach",),
         ("device", "cpu"),
         ("dtype", torch.float64),
         ("reshape", (-1,)),
