@@ -14,17 +14,18 @@ class SpectrumApplyMiniMaxH3:
                 "model": ("MODEL",),
                 "enabled": ("BOOLEAN", {"default": True}),
                 "blend_weight": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "degree": ("INT", {"default": 4, "min": 1, "max": 16, "step": 1}),
+                "degree": ("INT", {"default": 1, "min": 1, "max": 16, "step": 1}),
                 "ridge_lambda": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 10.0, "step": 0.01}),
                 "window_size": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 16.0, "step": 0.05}),
                 "flex_window": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 8.0, "step": 0.05}),
-                "warmup_steps": ("INT", {"default": 5, "min": 0, "max": 64, "step": 1}),
+                "warmup_steps": ("INT", {"default": 1, "min": 0, "max": 64, "step": 1}),
                 "tail_actual_steps": ("INT", {"default": 1, "min": 0, "max": 64, "step": 1}),
                 "max_history": ("INT", {"default": 8, "min": 2, "max": 64, "step": 1}),
                 "debug": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "history_storage": (["system_ram", "vram"], {"default": "system_ram"}),
+                "bootstrap_first_forecast": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -47,6 +48,7 @@ class SpectrumApplyMiniMaxH3:
         max_history,
         debug,
         history_storage="system_ram",
+        bootstrap_first_forecast=False,
     ):
         if not enabled:
             return (model,)
@@ -62,6 +64,7 @@ class SpectrumApplyMiniMaxH3:
             tail_actual_steps=int(tail_actual_steps),
             max_history=int(max_history),
             history_storage=str(history_storage),
+            bootstrap_first_forecast=bootstrap_first_forecast,
             debug=bool(debug),
         ).validate()
         patched = model.clone()

@@ -8,16 +8,17 @@ from dataclasses import dataclass
 class SpectrumH3Config:
     enabled: bool = True
     blend_weight: float = 0.50
-    degree: int = 4
+    degree: int = 1
     ridge_lambda: float = 0.10
     window_size: float = 2.0
     flex_window: float = 0.75
-    warmup_steps: int = 5
+    warmup_steps: int = 1
     tail_actual_steps: int = 1
     max_history: int = 8
     history_storage: str = "system_ram"
     debug: bool = False
     force_actual: bool = False
+    bootstrap_first_forecast: bool = False
 
     @property
     def min_fit_points(self) -> int:
@@ -30,6 +31,8 @@ class SpectrumH3Config:
             raise TypeError("debug must be a boolean")
         if not isinstance(self.force_actual, bool):
             raise TypeError("force_actual must be a boolean")
+        if not isinstance(self.bootstrap_first_forecast, bool):
+            raise TypeError("bootstrap_first_forecast must be a boolean")
         if not math.isfinite(self.blend_weight) or not 0.0 <= self.blend_weight <= 1.0:
             raise ValueError("blend_weight must be finite and in [0, 1]")
         if isinstance(self.degree, bool) or not isinstance(self.degree, int) or self.degree < 1:
@@ -46,6 +49,10 @@ class SpectrumH3Config:
             or self.warmup_steps < 0
         ):
             raise ValueError("warmup_steps must be an integer >= 0")
+        if self.bootstrap_first_forecast and self.degree != 1:
+            raise ValueError("bootstrap_first_forecast requires degree == 1")
+        if self.bootstrap_first_forecast and self.warmup_steps > 1:
+            raise ValueError("bootstrap_first_forecast requires warmup_steps <= 1")
         if (
             isinstance(self.tail_actual_steps, bool)
             or not isinstance(self.tail_actual_steps, int)
@@ -71,6 +78,8 @@ class SpectrumH3Config:
 CONSERVATIVE_PRESET = SpectrumH3Config()
 AGGRESSIVE_PRESET = SpectrumH3Config(
     blend_weight=0.75,
+    degree=4,
     flex_window=3.0,
+    warmup_steps=5,
     tail_actual_steps=1,
 )
