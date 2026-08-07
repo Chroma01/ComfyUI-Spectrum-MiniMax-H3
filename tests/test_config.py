@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import inspect
+import logging
 
 import pytest
 
+from comfyui_spectrum_h3 import nodes as nodes_module
 from comfyui_spectrum_h3.config import AGGRESSIVE_PRESET, SpectrumH3Config
-from comfyui_spectrum_h3.nodes import SpectrumApplyMiniMaxH3
+from comfyui_spectrum_h3.nodes import (
+    SpectrumApplyMiniMaxH3,
+    _effective_bootstrap_first_forecast,
+)
 
 
 @pytest.mark.parametrize(
@@ -40,7 +45,12 @@ def test_preliminary_scheduler_defaults():
     assert required["degree"][1]["default"] == 1
     assert required["warmup_steps"][1]["default"] == 1
     assert required["tail_actual_steps"][1]["default"] == 1
-    assert optional["bootstrap_first_forecast"] == ("BOOLEAN", {"default": True})
+    assert optional["bootstrap_first_forecast"][0] == "BOOLEAN"
+    assert optional["bootstrap_first_forecast"][1]["default"] is True
+    assert "degree=1" in optional["bootstrap_first_forecast"][1]["tooltip"]
+    assert "warmup_steps<=1" in optional["bootstrap_first_forecast"][1]["tooltip"]
+    assert "disable bootstrap_first_forecast" in required["degree"][1]["tooltip"]
+    assert "disable bootstrap_first_forecast" in required["warmup_steps"][1]["tooltip"]
     assert apply_parameters["bootstrap_first_forecast"].default is True
 
 
@@ -78,3 +88,88 @@ def test_bootstrap_first_forecast_accepts_degree_one_and_one_warmup_step():
     ).validate()
 
     assert config.bootstrap_first_forecast is True
+
+
+@pytest.mark.parametrize(
+    ("degree", "warmup_steps"),
+    [
+        (2, 1),
+        (1, 2),
+        (2, 2),
+    ],
+)
+def test_node_disables_incompatible_bootstrap_settings(degree, warmup_steps, caplog):
+    with caplog.at_level(logging.WARNING, logger="comfyui_spectrum_h3.nodes"):
+        effective = _effective_bootstrap_first_forecast(
+            requested=True,
+            degree=degree,
+            warmup_steps=warmup_steps,
+        )
+
+    assert effective is False
+    assert "Disabling bootstrap_first_forecast" in caplog.text
+    assert f"degree={degree}" in caplog.text
+    assert f"warmup_steps={warmup_steps}" in caplog.text
+
+
+def test_node_keeps_compatible_bootstrap_without_warning(caplog):
+    with caplog.at_level(logging.WARNING, logger="comfyui_spectrum_h3.nodes"):
+        effective = _effective_bootstrap_first_forecast(
+            requested=True,
+            degree=1,
+            warmup_steps=1,
+        )
+
+    assert effective is True
+    assert not caplog.records
+
+
+def test_node_keeps_explicitly_disabled_bootstrap_without_warning(caplog):
+    with caplog.at_level(logging.WARNING, logger="comfyui_spectrum_h3.nodes"):
+        effective = _effective_bootstrap_first_forecast(
+            requested=False,
+            degree=4,
+            warmup_steps=5,
+        )
+
+    assert effective is False
+    assert not caplog.records
+
+
+def test_apply_normalizes_reported_warmup_conflict(monkeypatch, caplog):
+    captured = {}
+
+    class FakeModel:
+        def clone(self):
+            return FakeModel()
+
+    class FakeRuntime:
+        def __init__(self, config):
+            captured["config"] = config
+
+    monkeypatch.setattr(nodes_module, "require_native_minimax_h3", lambda model: None)
+    monkeypatch.setattr(nodes_module, "SpectrumH3Runtime", FakeRuntime)
+    monkeypatch.setattr(nodes_module, "install_sampler_wrappers", lambda model, runtime: None)
+    monkeypatch.setattr(nodes_module, "install_h3_wrapper", lambda model: None)
+
+    with caplog.at_level(logging.WARNING, logger="comfyui_spectrum_h3.nodes"):
+        (patched,) = SpectrumApplyMiniMaxH3().apply(
+            FakeModel(),
+            True,
+            0.50,
+            1,
+            0.10,
+            2.0,
+            0.75,
+            2,
+            1,
+            8,
+            False,
+            bootstrap_first_forecast=True,
+        )
+
+    assert isinstance(patched, FakeModel)
+    assert captured["config"].degree == 1
+    assert captured["config"].warmup_steps == 2
+    assert captured["config"].bootstrap_first_forecast is False
+    assert "Disabling bootstrap_first_forecast" in caplog.text
