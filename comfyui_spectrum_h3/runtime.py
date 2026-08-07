@@ -39,6 +39,7 @@ class RuntimeStats:
     actual_transformer_calls: int = 0
     forecast_model_calls: int = 0
     forecast_fallbacks: int = 0
+    bypassed_steps: int = 0
     history_archive_seconds: float = 0.0
     history_update_seconds: float = 0.0
     forecast_prediction_seconds: float = 0.0
@@ -309,8 +310,9 @@ class SpectrumH3Runtime:
             raise RuntimeError("Spectrum H3 solver-step context is stale")
         return self._step
 
-    def _disable_forecasting(self, reason: str) -> None:
-        if not self._disabled:
+    def _disable_forecasting(self, reason: str) -> bool:
+        newly_disabled = not self._disabled
+        if newly_disabled:
             self._disabled = True
             self._disable_reason = str(reason)
             self.stats.disabled = True
@@ -318,6 +320,7 @@ class SpectrumH3Runtime:
         self.forecaster.reset()
         self._history_topology = None
         self._history_labels = None
+        return newly_disabled
 
     def _fallback_or_retry(self, step: _StepState, reason: str) -> None:
         self._disable_forecasting(reason)
@@ -520,8 +523,21 @@ class SpectrumH3Runtime:
                 self.stats.current_window = self._current_window
                 self._step = None
                 return
-            self._disable_forecasting("solver step completed without an H3 model call")
-            raise RuntimeError("Spectrum H3 solver step completed without an H3 model call")
+            reason = "solver step completed without reaching the native H3 model wrapper"
+            newly_disabled = self._disable_forecasting(reason)
+            self._consecutive_forecasts = 0
+            self._required_actual_refreshes = 0
+            self.stats.bypassed_steps += 1
+            self.stats.current_window = self._current_window
+            self._step = None
+            if newly_disabled:
+                LOG.warning(
+                    "Spectrum H3 disabled for the rest of this run because a predict-noise "
+                    "evaluation returned without reaching the native MiniMax H3 model wrapper; "
+                    "accepting the wrapped result as a passthrough. Another model or cache patch "
+                    "may have intercepted the evaluation."
+                )
+            return
 
         if step.mode == "forecast":
             if any(call.observed_actual for call in step.calls) or not all(call.used_forecast for call in step.calls):
@@ -578,7 +594,8 @@ class SpectrumH3Runtime:
             f"forecast_steps={self.stats.forecast_steps} "
             f"actual_transformer_calls={self.stats.actual_transformer_calls} "
             f"forecast_calls={self.stats.forecast_model_calls} "
-            f"fallbacks={self.stats.forecast_fallbacks} disabled={self.stats.disabled} "
+            f"fallbacks={self.stats.forecast_fallbacks} "
+            f"bypassed_steps={self.stats.bypassed_steps} disabled={self.stats.disabled} "
             f"history_archive_s={self.stats.history_archive_seconds:.3f} "
             f"history_update_s={self.stats.history_update_seconds:.3f} "
             f"forecast_predict_s={self.stats.forecast_prediction_seconds:.3f} "

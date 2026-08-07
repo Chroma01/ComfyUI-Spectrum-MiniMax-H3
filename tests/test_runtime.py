@@ -735,6 +735,42 @@ def test_aborted_res_refresh_does_not_consume_refresh_state():
     runtime.abort_step(run_id, retried["step_id"])
 
 
+def test_missing_h3_call_disables_forecasting_and_releases_history():
+    runtime = _runtime(
+        bootstrap_first_forecast=True,
+        warmup_steps=1,
+        tail_actual_steps=0,
+    )
+    runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.25, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    _actual_step(runtime, 1.0, [(LABEL, torch.ones(1, 3, 4))])
+
+    decision = runtime.begin_step(torch.tensor([0.5]))
+    assert not decision["actual"]
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    assert runtime.active_step_id is None
+    assert runtime.stats.bypassed_steps == 1
+    assert runtime.stats.actual_steps == 1
+    assert runtime.stats.forecast_steps == 0
+    assert runtime.stats.disabled
+    assert "without reaching the native H3 model wrapper" in runtime.disabled_reason
+    assert runtime.forecaster.history_length == 0
+
+    summary = runtime.debug_summary()
+    assert "bypassed_steps=1" in summary
+
+    next_step = runtime.begin_step(torch.tensor([0.25]))
+    assert next_step["actual"]
+    assert next_step["reason"] == runtime.disabled_reason
+    runtime.abort_step(next_step["run_id"], next_step["step_id"])
+
+
 def test_twenty_step_euler_schedule_refreshes_between_forecasts():
     runtime = SpectrumH3Runtime(SpectrumH3Config())
     runtime.start_run(

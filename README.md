@@ -204,6 +204,8 @@ The native path is used when forecasting is unsupported or cannot be proven safe
 
 Split conditional calls are assigned by ComfyUI's `cond_or_uncond` and UUID labels. Row allocation is transactional. If correspondence becomes incomplete after an earlier subcall forecast, the entire `predict_noise` attempt is discarded and rerun as an actual step. Exceptions abort the active step without advancing scheduler state, preserve the original traceback, and outer-run teardown releases all history.
 
+If a downstream model or cache patch returns a successful `predict_noise` result without reaching the native MiniMax H3 wrapper, Spectrum accepts that result as a passthrough, disables itself for the rest of the run, and releases its forecast history. One warning identifies the bypass. This preserves the other patch's execution path without letting Spectrum continue from an unobserved solver step.
+
 Model wrappers are registered on the cloned `ModelPatcher`. A clone callback creates a new runtime for every downstream clone. The shared inner H3 module stores no Spectrum state and is never monkey-patched.
 
 ## Validation status

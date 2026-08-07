@@ -49,6 +49,8 @@ The optional `bootstrap_first_forecast` path is evaluated after configured warmu
 
 Native EasyCache and LazyCache may terminate a diffusion-model wrapper chain without an H3 call. Their shared `transformer_options["easycache"]` holder is therefore detected before Spectrum opens a run transaction. Spectrum remains inactive for that run and the cache owns the acceleration path.
 
+Other downstream wrappers can also return a valid `predict_noise` result before the native H3 wrapper is reached. This cannot be detected reliably before execution. A zero-call step therefore commits as a passthrough boundary: Spectrum disables forecasting for the rest of the run, clears all retained history, resets forecast-refresh state, and accepts the wrapped result. It logs the transition once and tracks subsequent bypasses separately from actual and forecast steps.
+
 ## Forecast memory model
 
 The forecaster stores at most `max_history` detached model-dtype snapshots in the configured history storage: system RAM by default, or the producing model device when the opt-in VRAM mode is selected. It solves only for history weights:
