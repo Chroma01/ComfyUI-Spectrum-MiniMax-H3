@@ -68,12 +68,12 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 | `ridge_lambda` | `0.10` | Ridge regularization applied to the small Gram matrix. |
 | `window_size` | `2.0` | Initial adaptive interval. |
 | `flex_window` | `0.75` | Amount added to the interval after a scheduled post-warmup actual step. |
-| `warmup_steps` | `1` | Initial solver steps forced to native transformer evaluation. |
+| `warmup_steps` | `1` | Initial solver steps forced to native transformer evaluation. Values above `1` disable the one-point bootstrap. |
 | `tail_actual_steps` | `1` | Requested final native tail. Deterministic RES enforces a sampler-safe minimum of `3`. |
 | `max_history` | `8` | Maximum model-dtype actual feature snapshots retained. |
 | `debug` | `false` | Enables concise run, step, topology, fallback, sanitization, chunk, and teardown logs. |
 | `history_storage` | `system_ram` | Stores history in `system_ram`, or in `vram` to avoid transfer overhead when sufficient accelerator memory is free. |
-| `bootstrap_first_forecast` | `true` | Experimental degree-1 one-point hold that can forecast solver step 1 from the actual step-0 hidden feature. |
+| `bootstrap_first_forecast` | `true` | Experimental one-point hold for `degree=1` and `warmup_steps<=1`. Incompatible node settings disable it with a console warning. |
 
 Every value is validated. `max_history` must be at least `degree + 1`.
 
@@ -131,6 +131,8 @@ warmup_steps <= 1
 ```
 
 After actual step 0, the bootstrap reuses that step's packed final-transformer-block hidden feature as the prediction for step 1. The current step still computes its native H3 timestep conditioning, runs `FinalLayer`, performs the video and audio projections and reconstruction, and applies the current sigma-dependent audio processing. It does not copy the previous step's final video or audio output.
+
+When the ComfyUI node receives `degree != 1` or `warmup_steps > 1`, it disables only `bootstrap_first_forecast` for that execution and logs the supplied values. The requested degree and warmup remain unchanged, and normal history-based forecasting continues. Direct `SpectrumH3Config` callers still receive a validation error for an incompatible enabled bootstrap so configuration mistakes outside the node are not silently accepted.
 
 This bootstrap is separate from polynomial regression. Ordinary degree-1 forecasting still requires at least two actual history entries, no factorization is attempted with one entry, and a bootstrap result is never inserted into actual history. Consequently, step 2 is actual because history still contains only step 0; after step 2, ordinary degree-1 forecasts can proceed.
 

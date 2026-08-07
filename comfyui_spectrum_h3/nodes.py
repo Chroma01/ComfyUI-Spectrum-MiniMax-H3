@@ -1,9 +1,31 @@
 from __future__ import annotations
 
+import logging
+
 from .config import SpectrumH3Config
 from .minimax_h3 import install_h3_wrapper, require_native_minimax_h3
 from .runtime import SpectrumH3Runtime
 from .sampling import install_sampler_wrappers
+
+LOG = logging.getLogger(__name__)
+
+
+def _effective_bootstrap_first_forecast(
+    *,
+    requested: bool,
+    degree: int,
+    warmup_steps: int,
+) -> bool:
+    if not requested or (degree == 1 and warmup_steps <= 1):
+        return requested
+    LOG.warning(
+        "Spectrum H3: bootstrap_first_forecast was enabled but requires "
+        "degree=1 and warmup_steps<=1; got degree=%d and warmup_steps=%d. "
+        "Disabling bootstrap_first_forecast for this node execution.",
+        degree,
+        warmup_steps,
+    )
+    return False
 
 
 class SpectrumApplyMiniMaxH3:
@@ -14,18 +36,45 @@ class SpectrumApplyMiniMaxH3:
                 "model": ("MODEL",),
                 "enabled": ("BOOLEAN", {"default": True}),
                 "blend_weight": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
-                "degree": ("INT", {"default": 1, "min": 1, "max": 16, "step": 1}),
+                "degree": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 1,
+                        "max": 16,
+                        "step": 1,
+                        "tooltip": "Polynomial degree. Values other than 1 disable bootstrap_first_forecast.",
+                    },
+                ),
                 "ridge_lambda": ("FLOAT", {"default": 0.10, "min": 0.0, "max": 10.0, "step": 0.01}),
                 "window_size": ("FLOAT", {"default": 2.0, "min": 1.0, "max": 16.0, "step": 0.05}),
                 "flex_window": ("FLOAT", {"default": 0.75, "min": 0.0, "max": 8.0, "step": 0.05}),
-                "warmup_steps": ("INT", {"default": 1, "min": 0, "max": 64, "step": 1}),
+                "warmup_steps": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 0,
+                        "max": 64,
+                        "step": 1,
+                        "tooltip": "Initial native solver steps. Values above 1 disable bootstrap_first_forecast.",
+                    },
+                ),
                 "tail_actual_steps": ("INT", {"default": 1, "min": 0, "max": 64, "step": 1}),
                 "max_history": ("INT", {"default": 8, "min": 2, "max": 64, "step": 1}),
                 "debug": ("BOOLEAN", {"default": False}),
             },
             "optional": {
                 "history_storage": (["system_ram", "vram"], {"default": "system_ram"}),
-                "bootstrap_first_forecast": ("BOOLEAN", {"default": True}),
+                "bootstrap_first_forecast": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Forecast solver step 1 from the actual step-0 feature. Requires degree=1 "
+                            "and warmup_steps<=1; incompatible settings disable it with a console warning."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -53,18 +102,27 @@ class SpectrumApplyMiniMaxH3:
         if not enabled:
             return (model,)
         require_native_minimax_h3(model)
+        resolved_degree = int(degree)
+        resolved_warmup_steps = int(warmup_steps)
+        if not isinstance(bootstrap_first_forecast, bool):
+            raise TypeError("bootstrap_first_forecast must be a boolean")
+        effective_bootstrap = _effective_bootstrap_first_forecast(
+            requested=bootstrap_first_forecast,
+            degree=resolved_degree,
+            warmup_steps=resolved_warmup_steps,
+        )
         config = SpectrumH3Config(
             enabled=bool(enabled),
             blend_weight=float(blend_weight),
-            degree=int(degree),
+            degree=resolved_degree,
             ridge_lambda=float(ridge_lambda),
             window_size=float(window_size),
             flex_window=float(flex_window),
-            warmup_steps=int(warmup_steps),
+            warmup_steps=resolved_warmup_steps,
             tail_actual_steps=int(tail_actual_steps),
             max_history=int(max_history),
             history_storage=str(history_storage),
-            bootstrap_first_forecast=bootstrap_first_forecast,
+            bootstrap_first_forecast=effective_bootstrap,
             debug=bool(debug),
         ).validate()
         patched = model.clone()
