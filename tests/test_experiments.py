@@ -23,7 +23,7 @@ def _archive(right_value: float) -> OfflineFeatureArchive:
         torch.zeros(1, 1, 2, dtype=torch.float16),
         labels=labels,
         topology=topology,
-        take_cpu_ownership=True,
+        take_ownership=True,
     )
     archive.record_actual(
         2,
@@ -31,8 +31,56 @@ def _archive(right_value: float) -> OfflineFeatureArchive:
         torch.full((1, 1, 2), right_value, dtype=torch.float16),
         labels=labels,
         topology=topology,
-        take_cpu_ownership=True,
+        take_ownership=True,
     )
+    assert archive.complete(minimum_anchors=2)
+    return archive
+
+
+def _interleaved_archive(values: list[float], *, history_storage: str = "system_ram") -> OfflineFeatureArchive:
+    total_steps = len(values) * 2 - 1
+    coordinates = torch.linspace(-1.0, 1.0, total_steps).tolist()
+    archive = OfflineFeatureArchive(
+        total_steps=total_steps,
+        sampler_name="sample_euler",
+        history_storage=history_storage,
+    )
+    for step_id, coordinate in enumerate(coordinates):
+        archive.record_step(step_id, coordinate, step_id % 2 == 0)
+    for anchor_index, value in enumerate(values):
+        step_id = anchor_index * 2
+        archive.record_actual(
+            step_id,
+            coordinates[step_id],
+            torch.full((1, 2, 16), value, dtype=torch.float32),
+            labels=((0, "positive"),),
+            topology=(("target_audio_rows", 1), ("target_video_rows", 1)),
+            take_ownership=True,
+        )
+    assert archive.complete(minimum_anchors=2)
+    return archive
+
+
+def _modality_archive(audio_values: list[float], video_values: list[float]) -> OfflineFeatureArchive:
+    assert len(audio_values) == len(video_values)
+    total_steps = len(audio_values) * 2 - 1
+    coordinates = torch.linspace(-1.0, 1.0, total_steps).tolist()
+    archive = OfflineFeatureArchive(total_steps=total_steps, sampler_name="sample_euler")
+    for step_id, coordinate in enumerate(coordinates):
+        archive.record_step(step_id, coordinate, step_id % 2 == 0)
+    for anchor_index, (audio, video) in enumerate(zip(audio_values, video_values, strict=True)):
+        step_id = anchor_index * 2
+        feature = torch.empty(1, 2, 16)
+        feature[:, 0].fill_(audio)
+        feature[:, 1].fill_(video)
+        archive.record_actual(
+            step_id,
+            coordinates[step_id],
+            feature,
+            labels=((0, "positive"),),
+            topology=(("target_audio_rows", 1), ("target_video_rows", 1)),
+            take_ownership=True,
+        )
     assert archive.complete(minimum_anchors=2)
     return archive
 
@@ -95,6 +143,144 @@ def test_offline_local_component_is_bracketing_interpolation():
     torch.testing.assert_close(middle, torch.full_like(middle, 4.0))
 
 
+def test_offline_spectral_weights_preserve_constant_trajectories_under_ridge():
+    archive = _interleaved_archive([4.0] * 5)
+    smoother = OfflineSmoother(
+        archive,
+        degree=1,
+        ridge_lambda=10.0,
+        blend_weight=1.0,
+    )
+
+    for step_id in (1, 3, 5, 7):
+        prediction = smoother.predict(
+            step_id,
+            rows=(0,),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        torch.testing.assert_close(prediction, torch.full_like(prediction, 4.0))
+        assert smoother._forecast_weights[(step_id, 0)].sum().item() == pytest.approx(1.0)
+
+
+def test_offline_smoother_attenuates_spectral_fit_that_loses_validation():
+    archive = _interleaved_archive([0.0, 1.0, 4.0, 9.0, 16.0])
+    smoother = OfflineSmoother(
+        archive,
+        degree=1,
+        ridge_lambda=0.1,
+        blend_weight=0.5,
+    )
+
+    assert smoother.validation_samples_per_branch == 32
+    assert smoother.validation_stream_count == 2
+    assert smoother.validation_anchor_count == 3
+    assert smoother.attenuated_prediction_count == 4
+    assert 0.0 < smoother.effective_blend_min < smoother.effective_blend_max < 0.5
+    assert smoother.effective_blend_min < smoother.effective_blend_mean < smoother.effective_blend_max
+
+
+def test_offline_smoother_validates_audio_and_video_independently():
+    archive = _modality_archive(
+        [0.0, 1.0, 2.0, 3.0, 4.0],
+        [0.0, 1.0, 0.0, 1.0, 0.0],
+    )
+    smoother = OfflineSmoother(
+        archive,
+        degree=1,
+        ridge_lambda=0.1,
+        blend_weight=0.5,
+    )
+
+    assert smoother.validation_stream_max_scores["audio"] > 1.0
+    assert smoother.validation_stream_max_scores["video"] <= 1.0
+    assert smoother.effective_blend_max < 0.5
+    prediction = smoother.predict(
+        1,
+        rows=(0,),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert prediction.shape == (1, 2, 16)
+
+
+def test_offline_archive_shares_owned_storage_on_selected_device():
+    archive = OfflineFeatureArchive(
+        total_steps=1,
+        sampler_name="sample_euler",
+        history_storage="vram",
+    )
+    archive.record_step(0, 0.0, True)
+    feature = torch.ones(1, 2, 3)
+    archive.record_actual(
+        0,
+        0.0,
+        feature,
+        labels=((0, "positive"),),
+        topology=(("shape", 1),),
+        take_ownership=True,
+    )
+
+    assert archive.anchors[0].feature.data_ptr() == feature.data_ptr()
+    assert archive.history_device == feature.device
+
+
+def test_offline_archive_rejects_unknown_storage():
+    with pytest.raises(ValueError, match="history_storage"):
+        OfflineFeatureArchive(
+            total_steps=1,
+            sampler_name="sample_euler",
+            history_storage="automatic",
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
+def test_offline_vram_archive_and_smoother_share_cuda_anchors():
+    archive = OfflineFeatureArchive(
+        total_steps=3,
+        sampler_name="sample_euler",
+        history_storage="vram",
+    )
+    archive.record_step(0, -1.0, True)
+    archive.record_step(1, 0.0, False)
+    archive.record_step(2, 1.0, True)
+    features = [
+        torch.full((1, 2, 4), value, device="cuda", dtype=torch.float16)
+        for value in (0.0, 2.0)
+    ]
+    for step_id, coordinate, feature in zip((0, 2), (-1.0, 1.0), features, strict=True):
+        archive.record_actual(
+            step_id,
+            coordinate,
+            feature,
+            labels=((0, "positive"),),
+            topology=(("target_audio_rows", 1), ("target_video_rows", 1)),
+            take_ownership=True,
+        )
+    assert archive.complete(minimum_anchors=2)
+
+    smoother = OfflineSmoother(
+        archive,
+        degree=1,
+        ridge_lambda=0.1,
+        blend_weight=0.5,
+    )
+    assert archive.history_device is not None
+    assert archive.history_device.type == "cuda"
+    assert smoother.history_device == archive.history_device
+    assert [anchor.feature.data_ptr() for anchor in archive.anchors] == [
+        feature.data_ptr() for feature in features
+    ]
+    prediction = smoother.predict(
+        1,
+        rows=(0,),
+        device=torch.device("cuda"),
+        dtype=torch.float16,
+    )
+    assert prediction.device.type == "cuda"
+    assert torch.isfinite(prediction).all()
+
+
 def test_offline_archive_requires_a_future_anchor_for_every_forecast():
     archive = OfflineFeatureArchive(total_steps=2, sampler_name="sample_euler")
     archive.record_step(0, -1.0, True)
@@ -105,7 +291,7 @@ def test_offline_archive_requires_a_future_anchor_for_every_forecast():
         torch.zeros(1, 1, 1),
         labels=((0, "positive"),),
         topology=(("shape", 1),),
-        take_cpu_ownership=True,
+        take_ownership=True,
     )
     assert not archive.complete(minimum_anchors=1)
     assert "future actual anchor" in archive.failure_reason

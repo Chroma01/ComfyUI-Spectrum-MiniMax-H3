@@ -81,7 +81,7 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 | `bootstrap_first_forecast` | `true` | Experimental one-point hold for `degree=1` and `warmup_steps<=1`. Incompatible node settings disable it with a console warning. |
 | `anchor_residual_feedback` | `false` | Experimental video-scored actual-refresh guard. It never injects a hidden residual. |
 | `selective_rollback_correction` | `false` | Experimental thresholded, budgeted rollback for the exact deterministic Euler sampler contract. |
-| `offline_smoothing_replay` | `false` | Experimental two-pass anchor archive, bidirectional smoothing, and transformer-free replay. |
+| `offline_smoothing_replay` | `false` | Experimental two-pass anchor archive, cross-validated bidirectional smoothing, and transformer-free replay. |
 
 Every value is validated. `max_history` must be at least `degree + 1`.
 
@@ -142,20 +142,31 @@ Current deterministic RES stores solver-local `old_denoised`, `old_sigma_down`, 
 
 ### Offline smoothing replay
 
-The first pass runs ordinary Spectrum with the external callback suppressed and retains every completed actual anchor in system RAM, independent of causal `max_history` eviction. It also records the exact initial noise, latent, sigma sequence, seed, sampler, schedule decisions, labels, topology, and input shapes needed to restart the same deterministic sampler.
+The first pass runs ordinary Spectrum with the external callback suppressed and retains every completed actual anchor independently of causal `max_history` eviction. Anchors use the selected `history_storage`: system-RAM history and the offline archive share immutable CPU tensors, while `vram` retains the full archive on the producing device and shares the most recent tensors with causal history. It also records the exact initial noise, latent, sigma sequence, seed, sampler, schedule decisions, labels, topology, and input shapes needed to restart the same deterministic sampler.
 
 For a first-pass forecast step, the offline smoother combines:
 
 - a spectral prediction fitted over all retained actual anchors; and
 - linear interpolation between the nearest earlier and later actual anchors.
 
-The existing `blend_weight` mixes those components. First-pass actual coordinates reuse their stored feature exactly, and every smoothed forecast requires a future actual anchor. The replay restarts from cloned original inputs, invokes zero H3 transformer blocks, runs the current replay step's native output heads and reconstruction, and advances the same deterministic solver. External callbacks/previews run during the accepted replay pass only. Interruption checks remain active in both passes.
+Before replay, every interior actual anchor is withheld in turn. A deterministic sample of up to 16,384 hidden values per conditional branch and modality measures the leave-one-anchor-out spectral error against the error of interpolation between the adjacent actual anchors. Audio and video are validated separately. For each missing step, the worse score at the two bracketing anchors limits the spectral share:
+
+```text
+validation_score = RMS(held-out spectral error) / max(RMS(local interpolation error), epsilon)
+effective_blend  = blend_weight / max(1, validation_score)
+```
+
+The configured `blend_weight` therefore remains an upper bound. A spectral fit that validates at least as well as local interpolation retains that share; a worse fit is attenuated in direct proportion to its error ratio. The worse audio/video score controls one packed-feature blend, preserving the coupled H3 hidden state without allocating separate full prediction buffers. Spectral weights receive a minimal affine correction so they sum to one, preventing ridge regularization from moving a constant hidden trajectory.
+
+First-pass actual coordinates reuse their stored feature exactly, and every smoothed forecast requires a future actual anchor. The replay restarts from cloned original inputs, invokes zero H3 transformer blocks, runs the current replay step's native output heads and reconstruction, and advances the same deterministic solver. External callbacks/previews run during the accepted replay pass only. Interruption checks remain active in both passes.
 
 This is an anchor-reuse approximation. The stored actual anchors were evaluated on the first-pass trajectory, while replay generally follows a different trajectory. Future anchors improve the hidden-feature interpolation but do not make those anchors native-equivalent at the replay latent. The method is not lossless, fully corrected, or guaranteed to improve quality.
 
-Offline memory includes cloned initial sampling inputs plus every actual hidden anchor in system RAM, even when causal history uses VRAM. Replay adds a second sampler pass and output-head work while eliminating H3 transformer calls only in that second pass. Debug summaries separately report CPU archive-copy time, smoother-build time, retained archive size, hypothetical full-schedule size, archived-anchor replay steps, smoothed replay steps, and the smoother's real history/chunk counters. If the first pass is unsupported, intercepted, disabled, incomplete, or changes topology, replay is skipped and the valid first-pass result is returned with one warning.
+Offline memory includes cloned initial sampling inputs plus every actual hidden anchor on the selected history device. With `max_history=8` and the observed 11-anchor schedule, shared ownership retains 11 unique feature tensors rather than an eight-entry causal history plus a separate eleven-entry archive. At the supplied 0.65 MP / 8-second shape, this changes explicit `vram` storage from approximately 2.90 GiB VRAM plus 3.89 GiB system RAM to approximately 3.89 GiB VRAM total for history/archive, excluding allocator overhead and input clones. System-RAM storage remains approximately 3.89 GiB and avoids duplicate anchor copies.
 
-Across three supplied 0.65 MP / 8-second runs, the transformer-free replay added 8.49%, 8.63%, and 8.95% to its corresponding first-pass sampler time while retaining 11 first-pass H3 calls. The tested seed appeared equivalent to ordinary Spectrum, so this mode remains useful only when a matched A/B demonstrates a quality gain that justifies the second pass and CPU archive.
+Replay adds a second sampler pass and output-head work while eliminating H3 transformer calls only in that second pass. Debug summaries separately report archive time, smoother-build and validation time, retained archive size and device, hypothetical full-schedule size, held-out sample/anchor/stream counts, maximum audio/video validation scores, effective blend range/mean, attenuated predictions, archived-anchor replay steps, smoothed replay steps, and the smoother's real history/chunk counters. If the first pass is unsupported, intercepted, disabled, incomplete, or changes topology, replay is skipped and the valid first-pass result is returned with one warning.
+
+Across three supplied 0.65 MP / 8-second runs of the earlier fixed-blend implementation, the transformer-free replay added 8.49%, 8.63%, and 8.95% to its corresponding first-pass sampler time while retaining 11 first-pass H3 calls. The tested seed appeared equivalent to ordinary Spectrum. The cross-validated blend and shared-VRAM archive have not yet been measured on the full checkpoint, so this mode remains useful only when a matched A/B demonstrates a quality gain that justifies the second pass.
 
 ### Preliminary performance preset (default)
 
@@ -305,7 +316,7 @@ Automated tests cover:
 - refresh-only anchor feedback with video-only policy scoring, a `1.5` threshold, a three-refresh budget, and no retained/injected hidden residual;
 - terminal feedback-probe elimination while preserving the final rollback validation probe;
 - rollback threshold and three-correction budget enforcement;
-- separate residual output-head timing, offline archive/build timing, replay anchor/smoothed counts, and replay smoother history/chunk reporting;
+- separate residual output-head timing, offline archive/build timing, cross-validation and effective-blend reporting, replay anchor/smoothed counts, and replay smoother history/chunk reporting;
 - downstream `predict_noise` passthroughs that never reach the native H3 wrapper, including one-warning disablement and retained-history release.
 
 A community compatibility report confirmed that revision `dc6291525112cb4246f864738e5bb4e2b85446da` ran without source changes on Windows 11 with a Radeon AI PRO R9700 32 GB, PyTorch 2.9.1 + ROCm 7.2.1, and ComfyUI 0.30.0. In the reported 20-step RES multistep, 864x480, 107-frame `system_ram` workflow, the expected 14 actual and 6 forecasted evaluations reduced warm elapsed time from 212.73 s to 160.97 s (24.33% lower time; about 1.32x throughput). This validates only that exact configuration; other AMD GPUs, ROCm builds, workflows, and quality cases remain unverified. See [issue #6](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues/6).

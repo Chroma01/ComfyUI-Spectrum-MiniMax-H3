@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import bisect
 import math
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -11,6 +12,7 @@ from .forecast import HistoryWeightForecaster
 
 
 DEFAULT_CHUNK_BYTES = 32 * 1024 * 1024
+OFFLINE_VALIDATION_SAMPLES = 16 * 1024
 
 
 def _chunk_elements(chunk_bytes: int) -> int:
@@ -111,15 +113,25 @@ class OfflineAnchor:
 
 
 class OfflineFeatureArchive:
-    def __init__(self, *, total_steps: int, sampler_name: str) -> None:
+    def __init__(
+        self,
+        *,
+        total_steps: int,
+        sampler_name: str,
+        history_storage: str = "system_ram",
+    ) -> None:
+        if history_storage not in {"system_ram", "vram"}:
+            raise ValueError("history_storage must be 'system_ram' or 'vram'")
         self.total_steps = int(total_steps)
         self.sampler_name = str(sampler_name)
+        self.history_storage = str(history_storage)
         self.steps: list[OfflineStepRecord] = []
         self.anchors: list[OfflineAnchor] = []
         self.labels: tuple[Any, ...] | None = None
         self.topology: tuple[Any, ...] | None = None
         self.feature_shape: tuple[int, ...] | None = None
         self.feature_dtype: torch.dtype | None = None
+        self.history_device: torch.device | None = None
         self.valid = True
         self.failure_reason: str | None = None
 
@@ -156,7 +168,7 @@ class OfflineFeatureArchive:
         *,
         labels: tuple[Any, ...],
         topology: tuple[Any, ...],
-        take_cpu_ownership: bool,
+        take_ownership: bool,
     ) -> None:
         if not self.valid:
             return
@@ -174,10 +186,16 @@ class OfflineFeatureArchive:
             return
 
         detached = feature.detach()
-        if take_cpu_ownership and detached.device.type == "cpu" and detached.is_contiguous():
+        storage_device = torch.device("cpu") if self.history_storage == "system_ram" else detached.device
+        if self.history_device is None:
+            self.history_device = storage_device
+        elif storage_device != self.history_device:
+            self.invalidate("offline actual feature device changed")
+            return
+        if take_ownership and detached.device == storage_device and detached.is_contiguous():
             archived = detached
         else:
-            archived = detached.to(device="cpu", dtype=feature.dtype, copy=True).contiguous()
+            archived = detached.to(device=storage_device, dtype=feature.dtype, copy=True).contiguous()
         self.anchors.append(OfflineAnchor(int(step_id), float(coordinate), archived))
 
     def complete(self, *, minimum_anchors: int) -> bool:
@@ -214,6 +232,7 @@ class OfflineFeatureArchive:
         self.topology = None
         self.feature_shape = None
         self.feature_dtype = None
+        self.history_device = None
 
 
 class OfflineSmoother:
@@ -230,17 +249,41 @@ class OfflineSmoother:
             raise ValueError("offline archive is incomplete")
         self.archive = archive
         self.blend_weight = float(blend_weight)
+        if not 0.0 <= self.blend_weight <= 1.0:
+            raise ValueError("blend_weight must be in [0, 1]")
+        self.degree = int(degree)
+        self.ridge_lambda = float(ridge_lambda)
         self._anchor_ids = [anchor.step_id for anchor in archive.anchors]
         self._anchor_by_step = {anchor.step_id: anchor for anchor in archive.anchors}
+        self._branch_count = int(archive.anchors[0].feature.shape[0])
         self._forecaster = HistoryWeightForecaster(
             degree=degree,
             ridge_lambda=ridge_lambda,
             max_history=max(len(archive.anchors), degree + 1, 2),
             chunk_bytes=chunk_bytes,
-            history_storage="system_ram",
+            history_storage=archive.history_storage,
         )
         for anchor in archive.anchors:
             self._forecaster.update(anchor.coordinate, anchor.feature, take_ownership=True)
+        self._stream_ranges = self._resolve_stream_ranges()
+        self.validation_stream_count = len(self._stream_ranges)
+        self.validation_stream_max_scores = {
+            name: 0.0 for name, _, _ in self._stream_ranges
+        }
+        self.validation_samples_per_branch = 0
+        self.validation_anchor_count = 0
+        self.attenuated_prediction_count = 0
+        self.local_only_prediction_count = 0
+        self.effective_blend_min = self.blend_weight
+        self.effective_blend_mean = self.blend_weight
+        self.effective_blend_max = self.blend_weight
+        self._last_prediction_chunk_count = 0
+        validation_started = time.perf_counter()
+        try:
+            self._validation_scores = self._build_validation_scores()
+        finally:
+            self.validation_seconds = time.perf_counter() - validation_started
+        self._forecast_weights = self._build_forecast_weights()
 
     @property
     def history_length(self) -> int:
@@ -256,23 +299,171 @@ class OfflineSmoother:
 
     @property
     def last_prediction_chunk_count(self) -> int:
-        return self._forecaster.last_prediction_chunk_count
+        return self._last_prediction_chunk_count
 
-    def _weights_for_step(self, record: OfflineStepRecord) -> torch.Tensor:
-        spectral = self._forecaster.spectral_weights(record.coordinate)
-        position = bisect.bisect_left(self._anchor_ids, record.step_id)
-        if position == 0 or position == len(self._anchor_ids):
-            raise RuntimeError("offline forecast requires bracketing actual anchors")
-        left = self.archive.anchors[position - 1]
-        right = self.archive.anchors[position]
-        spacing = right.coordinate - left.coordinate
-        if abs(spacing) <= 1e-12:
-            raise RuntimeError("offline bracketing anchors have duplicate coordinates")
-        ratio = (record.coordinate - left.coordinate) / spacing
-        local = torch.zeros(len(self.archive.anchors), dtype=torch.float32)
-        local[position - 1] = 1.0 - ratio
-        local[position] = ratio
-        return self.blend_weight * spectral + (1.0 - self.blend_weight) * local
+    @staticmethod
+    def _affine_spectral_weights(weights: torch.Tensor) -> torch.Tensor:
+        normalized = weights.detach().to(device="cpu", dtype=torch.float32).clone()
+        if normalized.ndim != 1 or normalized.numel() == 0 or not bool(torch.isfinite(normalized).all().item()):
+            raise RuntimeError("offline spectral weights are invalid")
+        normalized.add_((1.0 - float(normalized.sum().item())) / normalized.numel())
+        if not bool(torch.isfinite(normalized).all().item()):
+            raise RuntimeError("offline affine spectral correction is nonfinite")
+        return normalized
+
+    def _resolve_stream_ranges(self) -> list[tuple[str, int, int]]:
+        feature_shape = self.archive.feature_shape
+        if feature_shape is None or len(feature_shape) != 3:
+            raise RuntimeError("offline smoothing requires [branch, rows, width] features")
+        topology = {
+            str(entry[0]): entry[1]
+            for entry in (self.archive.topology or ())
+            if isinstance(entry, tuple) and len(entry) == 2
+        }
+        audio_rows = topology.get("target_audio_rows")
+        video_rows = topology.get("target_video_rows")
+        if (
+            isinstance(audio_rows, int)
+            and isinstance(video_rows, int)
+            and audio_rows > 0
+            and video_rows > 0
+            and audio_rows + video_rows == feature_shape[1]
+        ):
+            return [
+                ("audio", 0, audio_rows),
+                ("video", audio_rows, audio_rows + video_rows),
+            ]
+        return [("packed", 0, feature_shape[1])]
+
+    def _sampled_anchors(self, start_row: int, end_row: int) -> torch.Tensor:
+        width = self.archive.anchors[0].feature.shape[2]
+        tail_numel = (end_row - start_row) * width
+        sample_count = min(OFFLINE_VALIDATION_SAMPLES, tail_numel)
+        flat_indices = torch.div(
+            torch.arange(sample_count, dtype=torch.int64) * tail_numel,
+            sample_count,
+            rounding_mode="floor",
+        )
+        feature_rows = torch.div(flat_indices, width, rounding_mode="floor") + start_row
+        feature_columns = flat_indices.remainder(width)
+        sampled = []
+        for anchor in self.archive.anchors:
+            rows = feature_rows.to(device=anchor.feature.device)
+            columns = feature_columns.to(device=anchor.feature.device)
+            sampled.append(
+                anchor.feature[:, rows, columns].to(device="cpu", dtype=torch.float32)
+            )
+        self.validation_samples_per_branch += sample_count
+        return torch.stack(sampled, dim=0)
+
+    def _build_validation_scores(self) -> list[list[list[float | None]]]:
+        anchor_count = len(self.archive.anchors)
+        scores: list[list[list[float | None]]] = [
+            [[None] * self._branch_count for _ in range(anchor_count)]
+            for _ in self._stream_ranges
+        ]
+        if anchor_count < self.degree + 2 or anchor_count < 3:
+            return scores
+
+        for stream_index, (stream_name, start_row, end_row) in enumerate(self._stream_ranges):
+            samples = self._sampled_anchors(start_row, end_row)
+            for target_index in range(1, anchor_count - 1):
+                retained = [index for index in range(anchor_count) if index != target_index]
+                validator = HistoryWeightForecaster(
+                    degree=self.degree,
+                    ridge_lambda=self.ridge_lambda,
+                    max_history=max(len(retained), self.degree + 1, 2),
+                    chunk_bytes=DEFAULT_CHUNK_BYTES,
+                    history_storage="system_ram",
+                )
+                for index in retained:
+                    validator.update(
+                        self.archive.anchors[index].coordinate,
+                        samples[index],
+                        take_ownership=True,
+                    )
+                spectral = self._affine_spectral_weights(
+                    validator.spectral_weights(self.archive.anchors[target_index].coordinate)
+                )
+                spectral_prediction = torch.einsum("k,kbs->bs", spectral, samples[retained])
+
+                left = self.archive.anchors[target_index - 1]
+                target = self.archive.anchors[target_index]
+                right = self.archive.anchors[target_index + 1]
+                spacing = right.coordinate - left.coordinate
+                if abs(spacing) <= 1e-12:
+                    raise RuntimeError("offline validation anchors have duplicate coordinates")
+                ratio = (target.coordinate - left.coordinate) / spacing
+                local_prediction = torch.lerp(samples[target_index - 1], samples[target_index + 1], ratio)
+                target_samples = samples[target_index]
+
+                for branch in range(self._branch_count):
+                    actual = target_samples[branch]
+                    spectral_rms = float(torch.sqrt(torch.mean((spectral_prediction[branch] - actual) ** 2)).item())
+                    local_rms = float(torch.sqrt(torch.mean((local_prediction[branch] - actual) ** 2)).item())
+                    actual_rms = float(torch.sqrt(torch.mean(actual * actual)).item())
+                    epsilon = max(actual_rms * 1e-6, torch.finfo(torch.float32).eps)
+                    if spectral_rms <= epsilon and local_rms <= epsilon:
+                        score = 0.0
+                    else:
+                        score = spectral_rms / max(local_rms, epsilon)
+                    if not math.isfinite(score):
+                        raise RuntimeError("offline validation score is nonfinite")
+                    scores[stream_index][target_index][branch] = score
+                    self.validation_stream_max_scores[stream_name] = max(
+                        self.validation_stream_max_scores[stream_name], score
+                    )
+        self.validation_anchor_count = anchor_count - 2
+        return scores
+
+    def _validation_score_for_interval(self, position: int, branch: int, stream_index: int) -> float:
+        nearby = [
+            self._validation_scores[stream_index][index][branch]
+            for index in (position - 1, position)
+            if self._validation_scores[stream_index][index][branch] is not None
+        ]
+        return max(nearby, default=1.0)
+
+    def _build_forecast_weights(self) -> dict[tuple[int, int], torch.Tensor]:
+        weights_by_step: dict[tuple[int, int], torch.Tensor] = {}
+        effective_blends: list[float] = []
+        for record in self.archive.steps:
+            if record.actual:
+                continue
+            spectral = self._affine_spectral_weights(
+                self._forecaster.spectral_weights(record.coordinate)
+            )
+            position = bisect.bisect_left(self._anchor_ids, record.step_id)
+            if position == 0 or position == len(self._anchor_ids):
+                raise RuntimeError("offline forecast requires bracketing actual anchors")
+            left = self.archive.anchors[position - 1]
+            right = self.archive.anchors[position]
+            spacing = right.coordinate - left.coordinate
+            if abs(spacing) <= 1e-12:
+                raise RuntimeError("offline bracketing anchors have duplicate coordinates")
+            ratio = (record.coordinate - left.coordinate) / spacing
+            local = torch.zeros(len(self.archive.anchors), dtype=torch.float32)
+            local[position - 1] = 1.0 - ratio
+            local[position] = ratio
+            for branch in range(self._branch_count):
+                validation_score = max(
+                    self._validation_score_for_interval(position, branch, stream_index)
+                    for stream_index in range(len(self._stream_ranges))
+                )
+                effective_blend = self.blend_weight / max(1.0, validation_score)
+                weights_by_step[(record.step_id, branch)] = (
+                    effective_blend * spectral + (1.0 - effective_blend) * local
+                )
+                effective_blends.append(effective_blend)
+                if effective_blend < self.blend_weight - 1e-7:
+                    self.attenuated_prediction_count += 1
+                if effective_blend <= 1e-7:
+                    self.local_only_prediction_count += 1
+        if effective_blends:
+            self.effective_blend_min = min(effective_blends)
+            self.effective_blend_mean = sum(effective_blends) / len(effective_blends)
+            self.effective_blend_max = max(effective_blends)
+        return weights_by_step
 
     def predict(
         self,
@@ -287,11 +478,25 @@ class OfflineSmoother:
         if anchor is not None:
             weights = torch.zeros(len(self.archive.anchors), dtype=torch.float32)
             weights[self._anchor_ids.index(record.step_id)] = 1.0
-        else:
-            weights = self._weights_for_step(record)
-        return self._forecaster.predict_with_weights(
-            weights,
-            rows=rows,
-            device=device,
-            dtype=dtype,
-        )
+            result = self._forecaster.predict_with_weights(
+                weights,
+                rows=rows,
+                device=device,
+                dtype=dtype,
+            )
+            self._last_prediction_chunk_count = self._forecaster.last_prediction_chunk_count
+            return result
+
+        predictions = []
+        chunks = 0
+        for row in rows:
+            prediction = self._forecaster.predict_with_weights(
+                self._forecast_weights[(record.step_id, int(row))],
+                rows=(int(row),),
+                device=device,
+                dtype=dtype,
+            )
+            predictions.append(prediction)
+            chunks += self._forecaster.last_prediction_chunk_count
+        self._last_prediction_chunk_count = chunks
+        return torch.cat(predictions, dim=0)

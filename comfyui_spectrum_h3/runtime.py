@@ -89,6 +89,18 @@ class RuntimeStats:
     offline_replay_model_calls: int = 0
     offline_replay_anchor_steps: int = 0
     offline_replay_smoothed_steps: int = 0
+    offline_validation_samples_per_branch: int = 0
+    offline_validation_anchors: int = 0
+    offline_validation_streams: int = 0
+    offline_validation_seconds: float = 0.0
+    offline_validation_audio_max: float = 0.0
+    offline_validation_video_max: float = 0.0
+    offline_validation_packed_max: float = 0.0
+    offline_attenuated_predictions: int = 0
+    offline_local_only_predictions: int = 0
+    offline_effective_blend_min: float = 0.0
+    offline_effective_blend_mean: float = 0.0
+    offline_effective_blend_max: float = 0.0
 
 
 @dataclass(slots=True)
@@ -280,6 +292,23 @@ class SpectrumH3Runtime:
     def record_residual_output_head_seconds(self, elapsed: float) -> None:
         self.stats.residual_output_head_seconds += max(0.0, float(elapsed))
 
+    def _record_offline_smoother_stats(self) -> None:
+        smoother = self._offline_smoother
+        if smoother is None:
+            return
+        self.stats.offline_validation_samples_per_branch = smoother.validation_samples_per_branch
+        self.stats.offline_validation_anchors = smoother.validation_anchor_count
+        self.stats.offline_validation_streams = smoother.validation_stream_count
+        self.stats.offline_validation_seconds = smoother.validation_seconds
+        self.stats.offline_validation_audio_max = smoother.validation_stream_max_scores.get("audio", 0.0)
+        self.stats.offline_validation_video_max = smoother.validation_stream_max_scores.get("video", 0.0)
+        self.stats.offline_validation_packed_max = smoother.validation_stream_max_scores.get("packed", 0.0)
+        self.stats.offline_attenuated_predictions = smoother.attenuated_prediction_count
+        self.stats.offline_local_only_predictions = smoother.local_only_prediction_count
+        self.stats.offline_effective_blend_min = smoother.effective_blend_min
+        self.stats.offline_effective_blend_mean = smoother.effective_blend_mean
+        self.stats.offline_effective_blend_max = smoother.effective_blend_max
+
     def _residual_experiment_enabled(self) -> bool:
         return bool(
             not self._experiment_disabled
@@ -387,6 +416,7 @@ class SpectrumH3Runtime:
             self.stats.offline_estimated_archive_bytes = self._offline_archive.estimated_tensor_bytes
             self.stats.offline_archive_seconds = self._offline_archive_seconds_total
             self.stats.offline_smoother_build_seconds = self._offline_smoother_build_seconds_total
+            self._record_offline_smoother_stats()
         return self._run.run_id
 
     def end_run(self, run_id: int) -> None:
@@ -417,6 +447,7 @@ class SpectrumH3Runtime:
         self._offline_archive = OfflineFeatureArchive(
             total_steps=total_steps,
             sampler_name=sampler_name,
+            history_storage=self.config.history_storage,
         )
 
     def complete_offline_capture(self) -> bool:
@@ -438,6 +469,7 @@ class SpectrumH3Runtime:
                 ridge_lambda=self.config.ridge_lambda,
                 blend_weight=self.config.blend_weight,
             )
+            self._record_offline_smoother_stats()
         except (RuntimeError, ValueError) as exc:
             archive.invalidate(f"offline smoother construction failed: {exc}")
             return False
@@ -1160,7 +1192,7 @@ class SpectrumH3Runtime:
                             combined,
                             labels=self._history_labels,
                             topology=step.calls[0].topology,
-                            take_cpu_ownership=self.config.history_storage == "system_ram",
+                            take_ownership=True,
                         )
                     finally:
                         elapsed = time.perf_counter() - archive_started
@@ -1374,6 +1406,18 @@ class SpectrumH3Runtime:
             f"offline_replay_calls={self.stats.offline_replay_model_calls} "
             f"offline_replay_anchor_steps={self.stats.offline_replay_anchor_steps} "
             f"offline_replay_smoothed_steps={self.stats.offline_replay_smoothed_steps} "
+            f"offline_validation_samples_per_branch={self.stats.offline_validation_samples_per_branch} "
+            f"offline_validation_anchors={self.stats.offline_validation_anchors} "
+            f"offline_validation_streams={self.stats.offline_validation_streams} "
+            f"offline_validation_s={self.stats.offline_validation_seconds:.3f} "
+            f"offline_validation_audio_max={self.stats.offline_validation_audio_max:.6f} "
+            f"offline_validation_video_max={self.stats.offline_validation_video_max:.6f} "
+            f"offline_validation_packed_max={self.stats.offline_validation_packed_max:.6f} "
+            f"offline_attenuated_predictions={self.stats.offline_attenuated_predictions} "
+            f"offline_local_only_predictions={self.stats.offline_local_only_predictions} "
+            f"offline_effective_blend_min={self.stats.offline_effective_blend_min:.6f} "
+            f"offline_effective_blend_mean={self.stats.offline_effective_blend_mean:.6f} "
+            f"offline_effective_blend_max={self.stats.offline_effective_blend_max:.6f} "
             f"offline_archive_mib={self.stats.offline_archive_bytes / (1024 * 1024):.1f} "
             f"offline_full_schedule_estimated_mib={self.stats.offline_estimated_archive_bytes / (1024 * 1024):.1f} "
             f"direct_history_updates={self.stats.direct_history_updates} "

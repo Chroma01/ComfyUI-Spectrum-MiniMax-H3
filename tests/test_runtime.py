@@ -1094,12 +1094,14 @@ def test_terminal_feedback_probe_is_skipped_but_rollback_probe_is_retained():
         runtime.abort_step(decision["run_id"], decision["step_id"])
 
 
-def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_calls():
+@pytest.mark.parametrize("history_storage", ["system_ram", "vram"])
+def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_calls(history_storage):
     runtime = _runtime(
         offline_smoothing_replay=True,
         max_history=2,
         warmup_steps=2,
         tail_actual_steps=0,
+        history_storage=history_storage,
     )
     sigmas = torch.linspace(1.0, 0.0, 7)
     runtime.begin_offline_capture(total_steps=6, sampler_name="sample_euler")
@@ -1143,6 +1145,17 @@ def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_call
     archive = runtime.offline_archive
     assert archive is not None
     assert len(archive.anchors) == 4
+    assert archive.history_storage == history_storage
+    assert archive.history_device == torch.device("cpu")
+    assert {
+        anchor.feature.data_ptr() for anchor in archive.anchors[-2:]
+    } == {
+        entry.feature_flat.data_ptr() for entry in runtime.forecaster._history
+    }
+    assert runtime.stats.offline_validation_samples_per_branch == 12
+    assert runtime.stats.offline_validation_anchors == 2
+    assert runtime.stats.offline_attenuated_predictions == 2
+    assert runtime.stats.offline_effective_blend_min < runtime.config.blend_weight
     actual_features = {anchor.step_id: anchor.feature.clone() for anchor in archive.anchors}
     runtime.end_run(run_id)
 
@@ -1187,6 +1200,9 @@ def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_call
     summary = runtime.debug_summary()
     assert "offline_replay_anchor_steps=4" in summary
     assert "offline_replay_smoothed_steps=2" in summary
+    assert "offline_validation_samples_per_branch=12" in summary
+    assert "offline_attenuated_predictions=2" in summary
+    assert "offline_effective_blend_mean=" in summary
     assert "offline_full_schedule_estimated_mib=" in summary
     assert "history_device='cpu'" in summary
     runtime.end_run(replay_id)
