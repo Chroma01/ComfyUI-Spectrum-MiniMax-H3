@@ -50,6 +50,7 @@ def test_preliminary_scheduler_defaults():
     assert config.bootstrap_first_forecast is True
     assert config.blend_weight == 0.5
     assert config.audio_blend_weight == 0.0
+    assert config.offline_smoothing_replay is True
     assert required["degree"][1]["default"] == 1
     assert required["warmup_steps"][1]["default"] == 1
     assert required["tail_actual_steps"][1]["default"] == 1
@@ -63,11 +64,10 @@ def test_preliminary_scheduler_defaults():
     assert optional["audio_blend_weight"][0] == "FLOAT"
     assert optional["audio_blend_weight"][1]["default"] == 0.0
     assert apply_parameters["audio_blend_weight"].default == 0.0
-    for name in (
-        "anchor_residual_feedback",
-        "selective_rollback_correction",
-        "offline_smoothing_replay",
-    ):
+    assert optional["offline_smoothing_replay"][0] == "BOOLEAN"
+    assert optional["offline_smoothing_replay"][1]["default"] is True
+    assert apply_parameters["offline_smoothing_replay"].default is True
+    for name in ("anchor_residual_feedback", "selective_rollback_correction"):
         assert getattr(config, name) is False
         assert optional[name][0] == "BOOLEAN"
         assert optional[name][1]["default"] is False
@@ -83,7 +83,7 @@ def test_preliminary_scheduler_defaults():
     ),
 )
 @pytest.mark.parametrize("value", [0, 1, "false", None])
-def test_experimental_settings_require_strict_booleans(name, value):
+def test_trajectory_settings_require_strict_booleans(name, value):
     with pytest.raises(TypeError, match=rf"{name} must be a boolean"):
         SpectrumH3Config(**{name: value})
 
@@ -101,7 +101,7 @@ def test_experimental_settings_require_strict_booleans(name, value):
         ),
     ),
 )
-def test_experimental_settings_are_mutually_exclusive_on_construction(enabled):
+def test_trajectory_settings_are_mutually_exclusive_on_construction(enabled):
     values = {name: True for name in enabled}
     with pytest.raises(ValueError) as error:
         SpectrumH3Config(**values)
@@ -109,7 +109,25 @@ def test_experimental_settings_are_mutually_exclusive_on_construction(enabled):
         assert name in str(error.value)
 
 
-def test_disabled_config_allows_irrelevant_experimental_conflicts():
+@pytest.mark.parametrize(
+    "name",
+    ("anchor_residual_feedback", "selective_rollback_correction"),
+)
+def test_research_modes_require_explicitly_disabling_default_offline_replay(name):
+    with pytest.raises(ValueError) as error:
+        SpectrumH3Config(**{name: True})
+    assert name in str(error.value)
+    assert "offline_smoothing_replay" in str(error.value)
+
+    config = SpectrumH3Config(
+        **{name: True},
+        offline_smoothing_replay=False,
+    ).validate()
+    assert getattr(config, name) is True
+    assert config.offline_smoothing_replay is False
+
+
+def test_disabled_config_allows_irrelevant_trajectory_conflicts():
     config = SpectrumH3Config(
         enabled=False,
         anchor_residual_feedback=True,
@@ -119,7 +137,7 @@ def test_disabled_config_allows_irrelevant_experimental_conflicts():
     config.validate()
 
 
-def test_disabled_node_returns_original_before_experimental_validation():
+def test_disabled_node_returns_original_before_trajectory_validation():
     model = object()
     (result,) = SpectrumApplyMiniMaxH3().apply(
         model,
@@ -142,6 +160,7 @@ def test_disabled_node_returns_original_before_experimental_validation():
 def test_aggressive_preset_explicitly_disables_degree_one_bootstrap():
     assert AGGRESSIVE_PRESET.degree == 4
     assert AGGRESSIVE_PRESET.bootstrap_first_forecast is False
+    assert AGGRESSIVE_PRESET.offline_smoothing_replay is True
     AGGRESSIVE_PRESET.validate()
 
 

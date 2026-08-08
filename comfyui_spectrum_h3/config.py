@@ -21,22 +21,22 @@ class SpectrumH3Config:
     bootstrap_first_forecast: bool = True
     anchor_residual_feedback: bool = False
     selective_rollback_correction: bool = False
-    offline_smoothing_replay: bool = False
+    offline_smoothing_replay: bool = True
     audio_blend_weight: float = 0.0
 
     def __post_init__(self) -> None:
-        experimental = {
+        trajectory_modes = {
             "anchor_residual_feedback": self.anchor_residual_feedback,
             "selective_rollback_correction": self.selective_rollback_correction,
             "offline_smoothing_replay": self.offline_smoothing_replay,
         }
-        for name, value in experimental.items():
+        for name, value in trajectory_modes.items():
             if not isinstance(value, bool):
                 raise TypeError(f"{name} must be a boolean")
-        conflicts = [name for name, value in experimental.items() if value]
+        conflicts = [name for name, value in trajectory_modes.items() if value]
         if self.enabled and len(conflicts) > 1:
             raise ValueError(
-                "Spectrum H3 experimental modes are mutually exclusive; conflicting settings: "
+                "Spectrum H3 trajectory modes are mutually exclusive; conflicting settings: "
                 + ", ".join(conflicts)
             )
 
@@ -71,7 +71,7 @@ class SpectrumH3Config:
         ]
         if self.enabled and len(conflicts) > 1:
             raise ValueError(
-                "Spectrum H3 experimental modes are mutually exclusive; conflicting settings: "
+                "Spectrum H3 trajectory modes are mutually exclusive; conflicting settings: "
                 + ", ".join(conflicts)
             )
         if not math.isfinite(self.blend_weight) or not 0.0 <= self.blend_weight <= 1.0:

@@ -24,6 +24,7 @@ def _runtime(**overrides):
         "tail_actual_steps": 0,
         "window_size": 2.0,
         "bootstrap_first_forecast": False,
+        "offline_smoothing_replay": False,
     }
     values.update(overrides)
     return SpectrumH3Runtime(SpectrumH3Config(**values))
@@ -870,6 +871,7 @@ def _measured_anchor(runtime, timestep, *, video_values, audio_values):
 def _feedback_runtime():
     runtime = _runtime(
         anchor_residual_feedback=True,
+        offline_smoothing_replay=False,
         warmup_steps=2,
         window_size=2.0,
         flex_window=0.75,
@@ -1124,7 +1126,7 @@ def test_terminal_feedback_probe_is_skipped_but_rollback_probe_is_retained():
         ("anchor_residual_feedback", False),
         ("selective_rollback_correction", True),
     ):
-        runtime = _runtime(**{setting: True})
+        runtime = _runtime(offline_smoothing_replay=False, **{setting: True})
         runtime.start_run(
             torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
             "sample_euler",

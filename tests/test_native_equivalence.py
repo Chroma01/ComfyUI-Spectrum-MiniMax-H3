@@ -358,6 +358,7 @@ def test_anchor_residual_probe_runs_current_heads_without_marking_actual_as_fore
             flex_window=0.0,
             bootstrap_first_forecast=False,
             anchor_residual_feedback=True,
+            offline_smoothing_replay=False,
         )
     )
     run_id = runtime.start_run(

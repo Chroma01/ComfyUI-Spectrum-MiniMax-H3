@@ -91,23 +91,31 @@ class SpectrumApplyMiniMaxH3:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Experimental video-scored actual-refresh guard; never injects a hidden residual.",
+                        "tooltip": (
+                            "Experimental video-scored actual-refresh guard; never injects a hidden residual. "
+                            "Disable offline_smoothing_replay before enabling this mode."
+                        ),
                     },
                 ),
                 "selective_rollback_correction": (
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Experimental thresholded, budgeted rollback for the reviewed deterministic Euler sampler only.",
+                        "tooltip": (
+                            "Experimental thresholded, budgeted rollback for the reviewed deterministic Euler sampler only. "
+                            "Disable offline_smoothing_replay before enabling this mode."
+                        ),
                     },
                 ),
                 "offline_smoothing_replay": (
                     "BOOLEAN",
                     {
-                        "default": False,
+                        "default": True,
                         "tooltip": (
-                            "Experimental two-pass replay: capture a local-only trajectory, then apply "
-                            "the configured video/audio blends using past and future anchors."
+                            "Default audio-quality path: capture a local-only trajectory, then apply the "
+                            "configured video/audio blends using past and future anchors without causal "
+                            "video-to-audio feedback. Uses a second sampler pass and retains every actual anchor. "
+                            "Disable only for single-pass comparisons or either research mode."
                         ),
                     },
                 ),
@@ -120,7 +128,7 @@ class SpectrumApplyMiniMaxH3:
                         "step": 0.01,
                         "tooltip": (
                             "Direct audio spectral share. The default 0 prevents spectral mixing of audio rows. "
-                            "Use offline_smoothing_replay to isolate capture from video-to-audio trajectory coupling."
+                            "The default offline replay path also isolates capture from video-to-audio trajectory coupling."
                         ),
                     },
                 ),
@@ -149,7 +157,7 @@ class SpectrumApplyMiniMaxH3:
         bootstrap_first_forecast=True,
         anchor_residual_feedback=False,
         selective_rollback_correction=False,
-        offline_smoothing_replay=False,
+        offline_smoothing_replay=True,
         audio_blend_weight=0.0,
     ):
         if not enabled:

@@ -74,6 +74,7 @@ def _run(
             flex_window=0.0,
             bootstrap_first_forecast=False,
             selective_rollback_correction=True,
+            offline_smoothing_replay=False,
             audio_blend_weight=0.5,
         )
     )
