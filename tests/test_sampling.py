@@ -176,7 +176,7 @@ def test_predict_noise_passthrough_survives_a_downstream_model_bypass(caplog):
         runtime.end_run(run_id)
 
 
-def test_offline_outer_sample_restarts_from_cloned_inputs_and_callbacks_only_replay():
+def test_default_offline_outer_sample_restarts_from_cloned_inputs_and_callbacks_only_replay():
     runtime = SpectrumH3Runtime(
         SpectrumH3Config(
             degree=1,
@@ -184,7 +184,6 @@ def test_offline_outer_sample_restarts_from_cloned_inputs_and_callbacks_only_rep
             warmup_steps=2,
             tail_actual_steps=0,
             bootstrap_first_forecast=False,
-            offline_smoothing_replay=True,
             audio_blend_weight=0.5,
         )
     )
@@ -322,6 +321,7 @@ def test_selective_rollback_res_falls_back_before_sampler_mutation(monkeypatch, 
             warmup_steps=2,
             bootstrap_first_forecast=False,
             selective_rollback_correction=True,
+            offline_smoothing_replay=False,
         )
     )
     run_id = runtime.start_run(

@@ -1,46 +1,31 @@
-# Spectrum MiniMax H3 v0.2.0
+# Spectrum MiniMax H3 v0.2.1
 
-Adds three default-off trajectory-correction experiments and isolates MiniMax H3 audio from unsafe shared spectral blending. Existing workflows continue to load with every new experiment disabled.
+Makes the validated H3 audio-quality correction the standard default path.
 
-## Audio and modality handling
+## Corrected default
 
-- Keep `blend_weight` as the video spectral share for saved-workflow compatibility.
-- Add `audio_blend_weight`, defaulting to `0.0`, so audio uses local prediction unless explicitly enabled for experiments.
-- Apply audio and video history weights independently inside one bounded packed prediction buffer.
-- Fail closed when native H3 cannot prove the target audio/video boundary.
-- Report configured, causal, and effective per-modality blends in debug summaries.
+- `offline_smoothing_replay` now defaults to `true` in the runtime configuration, node schema, and Python call signature.
+- The mode is no longer classified as experimental.
+- The default remains `blend_weight=0.5` for video and `audio_blend_weight=0.0` for audio.
+- Offline capture uses causal `video=0, audio=0`; configured per-modality weights are applied only during transformer-free replay.
 
-Matched full-checkpoint runs reproduced speech stutter when a video spectral forecast entered the causal joint audio-video trajectory, even with direct audio blending disabled. The revised offline path fixes that observed seed by capturing with `video=0, audio=0` and applying the configured `video=0.5, audio=0` only during transformer-free replay. Disabling offline replay with the same weights reproduced the stutter. This is a validated case, not a universal quality guarantee.
+This default follows the matched full-checkpoint result from v0.2.0 development. Single-pass `video=0.5, audio=0` reproduced degraded speech and stuttering because video forecasts fed into later joint audio-video transformer calls. Offline capture/replay with the same weights removed the defect and restored high-quality audio on that seed while retaining the preferred image result. Disabling offline replay brought the defect back.
 
-## Experimental trajectory correction
+## Retained research modes
 
-- `anchor_residual_feedback`: a video-scored actual-refresh guard with no hidden-residual injection, a `1.5` trigger, and a three-refresh budget.
-- `selective_rollback_correction`: thresholded deterministic Euler rollback with exact sampler-state restoration and a three-correction budget.
-- `offline_smoothing_replay`: local-only capture followed by transformer-free bidirectional replay using exact actual anchors, bracketing interpolation, affine-corrected spectral weights, and leave-one-anchor-out per-modality attenuation.
-- The three modes are mutually exclusive while Spectrum is enabled and remain disabled by default.
-- Unsupported and recoverably incomplete experimental paths preserve a valid ordinary/native result according to each mode's documented contract; cancellation, OOM, and other fatal exceptions propagate with normal teardown.
+- `anchor_residual_feedback` remains experimental and default-off.
+- `selective_rollback_correction` remains experimental and default-off.
+- Both remain mutually exclusive with each other and with the standard offline path. Disable `offline_smoothing_replay` before enabling either research mode.
+- Explicitly setting all three trajectory modes to `false` retains the single-pass comparison path.
 
-## Memory, telemetry, and compatibility
+## Upgrade behavior
 
-- Share immutable offline anchors with causal history instead of keeping a duplicate archive.
-- Keep offline anchors on the selected `history_storage` device; VRAM mode avoids repeated multi-GiB host transfers when sufficient memory is available.
-- Add detailed residual, rollback, archive, validation, replay, blend, call-count, timing, and memory telemetry.
-- Preserve exact actual anchors, constant hidden trajectories, callback order, cancellation, OOM propagation, clone-local state, and teardown.
-- Support native `t2va`, `fl2va`, and `ref2va` conditioning; reference-only rows remain outside forecast history.
-- Retain ordinary single-pass Spectrum when all three experiments are disabled.
+New nodes use offline replay automatically. Workflows created before v0.2.0 did not store this input and therefore also receive the new default. Workflows saved with v0.2.0 may retain a serialized `offline_smoothing_replay=false`; enable it once in those existing nodes to use the corrected path.
+
+Offline replay retains every actual hidden anchor plus cloned sampling inputs. `history_storage=system_ram` remains the default; `vram` avoids large host transfers when enough VRAM is available. Unsupported samplers run one valid native pass, and an incomplete replay archive returns the valid local-only first-pass result. Cancellation, OOM, and other fatal exceptions preserve normal teardown and propagation.
 
 ## Validation
 
-- Full current-ComfyUI contract suite, forecaster smoke test, compilation, and diff checks pass.
-- Native tiny-H3 tests cover forced-actual equivalence, zero-transformer forecast replay, output-head behavior, modality splitting, and visual/audio reference conditioning.
-- CUDA-only storage/parity checks remain skipped in CPU CI; full-checkpoint evidence comes from the documented user runs.
-
-Recommended configuration for the reproduced speech case:
-
-```text
-offline_smoothing_replay = true
-blend_weight = 0.5
-audio_blend_weight = 0.0
-```
-
-The other two correction modes remain available for research. All three settings are experimental and require exact-seed video, audio, timing, and memory validation on the intended workflow.
+- Default-value tests cover the dataclass, ComfyUI node schema, and Python call signature.
+- The outer-sampler integration test now proves that the omitted/default setting executes capture plus transformer-free replay.
+- Existing single-pass, residual-feedback, rollback, native-equivalence, `t2va`, `fl2va`, and `ref2va` contracts remain covered.

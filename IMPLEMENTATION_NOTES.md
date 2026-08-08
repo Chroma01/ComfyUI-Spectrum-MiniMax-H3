@@ -63,9 +63,9 @@ The one-point bootstrap bypasses spectral and linear weight construction and sup
 
 Native H3 lays out target rows as one contiguous `[audio | video]` packed tail. Actual capture archives that tail without materializing an audio/video concatenation. System-RAM mode copies the view directly to CPU. VRAM mode must clone it into compact owned device storage, because retaining the view would pin the complete final-block hidden tensor. When one model call contains the complete canonical branch set, the archived tensor transfers directly into forecaster history; split conditional calls retain the transactional canonicalization path and assemble rows only after all calls complete. Debug summaries expose the storage location and wall-clock archive, history-update, and forecast-prediction counters. Device-to-host archiving can synchronize outstanding CUDA work, while device cloning can be asynchronously enqueued.
 
-## Default-off trajectory-correction experiments
+## Default trajectory correction and retained experiments
 
-The published Spectrum procedure remains the causal online baseline. When `enabled=True`, `anchor_residual_feedback`, `selective_rollback_correction`, and `offline_smoothing_replay` are mutually exclusive repository experiments. With all three false, no experimental archive, probe, correction, or sampler controller is allocated.
+The published Spectrum procedure remains the causal online baseline. MiniMax H3 uses offline smoothing replay as its standard default-on correction because same-seed testing reproduced causal video-to-audio degradation in the single-pass path and removed it with isolated capture/replay. `anchor_residual_feedback` and `selective_rollback_correction` remain default-off repository experiments. When `enabled=True`, those two modes and `offline_smoothing_replay` are mutually exclusive. With all three false, no archive, probe, correction, or sampler controller is allocated and the node executes the explicit single-pass comparison path.
 
 ### Residual boundary and policy
 

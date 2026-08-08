@@ -10,17 +10,17 @@ This repository is independent from [ComfyUI-Spectrum-Proper](https://github.com
 
 Spectrum is an approximate accelerator, not a lossless or bit-identical execution path. Forecasted steps change the denoising trajectory, so outputs can differ even when the prompt, seed, model, sampler, and workflow are otherwise identical.
 
-The current `degree=1`, `warmup_steps=1`, `bootstrap_first_forecast=true` defaults are an aggressive, performance-oriented configuration. In local exact-seed testing with the pruned BF16 checkpoint at approximately 0.8 MP, they did not produce an obvious visible or audible quality decrease. That result does not establish the same tolerance for every checkpoint, resolution, generation mode, or prompt.
+The current `degree=1`, `warmup_steps=1`, `bootstrap_first_forecast=true` schedule is aggressive and performance-oriented. The default `offline_smoothing_replay=true`, `blend_weight=0.5`, `audio_blend_weight=0` path separates the video blend from the causal joint audio-video trajectory. On the exact seed that reproduced degraded speech and stuttering in single-pass mode, this path restored clean, high-quality audio while retaining the preferred image result. That result does not establish the same tolerance for every checkpoint, resolution, generation mode, or prompt.
 
 Broader exact-seed A/B testing and early user reports have exposed several kinds of changes:
 
 - **Trajectory deviations:** during fast or brief actions, the motion, pose, timing, gaze, or action path can diverge from the fully native run. For example, a subject may look up, move differently, or follow a different short motion than in the native output.
 - **Visual degradation:** eyes, fingers, fingernails, faces, limbs, or other articulated details can become malformed or unstable. Reported symptoms include distorted anatomy and additional limbs, especially in demanding motion.
-- **Audio degradation:** aggressive settings can distort generated audio as well as video. Reference-audio distortion has been reported with the Reference Model, and audiovisual synchronization should also be checked.
+- **Audio degradation:** single-pass forecasting and nonzero audio spectral blending can distort generated audio as well as video. Reference-audio distortion has also been reported with the Reference Model, and audiovisual synchronization should be checked.
 
 These effects can occur independently or together. Current evidence does not isolate a single cause. Checkpoint type and precision, output resolution, prompt and motion complexity, reference-audio conditioning, sampler and scheduler, the number of early native steps, the one-point bootstrap, and the total sampling-step count may all affect stability. Lower resolutions and heavily quantized model configurations may have less margin for absorbing forecast error, but this remains a hypothesis rather than a controlled finding.
 
-For quality-critical work, compare the same prompt and seed with Spectrum enabled and disabled. If the aggressive defaults cause visible or audible degradation, increase `degree` and `warmup_steps` and disable `bootstrap_first_forecast`; the [conservative quality-first preset](#conservative-quality-first-preset) below is a starting point. Increasing the total sampling-step count may also be necessary for reference-audio generations. One user reported reference-audio distortion with the aggressive defaults: increasing `degree` and `warmup_steps` helped, and a 30-step run with those increased settings produced clean audio on their setup.
+For quality-critical work, compare the same prompt and seed with Spectrum enabled and disabled. Keep the default offline replay and `audio_blend_weight=0` when evaluating audio. If the aggressive schedule still causes visible or audible degradation, increase `degree` and `warmup_steps` and disable `bootstrap_first_forecast`; the [conservative quality-first preset](#conservative-quality-first-preset) below is a starting point. Increasing the total sampling-step count may also be necessary for reference-audio generations. One user reported reference-audio distortion with the aggressive schedule: increasing `degree` and `warmup_steps` helped, and a 30-step run with those increased settings produced clean audio on their setup.
 
 Use Spectrum when the speed benefit is worth possible output differences. Disable it when maximum fidelity to the native MiniMax H3 trajectory is more important.
 
@@ -81,9 +81,9 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 | `debug` | `false` | Enables concise run, step, topology, fallback, sanitization, chunk, and teardown logs. |
 | `history_storage` | `system_ram` | Stores history in `system_ram`, or in `vram` to avoid transfer overhead when sufficient accelerator memory is free. |
 | `bootstrap_first_forecast` | `true` | Experimental one-point hold for `degree=1` and `warmup_steps<=1`. Incompatible node settings disable it with a console warning. |
-| `anchor_residual_feedback` | `false` | Experimental video-scored actual-refresh guard. It never injects a hidden residual. |
-| `selective_rollback_correction` | `false` | Experimental thresholded, budgeted rollback for the exact deterministic Euler sampler contract. |
-| `offline_smoothing_replay` | `false` | Experimental two-pass mode: local-only causal capture followed by cross-validated, transformer-free bidirectional replay. |
+| `anchor_residual_feedback` | `false` | Experimental video-scored actual-refresh guard. It never injects a hidden residual. Disable offline replay before enabling it. |
+| `selective_rollback_correction` | `false` | Experimental thresholded, budgeted rollback for the exact deterministic Euler sampler contract. Disable offline replay before enabling it. |
+| `offline_smoothing_replay` | `true` | Standard two-pass audio-quality path: local-only causal capture followed by cross-validated, transformer-free bidirectional replay. |
 | `audio_blend_weight` | `0.00` | Direct audio spectral share. Zero prevents spectral mixing of audio rows; ordinary single-pass H3 can still couple later audio to the video trajectory. |
 
 Every value is validated. `max_history` must be at least `degree + 1`.
@@ -96,17 +96,17 @@ A subsequent full-H3 comparison showed that direct row separation was necessary 
 
 On the same seed that reproduced the defect, revised offline replay with `video=0.5, audio=0` removed the speech stutter and retained the preferred image result. Disabling offline replay with the same weights brought the stutter back. This same-seed A/B validates the isolated capture/replay mechanism for that case: local-only capture preserves the clean audio anchor trajectory, and replay-only video blending cannot feed through another joint transformer call. It does not establish universal audio safety across seeds, checkpoints, samplers, prompts, or reference inputs. Ordinary one-pass Spectrum keeps the configured weights unchanged and remains susceptible to this indirect coupling path.
 
-When `enabled=True`, the three trajectory-correction settings are mutually exclusive. Enabling more than one raises an error that lists every conflicting setting. Existing workflows do not contain these optional inputs and therefore load with all three disabled. With all three disabled, the established single-pass schedule and output path are unchanged apart from the new modality-specific audio blend default.
+When `enabled=True`, the three trajectory modes are mutually exclusive. Enabling more than one raises an error that lists every conflicting setting. New nodes use offline replay by default. Workflows created before v0.2.0 did not store this input and therefore also receive the new default. Workflows saved with v0.2.0 may retain their serialized `offline_smoothing_replay=false` value after upgrading; turn it on once in those existing nodes to use the corrected default path. Turning it off explicitly retains the single-pass comparison path.
 
-## Experimental trajectory correction
+## Default trajectory correction and retained experiments
 
-These repository-specific experiments extend the published causal, online Spectrum algorithm. They remain default-off. Real-checkpoint tests at 0.65 MP, 8 seconds, 20-step Euler found an audio stutter with the original audiovisual anchor-feedback injection and excessive rollback work under the original `score > 1` trigger. Later same-seed testing validated the revised offline capture/replay separation for one reproducibly affected speech case. The safeguards below respond to those observations; broader quality, speed, memory, and stability remain unproven.
+Offline smoothing replay is the standard default-on H3 path because it prevents the reproduced causal video-to-audio feedback defect. The two repository-specific residual/rollback experiments remain default-off. Real-checkpoint tests at 0.65 MP, 8 seconds, 20-step Euler found an audio stutter with the original audiovisual anchor-feedback injection and excessive rollback work under the original `score > 1` trigger. The safeguards below retain those modes for continued research without placing them on the default execution path.
 
-| Setting | Sampler support | Passes | Behavior when unsupported |
-|---|---|---:|---|
-| `anchor_residual_feedback` | Euler, RES multistep, RES multistep CFG++ | 1 | Ordinary Spectrum/native fallback rules remain active. |
-| `selective_rollback_correction` | Exact deterministic `sample_euler`, with `s_churn=0` | 1, with local replay on a trigger | RES, CFG++, churned, ancestral, unknown, intercepted, and multi-GPU paths log once and run ordinary Spectrum. |
-| `offline_smoothing_replay` | Euler, RES multistep, RES multistep CFG++ | 2 | Unsupported samplers run one valid native pass. An incomplete first-pass archive returns the valid first-pass result. |
+| Setting | Status/default | Sampler support | Passes | Behavior when unsupported |
+|---|---|---|---:|---|
+| `anchor_residual_feedback` | Experimental / off | Euler, RES multistep, RES multistep CFG++ | 1 | Ordinary Spectrum/native fallback rules remain active. |
+| `selective_rollback_correction` | Experimental / off | Exact deterministic `sample_euler`, with `s_churn=0` | 1, with local replay on a trigger | RES, CFG++, churned, ancestral, unknown, intercepted, and multi-GPU paths log once and run ordinary Spectrum. |
+| `offline_smoothing_replay` | Standard / on | Euler, RES multistep, RES multistep CFG++ | 2 | Unsupported samplers run one valid native pass. An incomplete first-pass archive returns the valid local-only first-pass result. |
 
 ### Shared anchor residual
 
@@ -180,7 +180,7 @@ Replay adds a second sampler pass and output-head work while eliminating H3 tran
 
 Across three supplied 0.65 MP / 8-second runs of the earlier fixed-blend implementation, the transformer-free replay added 8.49%, 8.63%, and 8.95% to its corresponding first-pass sampler time while retaining 11 first-pass H3 calls. A later VRAM-resident local-only replay completed in `0.441 s`, while the matched ordinary Spectrum run used the same 11-call schedule. Global `blend_weight=0.5` produced audio issues in both ordinary Spectrum and offline replay; global `blend_weight=0` did not in either of two runs. Direct modality splitting improved the defect but left speech tripping in ordinary single-pass `video=0.5, audio=0`. With the revised isolated capture policy, offline replay at `video=0.5, audio=0` produced clean speech on that same seed; disabling offline replay with those weights reproduced the stutter. This validates the mechanism for the affected case while leaving broader quality and stability unproven.
 
-For workflows that reproduce this coupled speech defect, use this tested experimental combination as the first comparison point:
+The default audio-quality configuration is:
 
 ```text
 offline_smoothing_replay = true
@@ -202,6 +202,9 @@ tail_actual_steps = 1
 max_history = 8
 history_storage = system_ram
 bootstrap_first_forecast = true
+offline_smoothing_replay = true
+anchor_residual_feedback = false
+selective_rollback_correction = false
 ```
 
 ### Conservative quality-first preset
@@ -218,6 +221,9 @@ tail_actual_steps = 1
 max_history = 8
 history_storage = system_ram
 bootstrap_first_forecast = false
+offline_smoothing_replay = true
+anchor_residual_feedback = false
+selective_rollback_correction = false
 ```
 
 The preliminary defaults prioritize throughput and have not been established as universally quality-safe. Existing workflows retain their saved input values. The quality-first preset changes only the forecast degree, warmup, and bootstrap behavior relative to the defaults: it keeps the first five solver steps native, waits for the five actual history points required by degree 4, and does not use the one-point hold. It reduces the speed benefit and is a starting point rather than a guarantee; exact-seed Spectrum-on/Spectrum-off validation remains necessary for the intended workflow.
@@ -362,13 +368,14 @@ PYTHONPATH=/path/to/ComfyUI \
 python -m pytest -q
 ```
 
-## Manual validation required for experimental promotion
+## Validation boundaries
 
-Before any experimental mode is considered for a default-on or non-experimental status, test 20-step Euler and RES multistep, plus RES CFG++ where applicable, at approximately 0.65 MP, 8 seconds, and 24 fps. Keep prompt, seed, checkpoint, resolution, duration, sampler, scheduler, images, and audio references identical across:
+The offline mode was promoted because the affected same-seed A/B isolated the failure path: single-pass `video=0.5, audio=0` reproduced the audio defect, while offline capture/replay with the same weights removed it and retained the preferred image result. Broader checkpoint, sampler, prompt, and conditioning coverage remains valuable. Before either retained experiment is considered for promotion, test 20-step Euler and RES multistep, plus RES CFG++ where applicable, at approximately 0.65 MP, 8 seconds, and 24 fps. Keep prompt, seed, checkpoint, resolution, duration, sampler, scheduler, images, and audio references identical across:
 
 - native Spectrum-off;
-- ordinary Spectrum with all three settings false; and
-- each experimental setting enabled separately.
+- the default offline path;
+- explicit single-pass mode with all three settings false; and
+- each retained experimental setting enabled separately with offline replay disabled.
 
 Inspect video quality, generated audio, reference-audio distortion, audiovisual synchronization, total wall time, actual/discarded/replayed transformer calls, peak VRAM, and peak system RAM. Cancel during the first pass, residual evaluation, rollback replay, and offline replay. Run at least ten consecutive generations with Sol-Attn enabled and load old saved workflows to detect retained state, memory growth, deadlocks, callback duplication, WSL wedges, and compatibility regressions.
 
