@@ -1,21 +1,28 @@
-# Spectrum MiniMax H3 v0.2.2
+# Spectrum MiniMax H3 v0.2.3
 
-Fixes ComfyUI progress reporting for the default offline smoothing replay path.
+Restores the ComfyUI Manager installation path and brings the README in line with the current v0.2.1+ audio behavior.
 
-## Progress reporting
+## Comfy Registry and Manager installation
 
-- The compute-heavy capture pass now reports live progress to ComfyUI instead of running with no visible progress bar.
-- Capture and replay share one continuous two-pass range. For a 20-step sampler run, capture reports steps 1–20 and replay completes steps 21–40.
-- The normal terminal sampler bar follows capture. The transformer-free replay suppresses its own terminal bar, avoiding a second bar that appears and completes almost instantly.
-- External callbacks and previews remain replay-only, so accepted output side effects still occur once per logical sampler step.
-- If capture cannot be replayed or replay aborts recoverably, the combined progress range is completed before the valid first-pass result is returned.
+- Adds a root `.comfyignore` so Comfy Registry packages retain the complete runtime node while excluding `.github/` workflows and `tests/`.
+- Earlier Registry archives included development-only files that read test environment variables, launch an isolated test subprocess, and read release metadata. The Registry scanner flagged those files even though ComfyUI never imports or executes them.
+- Publishing v0.2.3 with those files excluded gives Manager a clean Registry version to resolve through its default channel once Registry scanning completes.
+
+## Audio documentation
+
+- Documents the current default audio path: `offline_smoothing_replay=true`, `blend_weight=0.5`, and `audio_blend_weight=0`.
+- Separates reproduced pre-v0.2.1 single-pass audio failures from the current offline capture/replay behavior.
+- Clarifies that workflows saved with v0.2.0 may retain `offline_smoothing_replay=false` and need it re-enabled once.
+- Records increased `degree`, increased `warmup_steps`, and the reported clean 30-step run as historical single-setup evidence, not requirements for the current default.
+- Updates the documented ComfyUI validation target and v0.2.2 progress-reporting coverage.
 
 ## Compatibility
 
-This release changes progress reporting only. Node inputs, saved workflows, sampling schedules, generated-result handling, and the v0.2.1 audio-quality defaults are unchanged.
+Runtime node code, inputs, saved-workflow compatibility, sampling schedules, and generated-result handling are unchanged. This release changes Registry packaging and documentation only.
 
 ## Validation
 
-- Confirmed in a live ComfyUI GPU generation: progress is visible during capture and completes through replay.
-- 173 tests pass against ComfyUI commit `00d02f2`; the two CUDA-only tests are skipped in the CPU test environment.
-- Tests cover successful capture/replay progress, replay-only callback forwarding, incomplete capture, recoverable replay abort, result retention, and runtime cleanup.
+- Verified the Registry archive excludes every `.github/` and `tests/` path while retaining every runtime Python module, `pyproject.toml`, README, and license file.
+- Verified the excluded paths cover every scanner finding reported for v0.2.1.
+- The documentation branch passes Markdown fence and internal-anchor validation.
+- The test matrix passes, including 173 tests against ComfyUI commit `00d02f2854892ee5b9808bc2f6348b972017886a`; two CUDA-only tests are skipped in the CPU environment.
