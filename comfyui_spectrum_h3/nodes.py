@@ -103,8 +103,8 @@ class SpectrumApplyMiniMaxH3:
                     {
                         "default": False,
                         "tooltip": (
-                            "Experimental two-pass replay: capture an audio-safe local-only trajectory, "
-                            "then apply the configured video/audio blends using past and future anchors."
+                            "Experimental two-pass replay: capture a local-only trajectory, then apply "
+                            "the configured video/audio blends using past and future anchors."
                         ),
                     },
                 ),
