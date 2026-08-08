@@ -42,7 +42,10 @@ class SpectrumApplyMiniMaxH3:
                         "min": 0.0,
                         "max": 1.0,
                         "step": 0.01,
-                        "tooltip": "Video spectral share. Audio uses the separate audio_blend_weight setting.",
+                        "tooltip": (
+                            "Direct video spectral share. Audio uses the separate audio_blend_weight setting. "
+                            "In ordinary single-pass H3, video forecasts can still affect later audio through joint transformer calls."
+                        ),
                     },
                 ),
                 "degree": (
@@ -116,8 +119,8 @@ class SpectrumApplyMiniMaxH3:
                         "max": 1.0,
                         "step": 0.01,
                         "tooltip": (
-                            "Audio spectral share. The default 0 uses two-point audio prediction because "
-                            "nonzero shared spectral blending caused repeatable speech distortion on H3."
+                            "Direct audio spectral share. The default 0 prevents spectral mixing of audio rows. "
+                            "Use offline_smoothing_replay to isolate capture from video-to-audio trajectory coupling."
                         ),
                     },
                 ),

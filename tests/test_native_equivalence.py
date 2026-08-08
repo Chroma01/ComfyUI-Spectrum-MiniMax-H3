@@ -86,6 +86,33 @@ def _inputs(PackedLayout):
     return [video, audio], context, payload
 
 
+def _reference_inputs(PackedLayout):
+    video = torch.randn(1, 2, 1, 4, 4)
+    audio = torch.randn(1, 2, 2, 3)
+    context = torch.randn(1, 2, 8)
+    ref_video = torch.randn(1, 2, 1, 4, 4)
+    ref_audio = torch.randn(1, 2, 2, 2)
+    refs = [
+        {
+            "kind": "video_audio",
+            "latent_t": 1,
+            "latent_h": 4,
+            "latent_w": 4,
+            "ref_audio_t": 2,
+            "latent": ref_video,
+            "audio_latent": ref_audio,
+        }
+    ]
+    payload = {
+        "layout": PackedLayout(2, 1, 4, 4, 3, refs=refs),
+        "refs": refs,
+        "cond_video_latents": [ref_video],
+        "cond_audio_latents": [ref_audio],
+        "seed": 5,
+    }
+    return [video, audio], context, payload
+
+
 def _wrapped_call(model, runtime, sigma, model_timestep, x, context, payload, label="positive"):
     patcher_extension, _, _ = _native_imports()
     decision = runtime.begin_step(torch.tensor([sigma]))
@@ -235,6 +262,39 @@ def test_forecast_step_skips_every_transformer_block_and_preserves_output_shapes
     calls_before = block.calls
     forecast, forecast_decision = _wrapped_call(model, runtime, 0.5, 500.0, x, context, payload)
     assert first_decision["actual"] and second_decision["actual"]
+    assert not forecast_decision["actual"]
+    assert block.calls == calls_before
+    assert [part.shape for part in forecast] == [part.shape for part in second]
+    assert [part.dtype for part in forecast] == [part.dtype for part in second]
+    assert all(torch.isfinite(part).all() for part in forecast)
+    runtime.end_run(run_id)
+
+
+def test_ref2va_forecast_skips_transformer_with_visual_and_audio_references():
+    _, _, PackedLayout = _native_imports()
+    model, block = _tiny_model()
+    x, context, payload = _reference_inputs(PackedLayout)
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            warmup_steps=2,
+            tail_actual_steps=0,
+            window_size=2.0,
+            bootstrap_first_forecast=False,
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+    )
+    _wrapped_call(model, runtime, 1.0, 1000.0, x, context, payload)
+    second, second_decision = _wrapped_call(model, runtime, 0.75, 750.0, x, context, payload)
+    calls_before = block.calls
+    forecast, forecast_decision = _wrapped_call(model, runtime, 0.5, 500.0, x, context, payload)
+
+    assert second_decision["actual"]
     assert not forecast_decision["actual"]
     assert block.calls == calls_before
     assert [part.shape for part in forecast] == [part.shape for part in second]
