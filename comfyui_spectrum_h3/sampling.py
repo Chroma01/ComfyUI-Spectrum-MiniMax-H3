@@ -321,7 +321,7 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
             decision["coordinate"],
             "actual" if decision["actual"] else "forecast",
             decision["reason"],
-            runtime.forecaster.history_length,
+            runtime.prediction_history_length,
             runtime.stats.current_window,
         )
 

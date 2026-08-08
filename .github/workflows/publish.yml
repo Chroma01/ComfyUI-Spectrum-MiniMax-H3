@@ -27,3 +27,4 @@ jobs:
         uses: Comfy-Org/publish-node-action@0eb6cd742945443bee7f79eeddd4f732780029a1 # v1
         with:
           personal_access_token: ${{ secrets.REGISTRY_ACCESS_TOKEN }}
+

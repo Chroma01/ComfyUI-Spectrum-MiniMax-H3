@@ -79,8 +79,8 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 | `debug` | `false` | Enables concise run, step, topology, fallback, sanitization, chunk, and teardown logs. |
 | `history_storage` | `system_ram` | Stores history in `system_ram`, or in `vram` to avoid transfer overhead when sufficient accelerator memory is free. |
 | `bootstrap_first_forecast` | `true` | Experimental one-point hold for `degree=1` and `warmup_steps<=1`. Incompatible node settings disable it with a console warning. |
-| `anchor_residual_feedback` | `false` | Experimental forward-only error feedback from actual anchors. |
-| `selective_rollback_correction` | `false` | Experimental local rollback for the exact deterministic Euler sampler contract. |
+| `anchor_residual_feedback` | `false` | Experimental video-scored actual-refresh guard. It never injects a hidden residual. |
+| `selective_rollback_correction` | `false` | Experimental thresholded, budgeted rollback for the exact deterministic Euler sampler contract. |
 | `offline_smoothing_replay` | `false` | Experimental two-pass anchor archive, bidirectional smoothing, and transformer-free replay. |
 
 Every value is validated. `max_history` must be at least `degree + 1`.
@@ -89,7 +89,7 @@ When `enabled=True`, the three trajectory-correction settings are mutually exclu
 
 ## Experimental trajectory correction
 
-These repository-specific experiments extend the published causal, online Spectrum algorithm. They are default-off and have not been validated with a real MiniMax H3 checkpoint. They carry no quality, speed, memory, or stability guarantee.
+These repository-specific experiments extend the published causal, online Spectrum algorithm. They remain default-off. Initial real-checkpoint tests at 0.65 MP, 8 seconds, 20-step Euler found an audio stutter with the original audiovisual anchor-feedback injection, excessive rollback work under the original `score > 1` trigger, and no perceived difference between offline replay and ordinary Spectrum for the tested seed. The safeguards below respond to those observations; broader quality, speed, memory, and stability are still unproven.
 
 | Setting | Sampler support | Passes | Behavior when unsupported |
 |---|---|---:|---|
@@ -107,23 +107,23 @@ E_hold     = RMS(actual output - held output)
 score      = E_forecast / max(E_hold, scale-aware epsilon)
 ```
 
-The maximum finite video/audio/branch score is used. A score at or below `1` means the shadow forecast is no worse than the hold baseline at that later actual coordinate. A score above `2` is treated as severe. This comparison does not reveal the native hidden feature at the earlier forecast coordinate; it measures a new actual anchor after the trajectory has already advanced.
+Video and audio scores remain separate. Anchor feedback uses only the video score. Rollback uses the maximum finite video/audio/branch score. A score at or below `1` means the shadow forecast is no worse than the hold baseline at that later actual coordinate. This comparison does not reveal the native hidden feature at the earlier forecast coordinate; it measures a new actual anchor after the trajectory has already advanced.
 
-Missing, duplicate, incomplete, reordered-unmappable, or changed branch labels/topology disable only the experimental behavior for that run. Nonfinite scores or hidden residuals do the same. Ordinary Spectrum or the native fallback remains usable. Debug summaries report residual timing, maximum video/audio score, failures, corrections, speculative work, discarded work, rollback work, and offline archive size.
+Missing, duplicate, incomplete, reordered-unmappable, or changed branch labels/topology disable only the experimental behavior for that run. Nonfinite scores do the same. Ordinary Spectrum or the native fallback remains usable. Debug logs report every measured anchor's video, audio, policy score, and action. Summaries separate shadow/hold output-head time from residual reduction time and report policy maxima, terminal probe skips, speculative/discarded work, refresh/rollback suppression, and offline archive/replay costs.
 
 ### Anchor residual feedback
 
-This is forward error feedback. It never revises a completed latent step.
+This is a forward scheduling guard. It never revises a completed latent step or adds an anchor residual to another coordinate. The original implementation corrected the packed `[audio | video]` hidden feature using the worse modality's score. Real H3 tests then found both a speech-timing regression and, in another run, a slight image regression. Those failures invalidate the assumption that a hidden error vector measured at anchor `t_j` remains a useful correction direction at `t_{j+1}`. The revised policy retains the measurement and removes hidden-state injection entirely.
 
-- For `1 < score <= 2`, the next ordinary forecast receives one model-dtype hidden correction with gain `score - 1`, and the adaptive window shrinks by `flex_window * gain` without going below the configured initial `window_size`.
-- For `score > 2`, the correction gain is `1`, the window shrinks by the full `flex_window`, and the next logical step is forced actual with reason `anchor residual feedback refresh`.
-- For `score <= 1`, an obsolete pending correction is released.
+- For `video_score >= 1.5`, the next logical step is forced actual with reason `anchor residual feedback refresh`.
+- For `video_score < 1.5`, the ordinary Spectrum schedule is left unchanged, even if the diagnostic audio score is larger.
+- A run performs at most three feedback refreshes. Once the budget is exhausted, later probes are skipped.
 
-The correction is consumed once by the next ordinary forecast. The one-point bootstrap is a hold rather than an ordinary forecast and does not consume it. At most one model-dtype hidden residual is retained, following `history_storage`; FP32 correction arithmetic is chunked.
+A feedback probe is skipped when only forced-tail steps remain because no later forecast can be replaced. This mode retains no hidden residual and performs no correction arithmetic. It spends one additional transformer call for each accepted refresh, so its value depends on an observable quality improvement over ordinary Spectrum.
 
 ### Selective rollback correction
 
-The Euler implementation owns a run-local sampler loop through ComfyUI's `SAMPLER_SAMPLE` wrapper. Before a forecast it checkpoints the pre-forecast latent, logical index, runtime scheduler, adaptive window, refresh counters, history references, statistics, and callback/progress position. If the immediately following actual anchor scores above `1`, it:
+The Euler implementation owns a run-local sampler loop through ComfyUI's `SAMPLER_SAMPLE` wrapper. Before a forecast it checkpoints the pre-forecast latent, logical index, runtime scheduler, adaptive window, refresh counters, history references, statistics, and callback/progress position. If the immediately following actual anchor has an aggregate video/audio score of at least `1.5`, and the run has used fewer than three rollback corrections, it:
 
 1. discards that forecast-influenced anchor result;
 2. restores the pre-forecast latent and runtime checkpoint;
@@ -132,7 +132,9 @@ The Euler implementation owns a run-local sampler loop through ComfyUI's `SAMPLE
 5. recomputes the current anchor as actual at the corrected latent; and
 6. continues from the corrected trajectory.
 
-The replayed interval cannot request another rollback. Speculative calls and the discarded actual call remain included in compute counters. Accepted callbacks and previews occur once per logical step. Cancellation and exceptions propagate through the normal ComfyUI path, and run teardown releases the checkpoint.
+The replayed interval cannot request another rollback. A run performs at most three corrections; once that budget is exhausted, later rollback probes are skipped. Scores below `1.5` are logged and accepted without replay. Speculative calls and the discarded actual call remain included in compute counters. Accepted callbacks and previews occur once per logical step. Cancellation and exceptions propagate through the normal ComfyUI path, and run teardown releases the checkpoint.
+
+The threshold and budget are deliberately fixed internal safeguards in this experimental PR, preserving the three-toggle public interface. In the first 20-step real-checkpoint test, the earlier `score > 1` policy rolled back 7 of 8 evaluated forecasts and executed 25 physical transformer calls, exceeding the 20-call native workload. The revised policy can request at most three rollbacks in one run and therefore prevents that observed seven-rollback failure mode. It is still a quality experiment, and the maximum-call result depends on the underlying Spectrum schedule.
 
 The `run_selective_rollback_euler` sampler mirror was reviewed and integration-tested against ComfyUI commit `5599a05fea715cb2aff11f30f5b06e16d0dfa0c4`. Compatibility review must re-check `KSamplerX0Inpaint`, `sampler.inpaint_options`, `model_sampling.noise_scaling`, `sampler.max_denoise`, `sampling.to_d`, and `sampling.trange` whenever the corresponding `KSAMPLER.sample` internals change.
 
@@ -151,7 +153,9 @@ The existing `blend_weight` mixes those components. First-pass actual coordinate
 
 This is an anchor-reuse approximation. The stored actual anchors were evaluated on the first-pass trajectory, while replay generally follows a different trajectory. Future anchors improve the hidden-feature interpolation but do not make those anchors native-equivalent at the replay latent. The method is not lossless, fully corrected, or guaranteed to improve quality.
 
-Offline memory includes cloned initial sampling inputs plus every actual hidden anchor in system RAM, even when causal history uses VRAM. Replay adds a second sampler pass and output-head work while eliminating H3 transformer calls only in that second pass. If the first pass is unsupported, intercepted, disabled, incomplete, or changes topology, replay is skipped and the valid first-pass result is returned with one warning.
+Offline memory includes cloned initial sampling inputs plus every actual hidden anchor in system RAM, even when causal history uses VRAM. Replay adds a second sampler pass and output-head work while eliminating H3 transformer calls only in that second pass. Debug summaries separately report CPU archive-copy time, smoother-build time, retained archive size, hypothetical full-schedule size, archived-anchor replay steps, smoothed replay steps, and the smoother's real history/chunk counters. If the first pass is unsupported, intercepted, disabled, incomplete, or changes topology, replay is skipped and the valid first-pass result is returned with one warning.
+
+Across three supplied 0.65 MP / 8-second runs, the transformer-free replay added 8.49%, 8.63%, and 8.95% to its corresponding first-pass sampler time while retaining 11 first-pass H3 calls. The tested seed appeared equivalent to ordinary Spectrum, so this mode remains useful only when a matched A/B demonstrates a quality gain that justifies the second pass and CPU archive.
 
 ### Preliminary performance preset (default)
 
@@ -298,6 +302,10 @@ Automated tests cover:
 - model detection and clone runtime isolation;
 - exact native versus wrapped forced-actual video/audio output on a deterministic tiny native H3 fixture;
 - proof that a forecast fixture invokes zero H3 transformer blocks;
+- refresh-only anchor feedback with video-only policy scoring, a `1.5` threshold, a three-refresh budget, and no retained/injected hidden residual;
+- terminal feedback-probe elimination while preserving the final rollback validation probe;
+- rollback threshold and three-correction budget enforcement;
+- separate residual output-head timing, offline archive/build timing, replay anchor/smoothed counts, and replay smoother history/chunk reporting;
 - downstream `predict_noise` passthroughs that never reach the native H3 wrapper, including one-warning disablement and retained-history release.
 
 A community compatibility report confirmed that revision `dc6291525112cb4246f864738e5bb4e2b85446da` ran without source changes on Windows 11 with a Radeon AI PRO R9700 32 GB, PyTorch 2.9.1 + ROCm 7.2.1, and ComfyUI 0.30.0. In the reported 20-step RES multistep, 864x480, 107-frame `system_ram` workflow, the expected 14 actual and 6 forecasted evaluations reduced warm elapsed time from 212.73 s to 160.97 s (24.33% lower time; about 1.32x throughput). This validates only that exact configuration; other AMD GPUs, ROCm builds, workflows, and quality cases remain unverified. See [issue #6](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues/6).
@@ -322,7 +330,7 @@ python -m pytest -q
 
 ## Manual validation required for the experimental modes
 
-Before any experimental mode is considered for a default or release, test 20-step Euler and RES multistep, plus RES CFG++ where applicable, at approximately 0.6 MP, 7 seconds, and 24 fps. Keep prompt, seed, checkpoint, resolution, duration, sampler, scheduler, images, and audio references identical across:
+Before any experimental mode is considered for a default or release, test 20-step Euler and RES multistep, plus RES CFG++ where applicable, at approximately 0.65 MP, 8 seconds, and 24 fps. Keep prompt, seed, checkpoint, resolution, duration, sampler, scheduler, images, and audio references identical across:
 
 - native Spectrum-off;
 - ordinary Spectrum with all three settings false; and

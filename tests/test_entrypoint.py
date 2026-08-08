@@ -49,3 +49,4 @@ assert 'SpectrumApplyMiniMaxH3' in module.NODE_CLASS_MAPPINGS
     )
 
     assert result.returncode == 0, result.stderr
+

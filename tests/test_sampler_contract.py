@@ -147,3 +147,4 @@ def test_native_ancestral_variants_inject_or_delegate_to_noise(function_name):
     )
 
     assert "noise_sampler" in loaded or delegates_to_ancestral_core
+

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
@@ -330,8 +331,14 @@ def _execute_actual(
                 minimax_payload or {},
                 layout,
             )
-            shadow_output = _execute_forecast(inner, residual_probe.shadow, state, x[0], x[1])
-            hold_output = _execute_forecast(inner, residual_probe.hold, state, x[0], x[1])
+            output_head_started = time.perf_counter()
+            try:
+                shadow_output = _execute_forecast(inner, residual_probe.shadow, state, x[0], x[1])
+                hold_output = _execute_forecast(inner, residual_probe.hold, state, x[0], x[1])
+            finally:
+                runtime.record_residual_output_head_seconds(
+                    time.perf_counter() - output_head_started
+                )
             runtime.record_residual_measurement(
                 run_id,
                 step_id,
@@ -545,8 +552,8 @@ def diffusion_model_wrapper(
             "Spectrum H3 forecast complete run_id=%s step=%s chunks=%s history=%s",
             run_id,
             step_id,
-            runtime.forecaster.last_prediction_chunk_count,
-            runtime.forecaster.history_length,
+            runtime.last_prediction_chunk_count,
+            runtime.prediction_history_length,
         )
     return output
 

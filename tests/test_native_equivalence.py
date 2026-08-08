@@ -300,7 +300,7 @@ def test_anchor_residual_probe_runs_current_heads_without_marking_actual_as_fore
         )
     )
     run_id = runtime.start_run(
-        torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
+        torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0]),
         "sample_euler",
         supported_sampler=True,
         max_consecutive_forecasts=1,
@@ -328,4 +328,5 @@ def test_anchor_residual_probe_runs_current_heads_without_marking_actual_as_fore
     assert runtime.stats.actual_transformer_calls == 3
     assert runtime.stats.residual_anchors == 1
     assert runtime.stats.residual_measure_seconds >= 0.0
+    assert runtime.stats.residual_output_head_seconds >= 0.0
     runtime.end_run(run_id)

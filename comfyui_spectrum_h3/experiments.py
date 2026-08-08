@@ -96,39 +96,6 @@ def measure_stream_residual(
     )
 
 
-def apply_hidden_residual(
-    prediction: torch.Tensor,
-    residual: torch.Tensor,
-    gain: float,
-    *,
-    chunk_bytes: int = DEFAULT_CHUNK_BYTES,
-) -> int:
-    if prediction.shape != residual.shape:
-        raise ValueError("prediction and residual shapes must match")
-    if not prediction.dtype.is_floating_point or not residual.dtype.is_floating_point:
-        raise ValueError("hidden residual correction requires floating-point tensors")
-    gain_value = float(gain)
-    if not math.isfinite(gain_value) or not 0.0 <= gain_value <= 1.0:
-        raise ValueError("residual gain must be finite and in [0, 1]")
-    if not prediction.is_contiguous():
-        raise ValueError("hidden residual correction requires a contiguous prediction tensor")
-    prediction_flat = prediction.view(-1)
-    residual_flat = residual.detach().reshape(-1)
-    chunk = _chunk_elements(chunk_bytes)
-    chunks = 0
-    for offset in range(0, prediction_flat.numel(), chunk):
-        length = min(chunk, prediction_flat.numel() - offset)
-        target = prediction_flat.narrow(0, offset, length)
-        corrected = target.to(torch.float32)
-        corrected.add_(
-            residual_flat.narrow(0, offset, length).to(device=target.device, dtype=torch.float32),
-            alpha=gain_value,
-        )
-        target.copy_(corrected.to(target.dtype))
-        chunks += 1
-    return chunks
-
-
 @dataclass(frozen=True, slots=True)
 class OfflineStepRecord:
     step_id: int
@@ -274,6 +241,22 @@ class OfflineSmoother:
         )
         for anchor in archive.anchors:
             self._forecaster.update(anchor.coordinate, anchor.feature, take_ownership=True)
+
+    @property
+    def history_length(self) -> int:
+        return self._forecaster.history_length
+
+    @property
+    def history_device(self) -> torch.device | None:
+        return self._forecaster.history_device
+
+    @property
+    def history_tensor_bytes(self) -> int:
+        return self._forecaster.history_tensor_bytes
+
+    @property
+    def last_prediction_chunk_count(self) -> int:
+        return self._forecaster.last_prediction_chunk_count
 
     def _weights_for_step(self, record: OfflineStepRecord) -> torch.Tensor:
         spectral = self._forecaster.spectral_weights(record.coordinate)

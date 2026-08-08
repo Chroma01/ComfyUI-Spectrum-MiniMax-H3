@@ -6,7 +6,6 @@ import torch
 from comfyui_spectrum_h3.experiments import (
     OfflineFeatureArchive,
     OfflineSmoother,
-    apply_hidden_residual,
     measure_stream_residual,
 )
 
@@ -54,23 +53,6 @@ def test_residual_score_compares_forecast_with_hold_baseline():
     assert score.forecast_rms == pytest.approx(3.0)
     assert score.hold_rms == pytest.approx(1.0)
     assert score.score == pytest.approx(3.0)
-
-
-def test_hidden_residual_is_applied_in_bounded_chunks_without_dtype_promotion():
-    prediction = torch.ones(4096, dtype=torch.float16)
-    residual = torch.full((4096,), 2.0, dtype=torch.float16)
-    chunks = apply_hidden_residual(prediction, residual, 0.5, chunk_bytes=4096)
-    assert chunks == 4
-    assert prediction.dtype is torch.float16
-    torch.testing.assert_close(prediction, torch.full_like(prediction, 2.0))
-
-
-def test_hidden_residual_rejects_noncontiguous_prediction():
-    prediction = torch.ones(2, 3).transpose(0, 1)
-    residual = torch.ones_like(prediction)
-
-    with pytest.raises(ValueError, match="contiguous prediction tensor"):
-        apply_hidden_residual(prediction, residual, 0.5)
 
 
 def test_offline_smoother_uses_future_anchor_and_reuses_actual_features_exactly():

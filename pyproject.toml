@@ -39,3 +39,4 @@ include = ["comfyui_spectrum_h3*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra"
+

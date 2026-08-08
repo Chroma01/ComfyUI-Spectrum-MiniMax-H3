@@ -162,3 +162,4 @@ def run_selective_rollback_euler(
         _callback(callback, pending, total_steps)
 
     return model_wrap.inner_model.model_sampling.inverse_noise_scaling(sigmas[-1], x)
+

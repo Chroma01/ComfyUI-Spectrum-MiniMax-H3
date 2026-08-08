@@ -79,14 +79,14 @@ class SpectrumApplyMiniMaxH3:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Experimental forward-only hidden-residual feedback at actual anchors.",
+                        "tooltip": "Experimental video-scored actual-refresh guard; never injects a hidden residual.",
                     },
                 ),
                 "selective_rollback_correction": (
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Experimental local rollback for the reviewed deterministic Euler sampler only.",
+                        "tooltip": "Experimental thresholded, budgeted rollback for the reviewed deterministic Euler sampler only.",
                     },
                 ),
                 "offline_smoothing_replay": (

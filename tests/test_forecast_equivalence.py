@@ -191,3 +191,4 @@ def test_vram_and_system_ram_predictions_match_on_cuda():
     assert system_ram.history_device == torch.device("cpu")
     assert vram.history_device is not None
     assert vram.history_device.type == "cuda"
+

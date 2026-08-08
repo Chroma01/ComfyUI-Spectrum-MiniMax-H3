@@ -247,3 +247,4 @@ def test_apply_normalizes_reported_warmup_conflict(monkeypatch, caplog):
     assert captured["config"].warmup_steps == 2
     assert captured["config"].bootstrap_first_forecast is False
     assert "Disabling bootstrap_first_forecast" in caplog.text
+

@@ -373,3 +373,4 @@ class HistoryWeightForecaster:
                     self.last_prediction_max_fp32_elements, accumulator.numel()
                 )
         return result
+

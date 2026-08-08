@@ -56,7 +56,14 @@ def _install_fake_comfy(monkeypatch, model_k_type):
     monkeypatch.setitem(sys.modules, "comfy.samplers", samplers)
 
 
-def _run(monkeypatch, *, trigger: bool, residual_trigger: bool = False):
+def _run(
+    monkeypatch,
+    *,
+    trigger: bool,
+    residual_trigger: bool = False,
+    residual_shadow: float = 0.5,
+    initial_rollbacks: int = 0,
+):
     runtime = SpectrumH3Runtime(
         SpectrumH3Config(
             degree=1,
@@ -77,6 +84,7 @@ def _run(monkeypatch, *, trigger: bool, residual_trigger: bool = False):
         max_consecutive_forecasts=1,
         min_actual_steps_after_forecast=1,
     )
+    runtime.stats.rollback_count = initial_rollbacks
     calls = []
 
     class FakeModelK:
@@ -120,7 +128,10 @@ def _run(monkeypatch, *, trigger: bool, residual_trigger: bool = False):
                         probe,
                         actual_feature=actual_feature,
                         actual_output=[torch.tensor([2.0]), torch.tensor([2.0])],
-                        shadow_output=[torch.tensor([0.5]), torch.tensor([0.5])],
+                        shadow_output=[
+                            torch.tensor([residual_shadow]),
+                            torch.tensor([residual_shadow]),
+                        ],
                         hold_output=[torch.tensor([1.0]), torch.tensor([1.0])],
                     )
             else:
@@ -201,4 +212,32 @@ def test_selective_rollback_is_triggered_by_recorded_residual_policy(monkeypatch
     assert runtime.stats.residual_anchors == 1
     assert runtime.stats.residual_max_score == pytest.approx(1.5)
     assert runtime.stats.rollback_count == 1
+    runtime.end_run(run_id)
+
+
+def test_selective_rollback_accepts_score_below_threshold(monkeypatch):
+    runtime, run_id, _result, calls, _callbacks = _run(
+        monkeypatch,
+        trigger=False,
+        residual_trigger=True,
+        residual_shadow=0.6,
+    )
+    assert [step_id for step_id, _actual, _x in calls] == [0, 1, 2, 3]
+    assert runtime.stats.residual_policy_max_score == pytest.approx(1.4)
+    assert runtime.stats.rollback_suppressed_threshold == 1
+    assert runtime.stats.rollback_count == 0
+    runtime.end_run(run_id)
+
+
+def test_selective_rollback_skips_probe_after_three_corrections(monkeypatch):
+    runtime, run_id, _result, calls, _callbacks = _run(
+        monkeypatch,
+        trigger=False,
+        residual_trigger=True,
+        initial_rollbacks=3,
+    )
+    assert [step_id for step_id, _actual, _x in calls] == [0, 1, 2, 3]
+    assert runtime.stats.residual_anchors == 0
+    assert runtime.stats.rollback_suppressed_budget == 1
+    assert runtime.stats.rollback_count == 3
     runtime.end_run(run_id)

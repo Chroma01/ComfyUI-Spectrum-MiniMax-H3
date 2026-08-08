@@ -11,3 +11,4 @@ if str(ROOT) not in sys.path:
 comfyui_path = os.environ.get("COMFYUI_PATH")
 if comfyui_path and comfyui_path not in sys.path:
     sys.path.insert(0, comfyui_path)
+

@@ -124,3 +124,4 @@ AGGRESSIVE_PRESET = SpectrumH3Config(
     tail_actual_steps=1,
     bootstrap_first_forecast=False,
 )
+
