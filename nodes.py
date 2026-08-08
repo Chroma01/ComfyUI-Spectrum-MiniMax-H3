@@ -16,4 +16,3 @@ __all__ = [
     "NODE_DISPLAY_NAME_MAPPINGS",
     "SpectrumApplyMiniMaxH3",
 ]
-

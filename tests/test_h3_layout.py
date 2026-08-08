@@ -32,4 +32,3 @@ def test_branch_labels_require_matching_cond_and_uuid_vectors():
     assert branch_labels({"cond_or_uncond": [0, 1], "uuids": ["p", "n"]}) == ((0, "p"), (1, "n"))
     assert branch_labels({"cond_or_uncond": [0], "uuids": []}) is None
     assert branch_labels({}) is None
-

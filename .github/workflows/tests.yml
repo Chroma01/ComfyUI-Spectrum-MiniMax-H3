@@ -54,4 +54,3 @@ jobs:
           COMFYUI_PATH: ${{ github.workspace }}/ComfyUI
           PYTHONPATH: ${{ github.workspace }}/ComfyUI
         run: python -m pytest -q
-

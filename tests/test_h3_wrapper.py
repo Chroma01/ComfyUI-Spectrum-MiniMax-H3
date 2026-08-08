@@ -114,4 +114,3 @@ def test_model_clone_callback_provisions_an_isolated_runtime():
     clone_runtime = clone.model_options[BINDING_KEY].runtime
     assert clone_runtime is not source_runtime
     assert clone_runtime.config == source_runtime.config
-

@@ -368,4 +368,3 @@ def test_selective_rollback_res_falls_back_before_sampler_mutation(monkeypatch, 
     assert "supports only the exact reviewed sample_euler contract" in runtime.experiment_disabled_reason
     assert caplog.text.count("experimental mode disabled") == 1
     runtime.end_run(run_id)
-

@@ -15,4 +15,3 @@ __all__ = [
     "locate_minimax_h3_inner",
     "require_native_minimax_h3",
 ]
-

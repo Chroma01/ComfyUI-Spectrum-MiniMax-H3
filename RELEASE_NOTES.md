@@ -18,4 +18,3 @@ Makes Spectrum tolerate valid downstream model-patch paths that complete a solve
 - Record the reported reference-audio result precisely: increasing `degree` and `warmup_steps` helped, and a 30-step run with those increased settings produced clean audio on that setup.
 
 Existing workflow inputs and normal native-H3 sampling behavior are unchanged. If a downstream patch bypasses the native H3 wrapper, that patch remains active while Spectrum safely becomes a passthrough for the rest of the run.
-

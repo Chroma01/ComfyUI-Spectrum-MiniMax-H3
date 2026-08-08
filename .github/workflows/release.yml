@@ -70,4 +70,3 @@ jobs:
             --target "${RELEASE_SHA}" \
             --title "Spectrum MiniMax H3 ${TAG}" \
             --notes-file RELEASE_NOTES.md
-
