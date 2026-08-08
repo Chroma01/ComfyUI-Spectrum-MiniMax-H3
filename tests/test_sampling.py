@@ -272,6 +272,47 @@ def test_offline_outer_sample_restarts_from_cloned_inputs_and_callbacks_only_rep
     assert runtime.offline_archive is None
 
 
+def test_offline_unsupported_sampler_uses_true_native_bypass(caplog):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            bootstrap_first_forecast=False,
+            offline_smoothing_replay=True,
+        )
+    )
+    guider = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}}
+    )
+    calls = []
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *args, **kwargs):
+            assert runtime.active_run_id is None
+            calls.append((args, kwargs))
+            return "native-result"
+
+    callback = object()
+    with caplog.at_level("WARNING"):
+        result = outer_sample_wrapper(
+            Executor(),
+            torch.ones(1),
+            torch.zeros(1),
+            _sampler("sample_euler_ancestral"),
+            torch.tensor([1.0, 0.0]),
+            callback=callback,
+            seed=7,
+        )
+
+    assert result == "native-result"
+    assert len(calls) == 1
+    assert calls[0][0][5] is callback
+    assert runtime.active_run_id is None
+    assert "running one native pass" in caplog.text
+
+
 def test_selective_rollback_res_falls_back_before_sampler_mutation(monkeypatch, caplog):
     runtime = SpectrumH3Runtime(
         SpectrumH3Config(

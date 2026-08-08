@@ -85,7 +85,7 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 
 Every value is validated. `max_history` must be at least `degree + 1`.
 
-The three trajectory-correction settings are mutually exclusive. Enabling more than one raises an error that lists every conflicting setting. Existing workflows do not contain these optional inputs and therefore load with all three disabled. With all three disabled, the v0.1.10 schedule and output path are unchanged.
+When `enabled=True`, the three trajectory-correction settings are mutually exclusive. Enabling more than one raises an error that lists every conflicting setting. Existing workflows do not contain these optional inputs and therefore load with all three disabled. With all three disabled, the v0.1.10 schedule and output path are unchanged.
 
 ## Experimental trajectory correction
 
@@ -133,6 +133,8 @@ The Euler implementation owns a run-local sampler loop through ComfyUI's `SAMPLE
 6. continues from the corrected trajectory.
 
 The replayed interval cannot request another rollback. Speculative calls and the discarded actual call remain included in compute counters. Accepted callbacks and previews occur once per logical step. Cancellation and exceptions propagate through the normal ComfyUI path, and run teardown releases the checkpoint.
+
+The `run_selective_rollback_euler` sampler mirror was reviewed and integration-tested against ComfyUI commit `5599a05fea715cb2aff11f30f5b06e16d0dfa0c4`. Compatibility review must re-check `KSamplerX0Inpaint`, `sampler.inpaint_options`, `model_sampling.noise_scaling`, `sampler.max_denoise`, `sampling.to_d`, and `sampling.trange` whenever the corresponding `KSAMPLER.sample` internals change.
 
 Current deterministic RES stores solver-local `old_denoised`, `old_sigma_down`, and, for CFG++, unconditional denoised state inside `res_multistep`. Those values are outside the public `PREDICT_NOISE` transaction. This branch does not claim RES rollback support: selecting rollback with either RES variant logs one warning before sampler mutation and executes ordinary Spectrum.
 

@@ -687,6 +687,8 @@ class SpectrumH3Runtime:
                 device=device,
                 dtype=dtype,
             )
+        except torch.cuda.OutOfMemoryError:
+            raise
         except (RuntimeError, ValueError) as exc:
             self.disable_experiment(f"residual probe prediction failed: {exc}")
             return None
@@ -720,7 +722,10 @@ class SpectrumH3Runtime:
         if call.labels is None:
             self.disable_experiment("residual measurement lost branch labels")
             return
-        if not all(len(output) == 2 for output in (actual_output, shadow_output, hold_output)):
+        if not all(
+            isinstance(output, (list, tuple)) and len(output) == 2
+            for output in (actual_output, shadow_output, hold_output)
+        ):
             self.disable_experiment("residual measurement output structure changed")
             return
         started = time.perf_counter()

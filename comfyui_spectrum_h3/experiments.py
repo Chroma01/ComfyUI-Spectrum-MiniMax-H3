@@ -110,7 +110,9 @@ def apply_hidden_residual(
     gain_value = float(gain)
     if not math.isfinite(gain_value) or not 0.0 <= gain_value <= 1.0:
         raise ValueError("residual gain must be finite and in [0, 1]")
-    prediction_flat = prediction.reshape(-1)
+    if not prediction.is_contiguous():
+        raise ValueError("hidden residual correction requires a contiguous prediction tensor")
+    prediction_flat = prediction.view(-1)
     residual_flat = residual.detach().reshape(-1)
     chunk = _chunk_elements(chunk_bytes)
     chunks = 0

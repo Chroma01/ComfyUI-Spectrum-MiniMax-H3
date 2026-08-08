@@ -65,6 +65,14 @@ def test_hidden_residual_is_applied_in_bounded_chunks_without_dtype_promotion():
     torch.testing.assert_close(prediction, torch.full_like(prediction, 2.0))
 
 
+def test_hidden_residual_rejects_noncontiguous_prediction():
+    prediction = torch.ones(2, 3).transpose(0, 1)
+    residual = torch.ones_like(prediction)
+
+    with pytest.raises(ValueError, match="contiguous prediction tensor"):
+        apply_hidden_residual(prediction, residual, 0.5)
+
+
 def test_offline_smoother_uses_future_anchor_and_reuses_actual_features_exactly():
     first_archive = _archive(2.0)
     second_archive = _archive(6.0)

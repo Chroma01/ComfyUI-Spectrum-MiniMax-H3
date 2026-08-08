@@ -65,7 +65,7 @@ Native H3 lays out target rows as one contiguous `[audio | video]` packed tail. 
 
 ## Default-off trajectory-correction experiments
 
-The published Spectrum procedure remains the causal online baseline. `anchor_residual_feedback`, `selective_rollback_correction`, and `offline_smoothing_replay` are mutually exclusive repository experiments. With all three false, no experimental archive, probe, correction, or sampler controller is allocated.
+The published Spectrum procedure remains the causal online baseline. When `enabled=True`, `anchor_residual_feedback`, `selective_rollback_correction`, and `offline_smoothing_replay` are mutually exclusive repository experiments. With all three false, no experimental archive, probe, correction, or sampler controller is allocated.
 
 ### Residual boundary and policy
 
@@ -82,6 +82,8 @@ Forward feedback stores one canonical residual and gain. Each split subcall rece
 `PREDICT_NOISE` can replace a denoised result but cannot restore the sampler's latent. True rollback therefore lives in a `SAMPLER_SAMPLE` wrapper implemented by `rollback.py`. The controller accepts only the exact current `comfy.k_diffusion.sampling.sample_euler` function with zero churn and no multi-GPU state.
 
 The controller mirrors `KSAMPLER.sample` setup and deterministic Euler advancement. Runtime state is snapshotted before each evaluation without cloning immutable history tensors. If that evaluation commits as a forecast, the pre-forecast latent is cloned before the solver advances and the callback is deferred. The following actual anchor can request rollback. Restoration removes the speculative schedule/history mutations while preserving their compute and timing counters, then two forced-actual calls replay the forecast interval and corrected anchor. Their callbacks replace the deferred speculative callbacks one-for-one.
+
+This mirrored setup was reviewed and integration-tested against ComfyUI commit `5599a05fea715cb2aff11f30f5b06e16d0dfa0c4`. Compatibility review must re-check `KSamplerX0Inpaint`, `sampler.inpaint_options`, `model_sampling.noise_scaling`, `sampler.max_denoise`, `sampling.to_d`, and `sampling.trange` whenever the corresponding `KSAMPLER.sample` internals change.
 
 RES rollback is intentionally unsupported. `old_denoised`, `old_sigma_down`, and the CFG++ `uncond_denoised` closure belong to `res_multistep`, below the public wrapper boundary. Reimplementing that sampler would require a separate exact contract and state-restoration test suite. The setting fails closed to ordinary Spectrum before the RES sampler mutates state.
 

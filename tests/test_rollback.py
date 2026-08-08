@@ -56,7 +56,7 @@ def _install_fake_comfy(monkeypatch, model_k_type):
     monkeypatch.setitem(sys.modules, "comfy.samplers", samplers)
 
 
-def _run(monkeypatch, *, trigger: bool):
+def _run(monkeypatch, *, trigger: bool, residual_trigger: bool = False):
     runtime = SpectrumH3Runtime(
         SpectrumH3Config(
             degree=1,
@@ -92,13 +92,37 @@ def _run(monkeypatch, *, trigger: bool):
                 labels=LABELS,
                 expected_shape=(1, 1, 1),
             )
+            probe = None
+            if actual and residual_trigger:
+                probe = runtime.prepare_residual_probe(
+                    decision["run_id"],
+                    decision["step_id"],
+                    call_id,
+                    device=torch.device("cpu"),
+                    dtype=torch.float32,
+                )
             if actual:
+                actual_feature = torch.full(
+                    (1, 1, 1),
+                    float(decision["step_id"]),
+                )
                 runtime.observe_actual(
                     decision["run_id"],
                     decision["step_id"],
                     call_id,
-                    torch.full((1, 1, 1), float(decision["step_id"])),
+                    actual_feature,
                 )
+                if probe is not None:
+                    runtime.record_residual_measurement(
+                        decision["run_id"],
+                        decision["step_id"],
+                        call_id,
+                        probe,
+                        actual_feature=actual_feature,
+                        actual_output=[torch.tensor([2.0]), torch.tensor([2.0])],
+                        shadow_output=[torch.tensor([0.5]), torch.tensor([0.5])],
+                        hold_output=[torch.tensor([1.0]), torch.tensor([1.0])],
+                    )
             else:
                 assert runtime.predict(
                     decision["run_id"],
@@ -164,4 +188,17 @@ def test_selective_rollback_no_trigger_matches_the_unreplayed_euler_path(monkeyp
     assert [entry[0] for entry in callbacks] == [0, 1, 2, 3]
     assert runtime.stats.rollback_count == 0
     assert runtime.stats.replayed_transformer_calls == 0
+    runtime.end_run(run_id)
+
+
+def test_selective_rollback_is_triggered_by_recorded_residual_policy(monkeypatch):
+    runtime, run_id, _result, calls, _callbacks = _run(
+        monkeypatch,
+        trigger=False,
+        residual_trigger=True,
+    )
+    assert [step_id for step_id, _actual, _x in calls] == [0, 1, 2, 3, 2, 3]
+    assert runtime.stats.residual_anchors == 1
+    assert runtime.stats.residual_max_score == pytest.approx(1.5)
+    assert runtime.stats.rollback_count == 1
     runtime.end_run(run_id)

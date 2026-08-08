@@ -882,6 +882,84 @@ def _feedback_runtime():
     return runtime
 
 
+def test_residual_probe_reraises_cuda_oom(monkeypatch):
+    runtime = _feedback_runtime()
+    decision = runtime.begin_step(torch.tensor([4.0 / 7.0]))
+    assert decision["actual"]
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert actual
+
+    def raise_oom(*_args, **_kwargs):
+        raise torch.cuda.OutOfMemoryError("probe prediction OOM")
+
+    monkeypatch.setattr(runtime.forecaster, "predict", raise_oom)
+    try:
+        with pytest.raises(torch.cuda.OutOfMemoryError, match="probe prediction OOM"):
+            runtime.prepare_residual_probe(
+                decision["run_id"],
+                decision["step_id"],
+                call_id,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        assert runtime.experiment_disabled_reason is None
+        assert runtime.stats.residual_measure_seconds >= 0.0
+    finally:
+        runtime.abort_step(decision["run_id"], decision["step_id"])
+        runtime.end_run(decision["run_id"])
+
+
+def test_residual_measurement_rejects_tensor_as_two_stream_container():
+    runtime = _feedback_runtime()
+    decision = runtime.begin_step(torch.tensor([4.0 / 7.0]))
+    assert decision["actual"]
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert actual
+    probe = runtime.prepare_residual_probe(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert probe is not None
+    actual_feature = probe.shadow + 1.0
+    runtime.observe_actual(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        actual_feature,
+    )
+    runtime.record_residual_measurement(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        probe,
+        actual_feature=actual_feature,
+        actual_output=torch.zeros(2, 4),
+        shadow_output=[torch.zeros(4), torch.zeros(4)],
+        hold_output=[torch.zeros(4), torch.zeros(4)],
+    )
+    assert runtime.experiment_disabled_reason is not None
+    assert runtime.experiment_disabled_reason == (
+        "residual measurement output structure changed"
+    )
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+    runtime.end_run(decision["run_id"])
+
+
 def test_moderate_anchor_feedback_shrinks_window_and_corrects_one_forecast():
     runtime = _feedback_runtime()
     _measured_anchor(
