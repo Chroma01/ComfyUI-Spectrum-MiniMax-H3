@@ -56,6 +56,8 @@ class RuntimeStats:
     forecast_model_calls: int = 0
     forecast_fallbacks: int = 0
     bypassed_steps: int = 0
+    causal_video_blend_weight: float = 0.0
+    causal_audio_blend_weight: float = 0.0
     history_archive_seconds: float = 0.0
     history_update_seconds: float = 0.0
     forecast_prediction_seconds: float = 0.0
@@ -337,6 +339,7 @@ class SpectrumH3Runtime:
         self.stats.offline_local_only_video_predictions = smoother.local_only_prediction_counts.get("video", 0)
 
     def _prediction_segments(self, call: _CallState) -> tuple[tuple[int, int, float], ...]:
+        audio_blend_weight, video_blend_weight = self._causal_prediction_blends()
         topology = {
             str(entry[0]): entry[1]
             for entry in call.topology
@@ -353,17 +356,22 @@ class SpectrumH3Runtime:
             and audio_rows + video_rows == target_rows
         ):
             return (
-                (0, audio_rows, self.config.audio_blend_weight),
-                (audio_rows, target_rows, self.config.blend_weight),
+                (0, audio_rows, audio_blend_weight),
+                (audio_rows, target_rows, video_blend_weight),
             )
         if math.isclose(
-            self.config.audio_blend_weight,
-            self.config.blend_weight,
+            audio_blend_weight,
+            video_blend_weight,
             rel_tol=0.0,
             abs_tol=1e-12,
         ):
-            return ((0, target_rows, self.config.blend_weight),)
+            return ((0, target_rows, video_blend_weight),)
         raise ValueError("packed H3 topology does not expose the target audio/video boundary")
+
+    def _causal_prediction_blends(self) -> tuple[float, float]:
+        if self._offline_phase in {"first_pass", "replay"}:
+            return 0.0, 0.0
+        return self.config.audio_blend_weight, self.config.blend_weight
 
     def _residual_experiment_enabled(self) -> bool:
         return bool(
@@ -459,6 +467,7 @@ class SpectrumH3Runtime:
             self._disable_reason = "supplied sigma schedule has no solver steps"
         else:
             self._disable_reason = None
+        causal_audio_blend, causal_video_blend = self._causal_prediction_blends()
         self.stats = RuntimeStats(
             run_id=self._run.run_id,
             sampler_name=self._run.sampler_name,
@@ -466,6 +475,8 @@ class SpectrumH3Runtime:
             current_window=self._current_window,
             disabled=self._disabled,
             disable_reason=self._disable_reason,
+            causal_video_blend_weight=causal_video_blend,
+            causal_audio_blend_weight=causal_audio_blend,
         )
         if self._offline_phase == "replay" and self._offline_archive is not None:
             self.stats.offline_archive_bytes = self._offline_archive.tensor_bytes
@@ -1443,6 +1454,8 @@ class SpectrumH3Runtime:
             f"bypassed_steps={self.stats.bypassed_steps} disabled={self.stats.disabled} "
             f"video_blend_weight={self.config.blend_weight:.6f} "
             f"audio_blend_weight={self.config.audio_blend_weight:.6f} "
+            f"causal_video_blend_weight={self.stats.causal_video_blend_weight:.6f} "
+            f"causal_audio_blend_weight={self.stats.causal_audio_blend_weight:.6f} "
             f"history_archive_s={self.stats.history_archive_seconds:.3f} "
             f"history_update_s={self.stats.history_update_seconds:.3f} "
             f"forecast_predict_s={self.stats.forecast_prediction_seconds:.3f} "

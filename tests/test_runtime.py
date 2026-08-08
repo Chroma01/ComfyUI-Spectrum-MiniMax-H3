@@ -1157,6 +1157,111 @@ def test_terminal_feedback_probe_is_skipped_but_rollback_probe_is_retained():
         runtime.abort_step(decision["run_id"], decision["step_id"])
 
 
+@pytest.mark.parametrize(
+    ("video_blend_weight", "audio_blend_weight"),
+    ((0.5, 0.0), (1.0, 1.0)),
+)
+def test_offline_capture_is_local_only_while_replay_keeps_configured_blends(
+    video_blend_weight,
+    audio_blend_weight,
+):
+    config = {
+        "degree": 2,
+        "max_history": 4,
+        "warmup_steps": 3,
+        "tail_actual_steps": 0,
+        "bootstrap_first_forecast": False,
+        "blend_weight": video_blend_weight,
+        "audio_blend_weight": audio_blend_weight,
+    }
+    sigmas = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0])
+    feature_values = (0.0, 1.0, 4.0)
+
+    def prepare_forecast(runtime):
+        runtime.start_run(
+            sigmas,
+            "sample_euler",
+            supported_sampler=True,
+            max_consecutive_forecasts=1,
+            min_actual_steps_after_forecast=1,
+        )
+        for sigma, value in zip(sigmas[:3], feature_values, strict=True):
+            _actual_step(
+                runtime,
+                float(sigma),
+                [(LABEL, torch.full((1, 3, 4), value))],
+            )
+        decision = runtime.begin_step(sigmas[3])
+        assert not decision["actual"]
+        local = runtime.forecaster.predict_segments(
+            decision["coordinate"],
+            ((0, 1, 0.0), (1, 3, 0.0)),
+            rows=(0,),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        configured = runtime.forecaster.predict_segments(
+            decision["coordinate"],
+            (
+                (0, 1, audio_blend_weight),
+                (1, 3, video_blend_weight),
+            ),
+            rows=(0,),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        assert not torch.equal(local, configured)
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=TOPOLOGY,
+            labels=LABEL,
+            expected_shape=(1, 3, 4),
+        )
+        assert not actual
+        prediction = runtime.predict(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        assert prediction is not None
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+        return prediction, local, configured
+
+    ordinary = _runtime(**config)
+    ordinary_prediction, _ordinary_local, ordinary_configured = prepare_forecast(ordinary)
+    torch.testing.assert_close(ordinary_prediction, ordinary_configured)
+    assert ordinary.stats.causal_video_blend_weight == video_blend_weight
+    assert ordinary.stats.causal_audio_blend_weight == audio_blend_weight
+    ordinary.end_run(ordinary.active_run_id)
+
+    offline = _runtime(offline_smoothing_replay=True, **config)
+    offline.begin_offline_capture(total_steps=5, sampler_name="sample_euler")
+    offline_prediction, offline_local, _offline_spectral = prepare_forecast(offline)
+    torch.testing.assert_close(offline_prediction, offline_local)
+    assert offline.stats.causal_video_blend_weight == 0.0
+    assert offline.stats.causal_audio_blend_weight == 0.0
+    summary = offline.debug_summary()
+    assert "causal_video_blend_weight=0.000000" in summary
+    assert "causal_audio_blend_weight=0.000000" in summary
+
+    _actual_step(
+        offline,
+        float(sigmas[4]),
+        [(LABEL, torch.full((1, 3, 4), 9.0))],
+    )
+    assert offline.complete_offline_capture()
+    assert offline._offline_smoother is not None
+    assert offline._offline_smoother.configured_stream_blends == {
+        "audio": audio_blend_weight,
+        "video": video_blend_weight,
+    }
+    offline.end_run(offline.active_run_id)
+    offline.release_offline_archive()
+
+
 @pytest.mark.parametrize("history_storage", ["system_ram", "vram"])
 def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_calls(history_storage):
     runtime = _runtime(
@@ -1275,6 +1380,8 @@ def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_call
     assert "offline_effective_blend_mean=" in summary
     assert "video_blend_weight=0.500000" in summary
     assert "audio_blend_weight=0.000000" in summary
+    assert "causal_video_blend_weight=0.000000" in summary
+    assert "causal_audio_blend_weight=0.000000" in summary
     assert "offline_effective_audio_blend_max=0.000000" in summary
     assert "offline_effective_video_blend_mean=" in summary
     assert "offline_local_only_audio_predictions=2" in summary

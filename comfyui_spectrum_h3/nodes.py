@@ -102,7 +102,10 @@ class SpectrumApplyMiniMaxH3:
                     "BOOLEAN",
                     {
                         "default": False,
-                        "tooltip": "Experimental two-pass replay using past and future actual anchors.",
+                        "tooltip": (
+                            "Experimental two-pass replay: capture an audio-safe local-only trajectory, "
+                            "then apply the configured video/audio blends using past and future anchors."
+                        ),
                     },
                 ),
                 "audio_blend_weight": (
