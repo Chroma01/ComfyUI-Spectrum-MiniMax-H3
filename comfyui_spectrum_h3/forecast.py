@@ -12,6 +12,20 @@ class _HistoryEntry:
     feature_flat: torch.Tensor
 
 
+@dataclass(slots=True)
+class ForecasterSnapshot:
+    history: list[_HistoryEntry]
+    feature_shape: tuple[int, ...] | None
+    feature_dtype: torch.dtype | None
+    history_device: torch.device | None
+    generation: int
+    factor_generation: int
+    design: torch.Tensor | None
+    cholesky: torch.Tensor | None
+    factorization_count: int
+    jitter_attempts: int
+
+
 class HistoryWeightForecaster:
     """Chebyshev ridge forecasting without full-feature FP32 coefficients.
 
@@ -56,6 +70,36 @@ class HistoryWeightForecaster:
         self._cholesky: torch.Tensor | None = None
         self._factorization_count = 0
         self._jitter_attempts = 0
+        self.last_prediction_chunk_count = 0
+        self.last_prediction_max_fp32_elements = 0
+
+    def snapshot(self) -> ForecasterSnapshot:
+        return ForecasterSnapshot(
+            history=list(self._history),
+            feature_shape=self._feature_shape,
+            feature_dtype=self._feature_dtype,
+            history_device=self._history_device,
+            generation=self._generation,
+            factor_generation=self._factor_generation,
+            design=self._design,
+            cholesky=self._cholesky,
+            factorization_count=self._factorization_count,
+            jitter_attempts=self._jitter_attempts,
+        )
+
+    def restore(self, snapshot: ForecasterSnapshot) -> None:
+        if not isinstance(snapshot, ForecasterSnapshot):
+            raise TypeError("snapshot must be a ForecasterSnapshot")
+        self._history = list(snapshot.history)
+        self._feature_shape = snapshot.feature_shape
+        self._feature_dtype = snapshot.feature_dtype
+        self._history_device = snapshot.history_device
+        self._generation = snapshot.generation
+        self._factor_generation = snapshot.factor_generation
+        self._design = snapshot.design
+        self._cholesky = snapshot.cholesky
+        self._factorization_count = snapshot.factorization_count
+        self._jitter_attempts = snapshot.jitter_attempts
         self.last_prediction_chunk_count = 0
         self.last_prediction_max_fp32_elements = 0
 
@@ -184,6 +228,9 @@ class HistoryWeightForecaster:
         solved = torch.cholesky_solve(design.transpose(0, 1), cholesky)
         return (phi @ solved).reshape(-1)
 
+    def spectral_weights(self, coordinate: float) -> torch.Tensor:
+        return self._spectral_weights(coordinate)
+
     def _linear_weights(self, coordinate: float) -> torch.Tensor:
         weights = torch.zeros(len(self._history), dtype=torch.float32)
         if len(self._history) == 1:
@@ -204,6 +251,8 @@ class HistoryWeightForecaster:
         blend = float(blend_weight)
         if not 0.0 <= blend <= 1.0:
             raise ValueError("blend_weight must be in [0, 1]")
+        if blend <= 1e-12:
+            return self._linear_weights(coordinate)
         spectral = self._spectral_weights(coordinate)
         if blend >= 1.0 - 1e-12:
             return spectral
@@ -244,6 +293,26 @@ class HistoryWeightForecaster:
         weights = self.combined_weights(coordinate, blend_weight)
         return self._predict_with_weights(weights, rows=rows, device=device, dtype=dtype)
 
+    def predict_segments(
+        self,
+        coordinate: float,
+        segment_blends: Sequence[tuple[int, int, float]],
+        *,
+        rows: Sequence[int] | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        weighted_segments = [
+            (start, end, self.combined_weights(coordinate, blend_weight))
+            for start, end, blend_weight in segment_blends
+        ]
+        return self._predict_with_segment_weights(
+            weighted_segments,
+            rows=rows,
+            device=device,
+            dtype=dtype,
+        )
+
     def predict_one_point_hold(
         self,
         *,
@@ -256,6 +325,44 @@ class HistoryWeightForecaster:
         weights = torch.ones(1, dtype=torch.float32)
         return self._predict_with_weights(weights, rows=rows, device=device, dtype=dtype)
 
+    def predict_latest_hold(
+        self,
+        *,
+        rows: Sequence[int] | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        if not self._history:
+            raise RuntimeError("latest hold requires at least one actual history entry")
+        weights = torch.zeros(len(self._history), dtype=torch.float32)
+        weights[-1] = 1.0
+        return self._predict_with_weights(weights, rows=rows, device=device, dtype=dtype)
+
+    def predict_with_weights(
+        self,
+        weights: torch.Tensor,
+        *,
+        rows: Sequence[int] | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        return self._predict_with_weights(weights, rows=rows, device=device, dtype=dtype)
+
+    def predict_with_segment_weights(
+        self,
+        weighted_segments: Sequence[tuple[int, int, torch.Tensor]],
+        *,
+        rows: Sequence[int] | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        return self._predict_with_segment_weights(
+            weighted_segments,
+            rows=rows,
+            device=device,
+            dtype=dtype,
+        )
+
     def _predict_with_weights(
         self,
         weights: torch.Tensor,
@@ -266,40 +373,89 @@ class HistoryWeightForecaster:
     ) -> torch.Tensor:
         if self._feature_shape is None or self._feature_dtype is None:
             raise RuntimeError("Spectrum forecaster has no actual history")
-        if weights.ndim != 1 or weights.numel() != len(self._history):
-            raise ValueError("prediction weights must match actual history length")
+        if len(self._feature_shape) < 2:
+            raise RuntimeError("Spectrum forecaster feature shape is invalid")
+        feature_rows = self._feature_shape[1] if len(self._feature_shape) >= 3 else 1
+        return self._predict_with_segment_weights(
+            ((0, feature_rows, weights),),
+            rows=rows,
+            device=device,
+            dtype=dtype,
+        )
+
+    def _predict_with_segment_weights(
+        self,
+        weighted_segments: Sequence[tuple[int, int, torch.Tensor]],
+        *,
+        rows: Sequence[int] | None,
+        device: torch.device | str | None,
+        dtype: torch.dtype | None,
+    ) -> torch.Tensor:
+        if self._feature_shape is None or self._feature_dtype is None:
+            raise RuntimeError("Spectrum forecaster has no actual history")
+        feature_rows = self._feature_shape[1] if len(self._feature_shape) >= 3 else 1
+        normalized_segments = []
+        expected_start = 0
+        for start, end, weights in weighted_segments:
+            start = int(start)
+            end = int(end)
+            if start != expected_start or end <= start or end > feature_rows:
+                raise ValueError("prediction segments must cover feature rows contiguously")
+            if weights.ndim != 1 or weights.numel() != len(self._history):
+                raise ValueError("prediction weights must match actual history length")
+            normalized_segments.append((start, end, tuple(float(weight) for weight in weights.tolist())))
+            expected_start = end
+        if expected_start != feature_rows:
+            raise ValueError("prediction segments must cover every feature row")
+
         resolved_rows = self._normalize_rows(rows)
         target_device = torch.device(device or "cpu")
         target_dtype = dtype or self._feature_dtype
         if not target_dtype.is_floating_point:
             raise ValueError("prediction dtype must be floating point")
-        weight_scalars = tuple(float(weight) for weight in weights.tolist())
 
         tail_shape = self._feature_shape[1:]
         tail_numel = 1
         for size in tail_shape:
             tail_numel *= size
+        if len(self._feature_shape) >= 3:
+            row_numel = 1
+            for size in tail_shape[1:]:
+                row_numel *= size
+        else:
+            row_numel = tail_numel
         result = torch.empty((len(resolved_rows), *tail_shape), device=target_device, dtype=target_dtype)
         result_flat = result.reshape(-1)
-        chunk_elements = min(self._chunk_elements(target_device), tail_numel)
         self.last_prediction_chunk_count = 0
         self.last_prediction_max_fp32_elements = 0
 
         for target_row, source_row in enumerate(resolved_rows):
             source_base = source_row * tail_numel
             target_base = target_row * tail_numel
-            for offset in range(0, tail_numel, chunk_elements):
-                length = min(chunk_elements, tail_numel - offset)
-                accumulator = torch.zeros(length, device=target_device, dtype=torch.float32)
-                for scalar, entry in zip(weight_scalars, self._history, strict=True):
-                    if scalar == 0.0:
-                        continue
-                    source = entry.feature_flat.narrow(0, source_base + offset, length)
-                    source_fp32 = source.to(device=target_device, dtype=torch.float32, non_blocking=False)
-                    accumulator.add_(source_fp32, alpha=scalar)
-                result_flat.narrow(0, target_base + offset, length).copy_(accumulator.to(target_dtype))
-                self.last_prediction_chunk_count += 1
-                self.last_prediction_max_fp32_elements = max(
-                    self.last_prediction_max_fp32_elements, accumulator.numel()
-                )
+            for start, end, weight_scalars in normalized_segments:
+                segment_start = start * row_numel
+                segment_numel = (end - start) * row_numel
+                chunk_elements = min(self._chunk_elements(target_device), segment_numel)
+                for offset in range(0, segment_numel, chunk_elements):
+                    length = min(chunk_elements, segment_numel - offset)
+                    accumulator = torch.zeros(length, device=target_device, dtype=torch.float32)
+                    for scalar, entry in zip(weight_scalars, self._history, strict=True):
+                        if scalar == 0.0:
+                            continue
+                        source = entry.feature_flat.narrow(
+                            0,
+                            source_base + segment_start + offset,
+                            length,
+                        )
+                        source_fp32 = source.to(device=target_device, dtype=torch.float32, non_blocking=False)
+                        accumulator.add_(source_fp32, alpha=scalar)
+                    result_flat.narrow(
+                        0,
+                        target_base + segment_start + offset,
+                        length,
+                    ).copy_(accumulator.to(target_dtype))
+                    self.last_prediction_chunk_count += 1
+                    self.last_prediction_max_fp32_elements = max(
+                        self.last_prediction_max_fp32_elements, accumulator.numel()
+                    )
         return result

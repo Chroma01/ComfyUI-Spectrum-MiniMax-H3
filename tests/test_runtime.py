@@ -6,7 +6,13 @@ import torch
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.runtime import ForecastRetryActual, SpectrumH3Runtime
 
-TOPOLOGY = (("video", (1, 24, 2, 4, 4)), ("audio", (1, 32, 2, 8)), ("hidden", 4))
+TOPOLOGY = (
+    ("video", (1, 24, 2, 4, 4)),
+    ("audio", (1, 32, 2, 8)),
+    ("hidden", 4),
+    ("target_audio_rows", 1),
+    ("target_video_rows", 2),
+)
 LABEL = ((0, "positive"),)
 
 
@@ -813,3 +819,574 @@ def test_twenty_step_euler_schedule_refreshes_between_forecasts():
     assert forecast_indices == [1, 3, 5, 7, 9, 11, 13, 15, 17]
     assert runtime.stats.actual_steps == 11
     assert runtime.stats.forecast_steps == 9
+
+
+def _measured_anchor(runtime, timestep, *, video_values, audio_values):
+    decision = runtime.begin_step(torch.tensor([timestep]))
+    assert decision["actual"]
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert actual
+    probe = runtime.prepare_residual_probe(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert probe is not None
+    actual_feature = probe.shadow + 1.0
+    runtime.observe_actual(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        actual_feature,
+    )
+    actual_video, shadow_video, hold_video = (
+        torch.full((4,), value) for value in video_values
+    )
+    actual_audio, shadow_audio, hold_audio = (
+        torch.full((4,), value) for value in audio_values
+    )
+    runtime.record_residual_measurement(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        probe,
+        actual_feature=actual_feature,
+        actual_output=[actual_video, actual_audio],
+        shadow_output=[shadow_video, shadow_audio],
+        hold_output=[hold_video, hold_audio],
+    )
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+    return decision
+
+
+def _feedback_runtime():
+    runtime = _runtime(
+        anchor_residual_feedback=True,
+        warmup_steps=2,
+        window_size=2.0,
+        flex_window=0.75,
+    )
+    runtime.start_run(
+        torch.linspace(1.0, 0.0, 8),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    _actual_step(runtime, 1.0, [(LABEL, torch.zeros(1, 3, 4))])
+    _actual_step(runtime, 6.0 / 7.0, [(LABEL, torch.ones(1, 3, 4))])
+    _forecast_step(runtime, 5.0 / 7.0)
+    runtime._current_window = 4.0
+    return runtime
+
+
+def test_residual_probe_reraises_cuda_oom(monkeypatch):
+    runtime = _feedback_runtime()
+    decision = runtime.begin_step(torch.tensor([4.0 / 7.0]))
+    assert decision["actual"]
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert actual
+
+    def raise_oom(*_args, **_kwargs):
+        raise torch.cuda.OutOfMemoryError("probe prediction OOM")
+
+    monkeypatch.setattr(runtime.forecaster, "predict_segments", raise_oom)
+    try:
+        with pytest.raises(torch.cuda.OutOfMemoryError, match="probe prediction OOM"):
+            runtime.prepare_residual_probe(
+                decision["run_id"],
+                decision["step_id"],
+                call_id,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        assert runtime.experiment_disabled_reason is None
+        assert runtime.stats.residual_measure_seconds >= 0.0
+    finally:
+        runtime.abort_step(decision["run_id"], decision["step_id"])
+        runtime.end_run(decision["run_id"])
+
+
+def test_residual_measurement_rejects_tensor_as_two_stream_container():
+    runtime = _feedback_runtime()
+    decision = runtime.begin_step(torch.tensor([4.0 / 7.0]))
+    assert decision["actual"]
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert actual
+    probe = runtime.prepare_residual_probe(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert probe is not None
+    actual_feature = probe.shadow + 1.0
+    runtime.observe_actual(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        actual_feature,
+    )
+    runtime.record_residual_measurement(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        probe,
+        actual_feature=actual_feature,
+        actual_output=torch.zeros(2, 4),
+        shadow_output=[torch.zeros(4), torch.zeros(4)],
+        hold_output=[torch.zeros(4), torch.zeros(4)],
+    )
+    assert runtime.experiment_disabled_reason is not None
+    assert runtime.experiment_disabled_reason == (
+        "residual measurement output structure changed"
+    )
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+    runtime.end_run(decision["run_id"])
+
+
+def test_anchor_feedback_requests_actual_refresh_without_hidden_correction():
+    runtime = _feedback_runtime()
+    _measured_anchor(
+        runtime,
+        4.0 / 7.0,
+        video_values=(2.0, 0.5, 1.0),
+        audio_values=(2.0, 0.5, 1.0),
+    )
+    assert runtime.stats.residual_max_score == pytest.approx(1.5)
+    assert runtime.stats.residual_policy_max_score == pytest.approx(1.5)
+    assert runtime.stats.current_window == pytest.approx(4.0)
+    assert not hasattr(runtime, "_pending_residual")
+
+    decision = runtime.begin_step(torch.tensor([3.0 / 7.0]))
+    assert decision["actual"]
+    assert decision["reason"] == "anchor residual feedback refresh"
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert actual
+    runtime.observe_actual(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        torch.zeros(1, 3, 4),
+    )
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+    assert runtime.stats.feedback_refreshes == 1
+
+
+def test_audio_only_residual_does_not_change_anchor_feedback_schedule():
+    runtime = _feedback_runtime()
+    _measured_anchor(
+        runtime,
+        4.0 / 7.0,
+        video_values=(2.0, 1.0, 0.0),
+        audio_values=(3.0, 0.0, 2.0),
+    )
+    assert runtime.stats.residual_max_score == pytest.approx(3.0)
+    assert runtime.stats.residual_policy_max_score == pytest.approx(0.5)
+    decision = runtime.begin_step(torch.tensor([3.0 / 7.0]))
+    assert not decision["actual"]
+    assert decision["reason"] == "adaptive forecast"
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert not actual
+    expected_audio = runtime.forecaster.predict(
+        decision["coordinate"],
+        runtime.config.audio_blend_weight,
+        rows=(0,),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    expected_video = runtime.forecaster.predict(
+        decision["coordinate"],
+        runtime.config.blend_weight,
+        rows=(0,),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    observed = runtime.predict(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(observed[:, :1], expected_audio[:, :1])
+    torch.testing.assert_close(observed[:, 1:], expected_video[:, 1:])
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+
+def test_distinct_modality_blends_fail_closed_without_target_row_metadata():
+    runtime = _runtime()
+    runtime.start_run(
+        torch.tensor([1.0, 0.75, 0.5, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    topology = (("tiny", 1),)
+    for timestep in (1.0, 0.75):
+        decision = runtime.begin_step(torch.tensor([timestep]))
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=topology,
+            labels=LABEL,
+            expected_shape=(1, 3, 4),
+        )
+        assert actual
+        runtime.observe_actual(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            torch.zeros(1, 3, 4),
+        )
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    decision = runtime.begin_step(torch.tensor([0.5]))
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=topology,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert not actual
+    assert runtime.predict(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    ) is None
+    assert runtime.disabled_reason == "packed H3 topology does not expose the target audio/video boundary"
+    runtime.abort_step(decision["run_id"], decision["step_id"])
+    runtime.end_run(decision["run_id"])
+
+
+def test_anchor_feedback_skips_probes_after_refresh_budget():
+    runtime = _feedback_runtime()
+    runtime.stats.feedback_refreshes = 3
+    decision = runtime.begin_step(torch.tensor([4.0 / 7.0]))
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert actual
+    assert runtime.prepare_residual_probe(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    ) is None
+    assert runtime.stats.feedback_suppressed_budget == 1
+    runtime.abort_step(decision["run_id"], decision["step_id"])
+
+
+def test_terminal_feedback_probe_is_skipped_but_rollback_probe_is_retained():
+    for setting, expected in (
+        ("anchor_residual_feedback", False),
+        ("selective_rollback_correction", True),
+    ):
+        runtime = _runtime(**{setting: True})
+        runtime.start_run(
+            torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
+            "sample_euler",
+            supported_sampler=True,
+            max_consecutive_forecasts=1,
+            min_actual_steps_after_forecast=1,
+        )
+        _actual_step(runtime, 1.0, [(LABEL, torch.zeros(1, 3, 4))])
+        _actual_step(runtime, 0.75, [(LABEL, torch.ones(1, 3, 4))])
+        _forecast_step(runtime, 0.5)
+        decision = runtime.begin_step(torch.tensor([0.25]))
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=TOPOLOGY,
+            labels=LABEL,
+            expected_shape=(1, 3, 4),
+        )
+        assert actual
+        probe = runtime.prepare_residual_probe(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        assert (probe is not None) is expected
+        if setting == "anchor_residual_feedback":
+            assert runtime.stats.residual_skipped_terminal_probes == 1
+        runtime.abort_step(decision["run_id"], decision["step_id"])
+
+
+@pytest.mark.parametrize(
+    ("video_blend_weight", "audio_blend_weight"),
+    ((0.5, 0.0), (1.0, 1.0)),
+)
+def test_offline_capture_is_local_only_while_replay_keeps_configured_blends(
+    video_blend_weight,
+    audio_blend_weight,
+):
+    config = {
+        "degree": 2,
+        "max_history": 4,
+        "warmup_steps": 3,
+        "tail_actual_steps": 0,
+        "bootstrap_first_forecast": False,
+        "blend_weight": video_blend_weight,
+        "audio_blend_weight": audio_blend_weight,
+    }
+    sigmas = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0])
+    feature_values = (0.0, 1.0, 4.0)
+
+    def prepare_forecast(runtime):
+        runtime.start_run(
+            sigmas,
+            "sample_euler",
+            supported_sampler=True,
+            max_consecutive_forecasts=1,
+            min_actual_steps_after_forecast=1,
+        )
+        for sigma, value in zip(sigmas[:3], feature_values, strict=True):
+            _actual_step(
+                runtime,
+                float(sigma),
+                [(LABEL, torch.full((1, 3, 4), value))],
+            )
+        decision = runtime.begin_step(sigmas[3])
+        assert not decision["actual"]
+        local = runtime.forecaster.predict_segments(
+            decision["coordinate"],
+            ((0, 1, 0.0), (1, 3, 0.0)),
+            rows=(0,),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        configured = runtime.forecaster.predict_segments(
+            decision["coordinate"],
+            (
+                (0, 1, audio_blend_weight),
+                (1, 3, video_blend_weight),
+            ),
+            rows=(0,),
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        assert not torch.equal(local, configured)
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=TOPOLOGY,
+            labels=LABEL,
+            expected_shape=(1, 3, 4),
+        )
+        assert not actual
+        prediction = runtime.predict(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        assert prediction is not None
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+        return prediction, local, configured
+
+    ordinary = _runtime(**config)
+    ordinary_prediction, _ordinary_local, ordinary_configured = prepare_forecast(ordinary)
+    torch.testing.assert_close(ordinary_prediction, ordinary_configured)
+    assert ordinary.stats.causal_video_blend_weight == video_blend_weight
+    assert ordinary.stats.causal_audio_blend_weight == audio_blend_weight
+    ordinary.end_run(ordinary.active_run_id)
+
+    offline = _runtime(offline_smoothing_replay=True, **config)
+    offline.begin_offline_capture(total_steps=5, sampler_name="sample_euler")
+    offline_prediction, offline_local, _offline_spectral = prepare_forecast(offline)
+    torch.testing.assert_close(offline_prediction, offline_local)
+    assert offline.stats.causal_video_blend_weight == 0.0
+    assert offline.stats.causal_audio_blend_weight == 0.0
+    summary = offline.debug_summary()
+    assert "causal_video_blend_weight=0.000000" in summary
+    assert "causal_audio_blend_weight=0.000000" in summary
+
+    _actual_step(
+        offline,
+        float(sigmas[4]),
+        [(LABEL, torch.full((1, 3, 4), 9.0))],
+    )
+    assert offline.complete_offline_capture()
+    assert offline._offline_smoother is not None
+    assert offline._offline_smoother.configured_stream_blends == {
+        "audio": audio_blend_weight,
+        "video": video_blend_weight,
+    }
+    offline.end_run(offline.active_run_id)
+    offline.release_offline_archive()
+
+
+@pytest.mark.parametrize("history_storage", ["system_ram", "vram"])
+def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_calls(history_storage):
+    runtime = _runtime(
+        offline_smoothing_replay=True,
+        max_history=2,
+        warmup_steps=2,
+        tail_actual_steps=0,
+        history_storage=history_storage,
+    )
+    sigmas = torch.linspace(1.0, 0.0, 7)
+    runtime.begin_offline_capture(total_steps=6, sampler_name="sample_euler")
+    run_id = runtime.start_run(
+        sigmas,
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    first_pass = []
+    for step, sigma in enumerate(torch.linspace(1.0, 1.0 / 6.0, 6)):
+        decision = runtime.begin_step(sigma)
+        first_pass.append(decision)
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=TOPOLOGY,
+            labels=LABEL,
+            expected_shape=(1, 3, 4),
+        )
+        if actual:
+            runtime.observe_actual(
+                decision["run_id"],
+                decision["step_id"],
+                call_id,
+                torch.full((1, 3, 4), float(step)),
+            )
+        else:
+            runtime.predict(
+                decision["run_id"],
+                decision["step_id"],
+                call_id,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    assert runtime.forecaster.history_length == 2
+    assert runtime.complete_offline_capture()
+    archive = runtime.offline_archive
+    assert archive is not None
+    assert len(archive.anchors) == 4
+    assert archive.history_storage == history_storage
+    assert archive.history_device == torch.device("cpu")
+    assert {
+        anchor.feature.data_ptr() for anchor in archive.anchors[-2:]
+    } == {
+        entry.feature_flat.data_ptr() for entry in runtime.forecaster._history
+    }
+    assert runtime.stats.offline_validation_samples_per_branch == 12
+    assert runtime.stats.offline_validation_anchors == 2
+    assert runtime.stats.offline_attenuated_predictions == 2
+    assert runtime.stats.offline_effective_blend_min < runtime.config.blend_weight
+    assert runtime.stats.offline_effective_audio_blend_min == 0.0
+    assert runtime.stats.offline_effective_audio_blend_mean == 0.0
+    assert runtime.stats.offline_effective_audio_blend_max == 0.0
+    assert runtime.stats.offline_local_only_audio_predictions == 2
+    assert runtime.stats.offline_attenuated_video_predictions == 2
+    assert 0.0 < runtime.stats.offline_effective_video_blend_min
+    assert runtime.stats.offline_effective_video_blend_max < runtime.config.blend_weight
+    actual_features = {anchor.step_id: anchor.feature.clone() for anchor in archive.anchors}
+    runtime.end_run(run_id)
+
+    runtime.begin_offline_replay()
+    replay_id = runtime.start_run(
+        sigmas,
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    for step, sigma in enumerate(torch.linspace(1.0, 1.0 / 6.0, 6)):
+        decision = runtime.begin_step(sigma)
+        assert not decision["actual"]
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=TOPOLOGY,
+            labels=LABEL,
+            expected_shape=(1, 3, 4),
+        )
+        assert not actual
+        prediction = runtime.predict(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        if step in actual_features:
+            torch.testing.assert_close(prediction, actual_features[step])
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    assert runtime.stats.actual_transformer_calls == 0
+    assert runtime.stats.offline_replay_steps == 6
+    assert runtime.stats.offline_replay_model_calls == 6
+    assert runtime.stats.offline_replay_anchor_steps == 4
+    assert runtime.stats.offline_replay_smoothed_steps == 2
+    assert runtime.prediction_history_length == 4
+    assert runtime.prediction_history_tensor_bytes == archive.tensor_bytes
+    assert runtime.last_prediction_chunk_count > 0
+    summary = runtime.debug_summary()
+    assert "offline_replay_anchor_steps=4" in summary
+    assert "offline_replay_smoothed_steps=2" in summary
+    assert "offline_validation_samples_per_branch=12" in summary
+    assert "offline_attenuated_predictions=2" in summary
+    assert "offline_effective_blend_mean=" in summary
+    assert "video_blend_weight=0.500000" in summary
+    assert "audio_blend_weight=0.000000" in summary
+    assert "causal_video_blend_weight=0.000000" in summary
+    assert "causal_audio_blend_weight=0.000000" in summary
+    assert "offline_effective_audio_blend_max=0.000000" in summary
+    assert "offline_effective_video_blend_mean=" in summary
+    assert "offline_local_only_audio_predictions=2" in summary
+    assert "offline_full_schedule_estimated_mib=" in summary
+    assert "history_device='cpu'" in summary
+    runtime.end_run(replay_id)
+    runtime.release_offline_archive()
+    assert runtime.offline_archive is None

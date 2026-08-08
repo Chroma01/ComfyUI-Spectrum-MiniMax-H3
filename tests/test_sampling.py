@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
+import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
@@ -17,6 +18,7 @@ from comfyui_spectrum_h3.sampling import (
     predict_noise_wrapper,
     sampler_is_supported,
     sampler_name,
+    sampler_sample_wrapper,
 )
 
 
@@ -172,3 +174,198 @@ def test_predict_noise_passthrough_survives_a_downstream_model_bypass(caplog):
         assert caplog.text.count("accepting the wrapped result as a passthrough") == 1
     finally:
         runtime.end_run(run_id)
+
+
+def test_offline_outer_sample_restarts_from_cloned_inputs_and_callbacks_only_replay():
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            warmup_steps=2,
+            tail_actual_steps=0,
+            bootstrap_first_forecast=False,
+            offline_smoothing_replay=True,
+            audio_blend_weight=0.5,
+        )
+    )
+    guider = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}},
+        conds={"positive": [{"nested": {"marker": "original"}}]},
+    )
+    starts = []
+    callback_arguments = []
+    topology = (("tiny", 1),)
+    labels = ((0, "positive"),)
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(
+            self,
+            run_noise,
+            run_latent,
+            _sampler,
+            run_sigmas,
+            _mask,
+            run_callback,
+            _disable_pbar,
+            _seed,
+            *,
+            latent_shapes=None,
+        ):
+            assert guider.conds["positive"][0]["nested"]["marker"] == "original"
+            starts.append((runtime.offline_phase, run_noise.clone(), run_latent.clone(), run_callback))
+            for index, sigma in enumerate(run_sigmas[:-1]):
+                decision = runtime.begin_step(sigma)
+                call_id, actual = runtime.begin_model_call(
+                    decision["run_id"],
+                    decision["step_id"],
+                    topology=topology,
+                    labels=labels,
+                    expected_shape=(1, 1, 1),
+                )
+                if actual:
+                    runtime.observe_actual(
+                        decision["run_id"],
+                        decision["step_id"],
+                        call_id,
+                        torch.full((1, 1, 1), float(index)),
+                    )
+                else:
+                    runtime.predict(
+                        decision["run_id"],
+                        decision["step_id"],
+                        call_id,
+                        device=torch.device("cpu"),
+                        dtype=torch.float32,
+                    )
+                runtime.finalize_step(decision["run_id"], decision["step_id"])
+                if run_callback is not None:
+                    run_callback(index, run_noise, run_latent, len(run_sigmas) - 1)
+            if runtime.offline_phase == "first_pass":
+                guider.conds["positive"][0]["nested"]["marker"] = "processed-first-pass"
+                run_noise.add_(10.0)
+            return run_noise + run_latent
+
+    noise = torch.ones(1)
+    latent = torch.full((1,), 2.0)
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+    result = outer_sample_wrapper(
+        Executor(),
+        noise,
+        latent,
+        _sampler("sample_euler"),
+        sigmas,
+        callback=lambda *args: callback_arguments.append(args),
+        seed=7,
+        latent_shapes=((1,),),
+    )
+
+    assert [phase for phase, *_rest in starts] == ["first_pass", "replay"]
+    assert starts[0][3] is None
+    assert starts[1][3] is not None
+    torch.testing.assert_close(starts[0][1], torch.ones(1))
+    torch.testing.assert_close(starts[1][1], torch.ones(1))
+    torch.testing.assert_close(starts[1][2], torch.full((1,), 2.0))
+    assert len(callback_arguments) == 2
+    torch.testing.assert_close(result, torch.full((1,), 3.0))
+    assert runtime.active_run_id is None
+    assert runtime.offline_archive is None
+
+
+def test_offline_unsupported_sampler_uses_true_native_bypass(caplog):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            bootstrap_first_forecast=False,
+            offline_smoothing_replay=True,
+        )
+    )
+    guider = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime), "transformer_options": {}}
+    )
+    calls = []
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *args, **kwargs):
+            assert runtime.active_run_id is None
+            calls.append((args, kwargs))
+            return "native-result"
+
+    callback = object()
+    with caplog.at_level("WARNING"):
+        result = outer_sample_wrapper(
+            Executor(),
+            torch.ones(1),
+            torch.zeros(1),
+            _sampler("sample_euler_ancestral"),
+            torch.tensor([1.0, 0.0]),
+            callback=callback,
+            seed=7,
+        )
+
+    assert result == "native-result"
+    assert len(calls) == 1
+    assert calls[0][0][5] is callback
+    assert runtime.active_run_id is None
+    assert "running one native pass" in caplog.text
+
+
+def test_selective_rollback_res_falls_back_before_sampler_mutation(monkeypatch, caplog):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            warmup_steps=2,
+            bootstrap_first_forecast=False,
+            selective_rollback_correction=True,
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_res_multistep",
+        supported_sampler=True,
+    )
+    model_wrap = SimpleNamespace(
+        model_options={BINDING_KEY: SpectrumH3Binding(runtime)}
+    )
+    fake_sampling = ModuleType("comfy.k_diffusion.sampling")
+    fake_sampling.sample_euler = object()
+    fake_k_diffusion = ModuleType("comfy.k_diffusion")
+    fake_k_diffusion.sampling = fake_sampling
+    fake_comfy = ModuleType("comfy")
+    fake_comfy.k_diffusion = fake_k_diffusion
+    monkeypatch.setitem(sys.modules, "comfy", fake_comfy)
+    monkeypatch.setitem(sys.modules, "comfy.k_diffusion", fake_k_diffusion)
+    monkeypatch.setitem(sys.modules, "comfy.k_diffusion.sampling", fake_sampling)
+    calls = []
+
+    class Executor:
+        class_obj = _sampler("sample_res_multistep")
+
+        def __call__(self, *args):
+            calls.append(args)
+            return "ordinary-spectrum"
+
+    with caplog.at_level("WARNING"):
+        result = sampler_sample_wrapper(
+            Executor(),
+            model_wrap,
+            torch.tensor([1.0, 0.5, 0.0]),
+            {"model_options": {}},
+            None,
+            torch.ones(1),
+            torch.zeros(1),
+            None,
+            True,
+        )
+
+    assert result == "ordinary-spectrum"
+    assert len(calls) == 1
+    assert runtime._run.next_step_id == 0
+    assert "supports only the exact reviewed sample_euler contract" in runtime.experiment_disabled_reason
+    assert caplog.text.count("experimental mode disabled") == 1
+    runtime.end_run(run_id)

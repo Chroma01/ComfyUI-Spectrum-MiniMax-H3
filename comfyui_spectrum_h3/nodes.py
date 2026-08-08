@@ -35,7 +35,19 @@ class SpectrumApplyMiniMaxH3:
             "required": {
                 "model": ("MODEL",),
                 "enabled": ("BOOLEAN", {"default": True}),
-                "blend_weight": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "blend_weight": (
+                    "FLOAT",
+                    {
+                        "default": 0.50,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Direct video spectral share. Audio uses the separate audio_blend_weight setting. "
+                            "In ordinary single-pass H3, video forecasts can still affect later audio through joint transformer calls."
+                        ),
+                    },
+                ),
                 "degree": (
                     "INT",
                     {
@@ -75,6 +87,43 @@ class SpectrumApplyMiniMaxH3:
                         ),
                     },
                 ),
+                "anchor_residual_feedback": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Experimental video-scored actual-refresh guard; never injects a hidden residual.",
+                    },
+                ),
+                "selective_rollback_correction": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Experimental thresholded, budgeted rollback for the reviewed deterministic Euler sampler only.",
+                    },
+                ),
+                "offline_smoothing_replay": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Experimental two-pass replay: capture a local-only trajectory, then apply "
+                            "the configured video/audio blends using past and future anchors."
+                        ),
+                    },
+                ),
+                "audio_blend_weight": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Direct audio spectral share. The default 0 prevents spectral mixing of audio rows. "
+                            "Use offline_smoothing_replay to isolate capture from video-to-audio trajectory coupling."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -98,6 +147,10 @@ class SpectrumApplyMiniMaxH3:
         debug,
         history_storage="system_ram",
         bootstrap_first_forecast=True,
+        anchor_residual_feedback=False,
+        selective_rollback_correction=False,
+        offline_smoothing_replay=False,
+        audio_blend_weight=0.0,
     ):
         if not enabled:
             return (model,)
@@ -106,6 +159,13 @@ class SpectrumApplyMiniMaxH3:
         resolved_warmup_steps = int(warmup_steps)
         if not isinstance(bootstrap_first_forecast, bool):
             raise TypeError("bootstrap_first_forecast must be a boolean")
+        for name, value in (
+            ("anchor_residual_feedback", anchor_residual_feedback),
+            ("selective_rollback_correction", selective_rollback_correction),
+            ("offline_smoothing_replay", offline_smoothing_replay),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be a boolean")
         effective_bootstrap = _effective_bootstrap_first_forecast(
             requested=bootstrap_first_forecast,
             degree=resolved_degree,
@@ -123,6 +183,10 @@ class SpectrumApplyMiniMaxH3:
             max_history=int(max_history),
             history_storage=str(history_storage),
             bootstrap_first_forecast=effective_bootstrap,
+            anchor_residual_feedback=anchor_residual_feedback,
+            selective_rollback_correction=selective_rollback_correction,
+            offline_smoothing_replay=offline_smoothing_replay,
+            audio_blend_weight=float(audio_blend_weight),
             debug=bool(debug),
         ).validate()
         patched = model.clone()

@@ -32,6 +32,12 @@ def test_history_storage_rejects_unknown_locations():
         SpectrumH3Config(history_storage="automatic").validate()
 
 
+@pytest.mark.parametrize("value", [-0.01, 1.01, float("nan"), float("inf")])
+def test_audio_blend_weight_requires_a_finite_unit_interval(value):
+    with pytest.raises(ValueError, match="audio_blend_weight"):
+        SpectrumH3Config(audio_blend_weight=value).validate()
+
+
 def test_preliminary_scheduler_defaults():
     config = SpectrumH3Config()
     required = SpectrumApplyMiniMaxH3.INPUT_TYPES()["required"]
@@ -42,6 +48,8 @@ def test_preliminary_scheduler_defaults():
     assert config.warmup_steps == 1
     assert config.tail_actual_steps == 1
     assert config.bootstrap_first_forecast is True
+    assert config.blend_weight == 0.5
+    assert config.audio_blend_weight == 0.0
     assert required["degree"][1]["default"] == 1
     assert required["warmup_steps"][1]["default"] == 1
     assert required["tail_actual_steps"][1]["default"] == 1
@@ -52,6 +60,83 @@ def test_preliminary_scheduler_defaults():
     assert "disable bootstrap_first_forecast" in required["degree"][1]["tooltip"]
     assert "disable bootstrap_first_forecast" in required["warmup_steps"][1]["tooltip"]
     assert apply_parameters["bootstrap_first_forecast"].default is True
+    assert optional["audio_blend_weight"][0] == "FLOAT"
+    assert optional["audio_blend_weight"][1]["default"] == 0.0
+    assert apply_parameters["audio_blend_weight"].default == 0.0
+    for name in (
+        "anchor_residual_feedback",
+        "selective_rollback_correction",
+        "offline_smoothing_replay",
+    ):
+        assert getattr(config, name) is False
+        assert optional[name][0] == "BOOLEAN"
+        assert optional[name][1]["default"] is False
+        assert apply_parameters[name].default is False
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "anchor_residual_feedback",
+        "selective_rollback_correction",
+        "offline_smoothing_replay",
+    ),
+)
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_experimental_settings_require_strict_booleans(name, value):
+    with pytest.raises(TypeError, match=rf"{name} must be a boolean"):
+        SpectrumH3Config(**{name: value})
+
+
+@pytest.mark.parametrize(
+    "enabled",
+    (
+        ("anchor_residual_feedback", "selective_rollback_correction"),
+        ("anchor_residual_feedback", "offline_smoothing_replay"),
+        ("selective_rollback_correction", "offline_smoothing_replay"),
+        (
+            "anchor_residual_feedback",
+            "selective_rollback_correction",
+            "offline_smoothing_replay",
+        ),
+    ),
+)
+def test_experimental_settings_are_mutually_exclusive_on_construction(enabled):
+    values = {name: True for name in enabled}
+    with pytest.raises(ValueError) as error:
+        SpectrumH3Config(**values)
+    for name in enabled:
+        assert name in str(error.value)
+
+
+def test_disabled_config_allows_irrelevant_experimental_conflicts():
+    config = SpectrumH3Config(
+        enabled=False,
+        anchor_residual_feedback=True,
+        selective_rollback_correction=True,
+        offline_smoothing_replay=True,
+    )
+    config.validate()
+
+
+def test_disabled_node_returns_original_before_experimental_validation():
+    model = object()
+    (result,) = SpectrumApplyMiniMaxH3().apply(
+        model,
+        False,
+        0.5,
+        1,
+        0.1,
+        2.0,
+        0.75,
+        1,
+        1,
+        8,
+        False,
+        anchor_residual_feedback=True,
+        selective_rollback_correction=True,
+    )
+    assert result is model
 
 
 def test_aggressive_preset_explicitly_disables_degree_one_bootstrap():
@@ -108,6 +193,7 @@ def test_node_disables_incompatible_bootstrap_settings(degree, warmup_steps, cap
 
     assert effective is False
     assert "Disabling bootstrap_first_forecast" in caplog.text
+
     assert f"degree={degree}" in caplog.text
     assert f"warmup_steps={warmup_steps}" in caplog.text
 
@@ -166,10 +252,12 @@ def test_apply_normalizes_reported_warmup_conflict(monkeypatch, caplog):
             8,
             False,
             bootstrap_first_forecast=True,
+            audio_blend_weight=0.25,
         )
 
     assert isinstance(patched, FakeModel)
     assert captured["config"].degree == 1
     assert captured["config"].warmup_steps == 2
     assert captured["config"].bootstrap_first_forecast is False
+    assert captured["config"].audio_blend_weight == 0.25
     assert "Disabling bootstrap_first_forecast" in caplog.text
