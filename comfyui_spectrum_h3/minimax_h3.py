@@ -7,7 +7,7 @@ from typing import Any
 
 import torch
 
-from .runtime import SpectrumH3Runtime
+from .runtime import OfflineReplayAbort, SpectrumH3Runtime
 from .sampling import (
     RUN_ID_KEY,
     RUNTIME_KEY,
@@ -275,6 +275,7 @@ def _execute_actual(
     transformer_options,
     minimax_payload,
     kwargs,
+    residual_probe=None,
 ):
     if len(inner.blocks) == 0:
         raise RuntimeError("native MiniMax H3 has no transformer blocks to observe")
@@ -286,9 +287,10 @@ def _execute_actual(
     local_options["patches_replace"] = patches_replace
     existing = dit_replacements.get(("double_block", last_index))
     observed = False
+    actual_target = None
 
     def capture_replacement(args, replacement_context):
-        nonlocal observed
+        nonlocal actual_target, observed
         output = existing(args, replacement_context) if existing is not None else replacement_context["original_block"](args)
         if not isinstance(output, dict) or "img" not in output or not torch.is_tensor(output["img"]):
             raise RuntimeError("final MiniMax H3 block replacement did not return {'img': tensor}")
@@ -300,6 +302,7 @@ def _execute_actual(
         # packed tail. Keep a view here; materializing torch.cat would create a
         # second full target tensor on the GPU before the required CPU archive.
         target = hidden[aa:vb].unsqueeze(0)
+        actual_target = target
         runtime.observe_actual(run_id, step_id, call_id, target)
         observed = True
         return output
@@ -315,6 +318,34 @@ def _execute_actual(
     )
     if not observed:
         raise RuntimeError("native MiniMax H3 final transformer block was not executed")
+    if residual_probe is not None and actual_target is not None:
+        try:
+            state = _prepare_output_state(
+                inner,
+                x[0],
+                x[1],
+                timestep,
+                context,
+                transformer_options,
+                minimax_payload or {},
+                layout,
+            )
+            shadow_output = _execute_forecast(inner, residual_probe.shadow, state, x[0], x[1])
+            hold_output = _execute_forecast(inner, residual_probe.hold, state, x[0], x[1])
+            runtime.record_residual_measurement(
+                run_id,
+                step_id,
+                call_id,
+                residual_probe,
+                actual_feature=actual_target,
+                actual_output=result,
+                shadow_output=shadow_output,
+                hold_output=hold_output,
+            )
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except (RuntimeError, TypeError, ValueError) as exc:
+            runtime.disable_experiment(f"residual output-head evaluation failed: {exc}")
     return result
 
 
@@ -432,6 +463,13 @@ def diffusion_model_wrapper(
         )
 
     if actual:
+        residual_probe = runtime.prepare_residual_probe(
+            int(run_id),
+            int(step_id),
+            call_id,
+            device=video_x.device,
+            dtype=context.dtype,
+        )
         return _execute_actual(
             executor,
             inner,
@@ -446,6 +484,7 @@ def diffusion_model_wrapper(
             options,
             minimax_payload,
             kwargs,
+            residual_probe,
         )
 
     predicted = runtime.predict(
@@ -492,8 +531,15 @@ def diffusion_model_wrapper(
         )
     if event is not None and runtime.config.debug:
         LOG.warning("Spectrum H3 forecast sanitized run_id=%s step=%s event=%s", run_id, step_id, event)
-    state = _prepare_output_state(inner, video_x, audio_x, timestep, context, options, payload, layout)
-    output = _execute_forecast(inner, sanitized, state, video_x, audio_x)
+    try:
+        state = _prepare_output_state(inner, video_x, audio_x, timestep, context, options, payload, layout)
+        output = _execute_forecast(inner, sanitized, state, video_x, audio_x)
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except (RuntimeError, TypeError, ValueError) as exc:
+        if runtime.offline_phase == "replay":
+            raise OfflineReplayAbort(f"offline replay output-head evaluation failed: {exc}") from exc
+        raise
     if runtime.config.debug:
         LOG.warning(
             "Spectrum H3 forecast complete run_id=%s step=%s chunks=%s history=%s",

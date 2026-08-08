@@ -75,6 +75,27 @@ class SpectrumApplyMiniMaxH3:
                         ),
                     },
                 ),
+                "anchor_residual_feedback": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Experimental forward-only hidden-residual feedback at actual anchors.",
+                    },
+                ),
+                "selective_rollback_correction": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Experimental local rollback for the reviewed deterministic Euler sampler only.",
+                    },
+                ),
+                "offline_smoothing_replay": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": "Experimental two-pass replay using past and future actual anchors.",
+                    },
+                ),
             },
         }
 
@@ -98,6 +119,9 @@ class SpectrumApplyMiniMaxH3:
         debug,
         history_storage="system_ram",
         bootstrap_first_forecast=True,
+        anchor_residual_feedback=False,
+        selective_rollback_correction=False,
+        offline_smoothing_replay=False,
     ):
         if not enabled:
             return (model,)
@@ -106,6 +130,13 @@ class SpectrumApplyMiniMaxH3:
         resolved_warmup_steps = int(warmup_steps)
         if not isinstance(bootstrap_first_forecast, bool):
             raise TypeError("bootstrap_first_forecast must be a boolean")
+        for name, value in (
+            ("anchor_residual_feedback", anchor_residual_feedback),
+            ("selective_rollback_correction", selective_rollback_correction),
+            ("offline_smoothing_replay", offline_smoothing_replay),
+        ):
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be a boolean")
         effective_bootstrap = _effective_bootstrap_first_forecast(
             requested=bootstrap_first_forecast,
             degree=resolved_degree,
@@ -123,6 +154,9 @@ class SpectrumApplyMiniMaxH3:
             max_history=int(max_history),
             history_storage=str(history_storage),
             bootstrap_first_forecast=effective_bootstrap,
+            anchor_residual_feedback=anchor_residual_feedback,
+            selective_rollback_correction=selective_rollback_correction,
+            offline_smoothing_replay=offline_smoothing_replay,
             debug=bool(debug),
         ).validate()
         patched = model.clone()

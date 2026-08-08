@@ -279,3 +279,53 @@ def test_bootstrap_forecast_skips_transformers_and_runs_the_current_output_head(
     assert [part.shape for part in forecast] == [part.shape for part in actual]
     assert all(torch.isfinite(part).all() for part in forecast)
     runtime.end_run(run_id)
+
+
+def test_anchor_residual_probe_runs_current_heads_without_marking_actual_as_forecast():
+    _, _, PackedLayout = _native_imports()
+    model, block = _tiny_model()
+    final_layer = _CountingFinalLayer(model.final_layer)
+    model.final_layer = final_layer
+    x, context, payload = _inputs(PackedLayout)
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            warmup_steps=2,
+            tail_actual_steps=0,
+            window_size=2.0,
+            flex_window=0.0,
+            bootstrap_first_forecast=False,
+            anchor_residual_feedback=True,
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+
+    decisions = []
+    for sigma, model_timestep in ((1.0, 1000.0), (0.75, 750.0), (0.5, 500.0), (0.25, 250.0)):
+        _output, decision = _wrapped_call(
+            model,
+            runtime,
+            sigma,
+            model_timestep,
+            x,
+            context,
+            payload,
+        )
+        decisions.append(decision)
+
+    assert [decision["actual"] for decision in decisions] == [True, True, False, True]
+    assert block.calls == 3
+    assert final_layer.calls == 6
+    assert runtime.stats.actual_steps == 3
+    assert runtime.stats.forecast_steps == 1
+    assert runtime.stats.actual_transformer_calls == 3
+    assert runtime.stats.residual_anchors == 1
+    assert runtime.stats.residual_measure_seconds >= 0.0
+    runtime.end_run(run_id)

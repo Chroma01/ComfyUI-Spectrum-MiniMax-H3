@@ -1,8 +1,8 @@
 # MiniMax H3 integration notes
 
-Source review date: 2026-08-07
+Source review date: 2026-08-08
 
-Reviewed native ComfyUI commits: `e377e263049f9338b4d12a3dd417b36ae62948ff` and `0dd9b154a1654fc699dcdc3af066c7cce096045a`
+Reviewed native ComfyUI commits: `e377e263049f9338b4d12a3dd417b36ae62948ff`, `0dd9b154a1654fc699dcdc3af066c7cce096045a`, and `5599a05fea715cb2aff11f30f5b06e16d0dfa0c4`
 
 Reviewed Spectrum paper: arXiv `2603.01623v1`
 
@@ -62,3 +62,35 @@ Spectral and two-point linear weights are combined before feature streaming. Pre
 The one-point bootstrap bypasses spectral and linear weight construction and supplies the same chunk engine with the explicit weight `[1.0]`. It requires exactly one history entry, performs no Chebyshev/ridge factorization, and does not modify history or ordinary `ready()` semantics. The held object remains the compact pre-`FinalLayer` `[target audio | target video]` hidden feature; current-step output-head conditioning and reconstruction still run normally.
 
 Native H3 lays out target rows as one contiguous `[audio | video]` packed tail. Actual capture archives that tail without materializing an audio/video concatenation. System-RAM mode copies the view directly to CPU. VRAM mode must clone it into compact owned device storage, because retaining the view would pin the complete final-block hidden tensor. When one model call contains the complete canonical branch set, the archived tensor transfers directly into forecaster history; split conditional calls retain the transactional canonicalization path and assemble rows only after all calls complete. Debug summaries expose the storage location and wall-clock archive, history-update, and forecast-prediction counters. Device-to-host archiving can synchronize outstanding CUDA work, while device cloning can be asynchronously enqueued.
+
+## Default-off trajectory-correction experiments
+
+The published Spectrum procedure remains the causal online baseline. `anchor_residual_feedback`, `selective_rollback_correction`, and `offline_smoothing_replay` are mutually exclusive repository experiments. With all three false, no experimental archive, probe, correction, or sampler controller is allocated.
+
+### Residual boundary and policy
+
+`experiments.py` owns bounded FP32 output reductions, scale-aware scoring, chunked hidden-residual application, and offline smoothing primitives. `runtime.py` owns branch transactions and policy state. `minimax_h3.py` owns native output-head reconstruction.
+
+On an eligible actual call, `prepare_residual_probe` maps that call's labels to canonical history rows without touching `used_history_rows`. It predicts a shadow feature and latest-actual hold before the current feature reaches forecaster history. After native `_forward` completes, `_execute_actual` runs both candidates through the current `_OutputState` and `_execute_forecast`, then reduces native actual versus candidate video/audio outputs. Only model-dtype hidden residuals and scalar scores survive the reduction.
+
+Split calls retain per-call residual rows until actual-step finalization. Finalization requires the residual records to cover exactly the same canonical label set as the actual records. The maximum video/audio/subcall score drives the policy. Any missing, duplicate, incomplete, changed, or nonfinite experimental state releases pending storage and disables the experiment without weakening base Spectrum's existing fallback rules.
+
+Forward feedback stores one canonical residual and gain. Each split subcall receives only its mapped rows; the pending residual remains live until the complete logical forecast commits. A bootstrap hold never reads it. Severe feedback uses a dedicated refresh counter whose consumption occurs at actual-step finalization, so aborting the forced step leaves the requirement intact.
+
+### Euler rollback ownership
+
+`PREDICT_NOISE` can replace a denoised result but cannot restore the sampler's latent. True rollback therefore lives in a `SAMPLER_SAMPLE` wrapper implemented by `rollback.py`. The controller accepts only the exact current `comfy.k_diffusion.sampling.sample_euler` function with zero churn and no multi-GPU state.
+
+The controller mirrors `KSAMPLER.sample` setup and deterministic Euler advancement. Runtime state is snapshotted before each evaluation without cloning immutable history tensors. If that evaluation commits as a forecast, the pre-forecast latent is cloned before the solver advances and the callback is deferred. The following actual anchor can request rollback. Restoration removes the speculative schedule/history mutations while preserving their compute and timing counters, then two forced-actual calls replay the forecast interval and corrected anchor. Their callbacks replace the deferred speculative callbacks one-for-one.
+
+RES rollback is intentionally unsupported. `old_denoised`, `old_sigma_down`, and the CFG++ `uncond_denoised` closure belong to `res_multistep`, below the public wrapper boundary. Reimplementing that sampler would require a separate exact contract and state-restoration test suite. The setting fails closed to ordinary Spectrum before the RES sampler mutates state.
+
+### Offline archive and replay
+
+The `OUTER_SAMPLE` wrapper owns the two-pass lifetime. It clones the original packed noise, latent, sigma schedule, and optional mask before the first call. The first pass runs ordinary Spectrum without the external callback. Actual-step finalization retains canonical model-dtype anchors on CPU before causal history eviction; system-RAM causal history and the offline archive may share the same immutable tensor storage.
+
+Archive completion requires every logical decision, an exact actual-step/anchor match, stable labels/topology/shape/dtype, enough anchors for the configured degree, and an earlier and later anchor around every forecast. `OfflineSmoother` fits spectral weights over all anchors and combines them with bracketing interpolation. Stored actual steps use one-hot weights and therefore reproduce their archived feature exactly.
+
+Replay opens a fresh runtime run from the cloned inputs. Because `CFGGuider.inner_sample` replaces `guider.conds` with processed conditions, the wrapper also restores a structural copy of the pre-first-pass condition containers; tensors and model/control payloads remain shared. Every step has runtime mode `replay`, so `DIFFUSION_MODEL` obtains an archived or smoothed target and never enters `_execute_actual`. Replay validates coordinates, topology, labels, row coverage, and output shape. An `OfflineReplayAbort` unwinds the second ComfyUI sampling call transactionally and lets the outer wrapper return the already valid first-pass result. OOM and cancellation remain fatal and preserve their original traceback. The outer `finally` releases input clones, the full CPU archive, and smoother references.
+
+First-pass anchors remain tied to the first-pass latent trajectory. Later anchors provide bidirectional information about hidden-feature evolution; they do not expose a native feature at an earlier forecast coordinate or make replay anchors native-equivalent at the changed replay latent.

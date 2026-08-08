@@ -3,13 +3,21 @@ from __future__ import annotations
 import logging
 import math
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 import torch
 
 from .config import SpectrumH3Config
-from .forecast import HistoryWeightForecaster
+from .experiments import (
+    OfflineFeatureArchive,
+    OfflineSmoother,
+    StreamResidualScore,
+    apply_hidden_residual,
+    measure_stream_residual,
+    tensor_all_finite,
+)
+from .forecast import ForecasterSnapshot, HistoryWeightForecaster
 
 LOG = logging.getLogger(__name__)
 
@@ -27,6 +35,10 @@ def _as_cpu_float64_vector(value: Any) -> torch.Tensor:
 
 class ForecastRetryActual(RuntimeError):
     """Internal signal used to discard a partial forecast attempt transactionally."""
+
+
+class OfflineReplayAbort(RuntimeError):
+    """Internal signal used to return the valid first-pass result after replay failure."""
 
 
 @dataclass(slots=True)
@@ -47,12 +59,42 @@ class RuntimeStats:
     current_window: float = 0.0
     disabled: bool = False
     disable_reason: str | None = None
+    residual_measure_seconds: float = 0.0
+    residual_anchors: int = 0
+    residual_failures: int = 0
+    residual_corrections: int = 0
+    residual_correction_chunks: int = 0
+    residual_max_score: float = 0.0
+    residual_max_video_score: float = 0.0
+    residual_max_audio_score: float = 0.0
+    speculative_forecast_calls: int = 0
+    discarded_actual_calls: int = 0
+    rollback_count: int = 0
+    replayed_transformer_calls: int = 0
+    offline_archive_bytes: int = 0
+    offline_estimated_archive_bytes: int = 0
+    offline_replay_steps: int = 0
+    offline_replay_model_calls: int = 0
 
 
 @dataclass(slots=True)
 class _ActualRecord:
     feature: torch.Tensor
     labels: tuple[Any, ...] | None
+
+
+@dataclass(slots=True)
+class ResidualProbe:
+    shadow: torch.Tensor
+    hold: torch.Tensor
+
+
+@dataclass(slots=True)
+class _ResidualRecord:
+    labels: tuple[Any, ...]
+    residual: torch.Tensor
+    video_score: StreamResidualScore
+    audio_score: StreamResidualScore
 
 
 @dataclass(slots=True)
@@ -76,6 +118,11 @@ class _StepState:
     actual_records: list[_ActualRecord] = field(default_factory=list)
     used_history_rows: set[int] = field(default_factory=set)
     fallback: bool = False
+    residual_expected: bool = False
+    residual_records: list[_ResidualRecord] = field(default_factory=list)
+    rollback_replay: bool = False
+    used_pending_residual: bool = False
+    consumes_feedback_refresh: bool = False
 
 
 @dataclass(slots=True)
@@ -90,6 +137,28 @@ class _RunState:
     min_actual_steps_after_forecast: int
     min_tail_actual_steps: int
     next_step_id: int = 0
+
+
+@dataclass(slots=True)
+class RuntimeRollbackSnapshot:
+    next_step_id: int
+    forecaster: ForecasterSnapshot
+    history_topology: tuple[Any, ...] | None
+    history_labels: tuple[Any, ...] | None
+    current_window: float
+    consecutive_forecasts: int
+    required_actual_refreshes: int
+    required_feedback_actuals: int
+    disabled: bool
+    disable_reason: str | None
+    experiment_disabled: bool
+    experiment_disable_reason: str | None
+    pending_residual: torch.Tensor | None
+    pending_residual_labels: tuple[Any, ...] | None
+    pending_residual_gain: float
+    last_completed_mode: str | None
+    last_completed_step_id: int | None
+    stats: RuntimeStats
 
 
 class SpectrumH3Runtime:
@@ -110,8 +179,23 @@ class SpectrumH3Runtime:
         self._current_window = float(self.config.window_size)
         self._consecutive_forecasts = 0
         self._required_actual_refreshes = 0
+        self._required_feedback_actuals = 0
         self._disabled = False
         self._disable_reason: str | None = None
+        self._experiment_disabled = False
+        self._experiment_disable_reason: str | None = None
+        self._pending_residual: torch.Tensor | None = None
+        self._pending_residual_labels: tuple[Any, ...] | None = None
+        self._pending_residual_gain = 0.0
+        self._last_completed_mode: str | None = None
+        self._last_completed_step_id: int | None = None
+        self._rollback_requested = False
+        self._forced_actual_reason: str | None = None
+        self._forced_actual_is_replay = False
+        self._rollback_replay_active = False
+        self._offline_phase: str | None = None
+        self._offline_archive: OfflineFeatureArchive | None = None
+        self._offline_smoother: OfflineSmoother | None = None
 
     @property
     def active_run_id(self) -> int | None:
@@ -132,6 +216,52 @@ class SpectrumH3Runtime:
     @property
     def history_labels(self) -> tuple[Any, ...] | None:
         return self._history_labels
+
+    @property
+    def last_completed_mode(self) -> str | None:
+        return self._last_completed_mode
+
+    @property
+    def last_completed_step_id(self) -> int | None:
+        return self._last_completed_step_id
+
+    @property
+    def experiment_disabled_reason(self) -> str | None:
+        return self._experiment_disable_reason
+
+    @property
+    def offline_archive(self) -> OfflineFeatureArchive | None:
+        return self._offline_archive
+
+    @property
+    def offline_phase(self) -> str | None:
+        return self._offline_phase
+
+    def _residual_experiment_enabled(self) -> bool:
+        return bool(
+            not self._experiment_disabled
+            and (
+                self.config.anchor_residual_feedback
+                or self.config.selective_rollback_correction
+            )
+        )
+
+    def _release_pending_residual(self) -> None:
+        self._pending_residual = None
+        self._pending_residual_labels = None
+        self._pending_residual_gain = 0.0
+
+    def disable_experiment(self, reason: str) -> bool:
+        newly_disabled = not self._experiment_disabled
+        self._experiment_disabled = True
+        self._experiment_disable_reason = str(reason)
+        self._rollback_requested = False
+        self._required_feedback_actuals = 0
+        self._release_pending_residual()
+        if newly_disabled:
+            self.stats.residual_failures += 1
+            LOG.warning("Spectrum H3 experimental mode disabled for this run: %s", reason)
+        return newly_disabled
 
     def start_run(
         self,
@@ -187,7 +317,17 @@ class SpectrumH3Runtime:
         self._current_window = float(self.config.window_size)
         self._consecutive_forecasts = 0
         self._required_actual_refreshes = 0
+        self._required_feedback_actuals = 0
         self._disabled = not effective_supported
+        self._experiment_disabled = False
+        self._experiment_disable_reason = None
+        self._release_pending_residual()
+        self._last_completed_mode = None
+        self._last_completed_step_id = None
+        self._rollback_requested = False
+        self._forced_actual_reason = None
+        self._forced_actual_is_replay = False
+        self._rollback_replay_active = False
         if not self.config.enabled:
             self._disable_reason = "forecasting disabled by configuration"
         elif not supported_sampler:
@@ -220,6 +360,57 @@ class SpectrumH3Runtime:
         self._history_labels = None
         self._consecutive_forecasts = 0
         self._required_actual_refreshes = 0
+        self._required_feedback_actuals = 0
+        self._release_pending_residual()
+        self._rollback_requested = False
+        self._forced_actual_reason = None
+        self._forced_actual_is_replay = False
+        self._rollback_replay_active = False
+        self._last_completed_mode = None
+        self._last_completed_step_id = None
+
+    def begin_offline_capture(self, *, total_steps: int, sampler_name: str) -> None:
+        self.release_offline_archive()
+        self._offline_phase = "first_pass"
+        self._offline_archive = OfflineFeatureArchive(
+            total_steps=total_steps,
+            sampler_name=sampler_name,
+        )
+
+    def complete_offline_capture(self) -> bool:
+        archive = self._offline_archive
+        if self._offline_phase != "first_pass" or archive is None:
+            raise RuntimeError("offline capture is not active")
+        if self._disabled:
+            archive.invalidate(self._disable_reason or "base Spectrum disabled during offline first pass")
+        complete = archive.complete(minimum_anchors=self.config.min_fit_points)
+        self.stats.offline_archive_bytes = archive.tensor_bytes
+        self.stats.offline_estimated_archive_bytes = archive.estimated_tensor_bytes
+        if not complete:
+            return False
+        try:
+            self._offline_smoother = OfflineSmoother(
+                archive,
+                degree=self.config.degree,
+                ridge_lambda=self.config.ridge_lambda,
+                blend_weight=self.config.blend_weight,
+            )
+        except (RuntimeError, ValueError) as exc:
+            archive.invalidate(f"offline smoother construction failed: {exc}")
+            return False
+        return True
+
+    def begin_offline_replay(self) -> None:
+        if self._offline_archive is None or self._offline_smoother is None:
+            raise RuntimeError("offline replay requires a complete first-pass archive")
+        self._offline_phase = "replay"
+
+    def release_offline_archive(self) -> None:
+        if self._offline_archive is not None:
+            self._offline_archive.release()
+        self._offline_archive = None
+        self._offline_smoother = None
+        self._offline_phase = None
 
     def coordinate_for_timestep(self, timestep: torch.Tensor | float) -> float:
         if self._run is None:
@@ -246,14 +437,51 @@ class SpectrumH3Runtime:
             raise RuntimeError("predict_noise call count exceeded the supplied sigma schedule")
         coordinate = self.coordinate_for_timestep(timestep)
 
+        if self._offline_phase == "replay":
+            archive = self._offline_archive
+            if archive is None or self._offline_smoother is None or step_id >= len(archive.steps):
+                raise OfflineReplayAbort("offline replay archive is incomplete")
+            record = archive.steps[step_id]
+            if not math.isclose(record.coordinate, coordinate, rel_tol=1e-6, abs_tol=1e-6):
+                raise OfflineReplayAbort(
+                    f"offline replay coordinate changed at step {step_id}: "
+                    f"{record.coordinate:.9f} != {coordinate:.9f}"
+                )
+            self._step = _StepState(
+                step_id=step_id,
+                coordinate=coordinate,
+                adaptive_recompute=False,
+                mode="replay",
+                reason="offline smoothing replay",
+            )
+            self._run.next_step_id += 1
+            return {
+                "run_id": self._run.run_id,
+                "step_id": step_id,
+                "coordinate": coordinate,
+                "actual": False,
+                "reason": "offline smoothing replay",
+            }
+
         effective_tail = max(self.config.tail_actual_steps, self._run.min_tail_actual_steps)
         tail_start = max(0, self._run.total_steps - effective_tail)
         advances_window = False
         bootstrap_forecast = False
+        rollback_replay = False
+        consumes_feedback_refresh = False
         if self.config.force_actual:
             actual, reason = True, "forced-actual validation mode"
         elif self._disabled:
             actual, reason = True, self._disable_reason or "forecasting disabled"
+        elif self._forced_actual_reason is not None:
+            actual, reason = True, self._forced_actual_reason
+            rollback_replay = self._forced_actual_is_replay
+            self._forced_actual_reason = None
+            self._forced_actual_is_replay = False
+        elif self._required_feedback_actuals > 0:
+            actual, reason = True, "anchor residual feedback refresh"
+            rollback_replay = False
+            consumes_feedback_refresh = True
         elif step_id < self.config.warmup_steps:
             actual, reason = True, "warmup"
         elif step_id >= tail_start:
@@ -293,6 +521,8 @@ class SpectrumH3Runtime:
             mode="actual" if actual else "forecast",
             reason=reason,
             bootstrap_forecast=bootstrap_forecast,
+            rollback_replay=rollback_replay,
+            consumes_feedback_refresh=consumes_feedback_refresh,
         )
         self._run.next_step_id += 1
         return {
@@ -320,9 +550,15 @@ class SpectrumH3Runtime:
         self.forecaster.reset()
         self._history_topology = None
         self._history_labels = None
+        self._release_pending_residual()
+        self._rollback_requested = False
+        if self._offline_phase == "first_pass" and self._offline_archive is not None:
+            self._offline_archive.invalidate(reason)
         return newly_disabled
 
     def _fallback_or_retry(self, step: _StepState, reason: str) -> None:
+        if step.mode == "replay":
+            raise OfflineReplayAbort(reason)
         self._disable_forecasting(reason)
         if any(call.used_forecast for call in step.calls):
             raise ForecastRetryActual(reason)
@@ -350,6 +586,13 @@ class SpectrumH3Runtime:
         normalized_labels = None if labels is None else tuple(labels)
         if len(normalized_shape) < 2:
             self._fallback_or_retry(step, "target feature shape has no branch dimension")
+        if step.mode == "replay" and self._offline_archive is not None:
+            if normalized_topology != self._offline_archive.topology:
+                self._fallback_or_retry(step, "offline replay topology changed")
+            if self._offline_archive.feature_shape is not None and tuple(normalized_shape[1:]) != tuple(
+                self._offline_archive.feature_shape[1:]
+            ):
+                self._fallback_or_retry(step, "offline replay target feature shape changed")
         if self._history_topology is not None and normalized_topology != self._history_topology:
             self._fallback_or_retry(step, "packed H3 topology changed within the sampling run")
         call = _CallState(normalized_topology, normalized_labels, normalized_shape)
@@ -386,6 +629,141 @@ class SpectrumH3Runtime:
         call.observed_actual = True
         step.actual_records.append(_ActualRecord(archived, call.labels))
 
+    def prepare_residual_probe(
+        self,
+        run_id: int,
+        step_id: int,
+        call_id: int,
+        *,
+        device: torch.device,
+        dtype: torch.dtype,
+    ) -> ResidualProbe | None:
+        step = self._require_step(run_id, step_id)
+        if (
+            step.mode != "actual"
+            or step.rollback_replay
+            or self._rollback_replay_active
+            or not self._residual_experiment_enabled()
+        ):
+            return None
+        if self.config.selective_rollback_correction and self._last_completed_mode != "forecast":
+            return None
+        if not self.forecaster.ready(self.config.min_fit_points):
+            return None
+
+        call = step.calls[int(call_id)]
+        if self._history_labels is None or call.labels is None:
+            self.disable_experiment("residual measurement branch labels are missing")
+            return None
+        if len(call.labels) != call.expected_shape[0] or len(set(call.labels)) != len(call.labels):
+            self.disable_experiment("residual measurement branch labels are duplicate or incomplete")
+            return None
+        positions: list[int] = []
+        for label in call.labels:
+            try:
+                positions.append(self._history_labels.index(label))
+            except ValueError:
+                self.disable_experiment("residual measurement branch identity changed")
+                return None
+        if len(set(positions)) != len(positions):
+            self.disable_experiment("residual measurement assigned a canonical row more than once")
+            return None
+        history_shape = self.forecaster.feature_shape
+        if history_shape is None or tuple(call.expected_shape[1:]) != tuple(history_shape[1:]):
+            self.disable_experiment("residual measurement target feature shape changed")
+            return None
+
+        started = time.perf_counter()
+        try:
+            shadow = self.forecaster.predict(
+                step.coordinate,
+                self.config.blend_weight,
+                rows=positions,
+                device=device,
+                dtype=dtype,
+            )
+            hold = self.forecaster.predict_latest_hold(
+                rows=positions,
+                device=device,
+                dtype=dtype,
+            )
+        except (RuntimeError, ValueError) as exc:
+            self.disable_experiment(f"residual probe prediction failed: {exc}")
+            return None
+        finally:
+            self.stats.residual_measure_seconds += time.perf_counter() - started
+        if tuple(shadow.shape) != call.expected_shape or tuple(hold.shape) != call.expected_shape:
+            self.disable_experiment("residual probe prediction shape is invalid")
+            return None
+        if not tensor_all_finite(shadow) or not tensor_all_finite(hold):
+            self.disable_experiment("residual probe prediction is nonfinite")
+            return None
+        step.residual_expected = True
+        return ResidualProbe(shadow=shadow, hold=hold)
+
+    def record_residual_measurement(
+        self,
+        run_id: int,
+        step_id: int,
+        call_id: int,
+        probe: ResidualProbe,
+        *,
+        actual_feature: torch.Tensor,
+        actual_output: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor],
+        shadow_output: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor],
+        hold_output: list[torch.Tensor] | tuple[torch.Tensor, torch.Tensor],
+    ) -> None:
+        step = self._require_step(run_id, step_id)
+        if not self._residual_experiment_enabled() or step.mode != "actual":
+            return
+        call = step.calls[int(call_id)]
+        if call.labels is None:
+            self.disable_experiment("residual measurement lost branch labels")
+            return
+        if not all(len(output) == 2 for output in (actual_output, shadow_output, hold_output)):
+            self.disable_experiment("residual measurement output structure changed")
+            return
+        started = time.perf_counter()
+        try:
+            video_score = measure_stream_residual(
+                actual_output[0], shadow_output[0], hold_output[0]
+            )
+            audio_score = measure_stream_residual(
+                actual_output[1], shadow_output[1], hold_output[1]
+            )
+            residual = actual_feature.detach() - probe.shadow
+            if residual.dtype != actual_feature.dtype:
+                residual = residual.to(actual_feature.dtype)
+            if not tensor_all_finite(residual):
+                raise ValueError("hidden residual is nonfinite")
+            storage_device = (
+                torch.device("cpu")
+                if self.config.history_storage == "system_ram"
+                else actual_feature.device
+            )
+            archived = residual.to(
+                device=storage_device,
+                dtype=actual_feature.dtype,
+                copy=True,
+            ).contiguous()
+        except (RuntimeError, ValueError) as exc:
+            self.disable_experiment(f"residual measurement failed: {exc}")
+            return
+        finally:
+            self.stats.residual_measure_seconds += time.perf_counter() - started
+        step.residual_records.append(
+            _ResidualRecord(tuple(call.labels), archived, video_score, audio_score)
+        )
+        self.stats.residual_max_video_score = max(
+            self.stats.residual_max_video_score, video_score.score
+        )
+        self.stats.residual_max_audio_score = max(
+            self.stats.residual_max_audio_score, audio_score.score
+        )
+        self.stats.residual_max_score = max(
+            self.stats.residual_max_score, video_score.score, audio_score.score
+        )
+
     def predict(
         self,
         run_id: int,
@@ -399,7 +777,12 @@ class SpectrumH3Runtime:
         call = step.calls[int(call_id)]
         if step.mode == "actual":
             return None
-        if self._history_labels is None or call.labels is None:
+        canonical_labels = (
+            self._offline_archive.labels
+            if step.mode == "replay" and self._offline_archive is not None
+            else self._history_labels
+        )
+        if canonical_labels is None or call.labels is None:
             self._fallback_or_retry(step, "branch labels are missing; forecast row correspondence is unproven")
             return None
         if len(call.labels) != call.expected_shape[0] or len(set(call.labels)) != len(call.labels):
@@ -408,7 +791,7 @@ class SpectrumH3Runtime:
         positions = []
         for label in call.labels:
             try:
-                position = self._history_labels.index(label)
+                position = canonical_labels.index(label)
             except ValueError:
                 self._fallback_or_retry(step, "conditional branch identity changed")
                 return None
@@ -417,7 +800,11 @@ class SpectrumH3Runtime:
                 return None
             positions.append(position)
 
-        history_shape = self.forecaster.feature_shape
+        history_shape = (
+            self._offline_archive.feature_shape
+            if step.mode == "replay" and self._offline_archive is not None
+            else self.forecaster.feature_shape
+        )
         if history_shape is None or tuple(call.expected_shape[1:]) != tuple(history_shape[1:]):
             self._fallback_or_retry(step, "target audio/video row count or hidden width changed")
             return None
@@ -429,7 +816,16 @@ class SpectrumH3Runtime:
             return None
         started = time.perf_counter()
         try:
-            if step.bootstrap_forecast:
+            if step.mode == "replay":
+                if self._offline_smoother is None:
+                    raise OfflineReplayAbort("offline replay smoother is missing")
+                predicted = self._offline_smoother.predict(
+                    step.step_id,
+                    rows=tuple(positions),
+                    device=device,
+                    dtype=dtype,
+                )
+            elif step.bootstrap_forecast:
                 predicted = self.forecaster.predict_one_point_hold(
                     rows=positions,
                     device=device,
@@ -443,11 +839,35 @@ class SpectrumH3Runtime:
                     device=device,
                     dtype=dtype,
                 )
+        except (RuntimeError, ValueError) as exc:
+            if step.mode == "replay":
+                raise OfflineReplayAbort(f"offline replay prediction failed: {exc}") from exc
+            raise
         finally:
             self.stats.forecast_prediction_seconds += time.perf_counter() - started
         if tuple(predicted.shape) != call.expected_shape:
             self._fallback_or_retry(step, "predicted target feature shape is invalid")
             return None
+        if (
+            step.mode == "forecast"
+            and not step.bootstrap_forecast
+            and self._pending_residual is not None
+        ):
+            if self._pending_residual_labels != canonical_labels:
+                self.disable_experiment("pending residual labels changed before correction")
+            else:
+                residual_rows = self._pending_residual[list(positions)]
+                try:
+                    chunks = apply_hidden_residual(
+                        predicted,
+                        residual_rows,
+                        self._pending_residual_gain,
+                    )
+                except (RuntimeError, ValueError) as exc:
+                    self.disable_experiment(f"pending residual correction failed: {exc}")
+                else:
+                    step.used_pending_residual = True
+                    self.stats.residual_correction_chunks += chunks
         step.used_history_rows.update(positions)
         call.used_forecast = True
         return predicted
@@ -460,6 +880,9 @@ class SpectrumH3Runtime:
         step.fallback = True
         step.calls.clear()
         step.actual_records.clear()
+        step.residual_records.clear()
+        step.residual_expected = False
+        step.used_pending_residual = False
         step.used_history_rows.clear()
         self.stats.forecast_fallbacks += 1
 
@@ -514,9 +937,77 @@ class SpectrumH3Runtime:
         self._history_labels = canonical_labels
         return combined
 
+    def _aggregate_residual(
+        self,
+        step: _StepState,
+    ) -> tuple[float, torch.Tensor] | None:
+        if not step.residual_expected:
+            return None
+        if len(step.residual_records) != len(step.actual_records):
+            self.disable_experiment("residual measurement did not cover every actual model subcall")
+            return None
+        if self._history_labels is None:
+            self.disable_experiment("residual measurement has no canonical branch labels")
+            return None
+        rows: list[tuple[Any, torch.Tensor]] = []
+        score = 0.0
+        for record in step.residual_records:
+            if len(record.labels) != record.residual.shape[0]:
+                self.disable_experiment("residual branch labels do not cover hidden rows")
+                return None
+            score = max(score, record.video_score.score, record.audio_score.score)
+            rows.extend(
+                (label, record.residual[index])
+                for index, label in enumerate(record.labels)
+            )
+        labels = tuple(label for label, _ in rows)
+        if len(set(labels)) != len(labels) or set(labels) != set(self._history_labels):
+            self.disable_experiment("residual branch set is duplicate or incomplete")
+            return None
+        row_map = {label: residual for label, residual in rows}
+        if len(step.residual_records) == 1 and step.residual_records[0].labels == self._history_labels:
+            combined = step.residual_records[0].residual
+        else:
+            combined = torch.stack(
+                [row_map[label] for label in self._history_labels], dim=0
+            ).contiguous()
+        if not math.isfinite(score) or not tensor_all_finite(combined):
+            self.disable_experiment("aggregated residual score or hidden residual is nonfinite")
+            return None
+        return score, combined
+
+    def _apply_residual_policy(self, step: _StepState, score: float, residual: torch.Tensor) -> None:
+        if self._experiment_disabled:
+            return
+        if self.config.anchor_residual_feedback:
+            if score <= 1.0:
+                self._release_pending_residual()
+                return
+            gain = min(max(score - 1.0, 0.0), 1.0)
+            self._pending_residual = residual
+            self._pending_residual_labels = self._history_labels
+            self._pending_residual_gain = gain
+            self._current_window = max(
+                float(self.config.window_size),
+                round(self._current_window - self.config.flex_window * gain, 6),
+            )
+            if score > 2.0:
+                self._required_feedback_actuals = max(self._required_feedback_actuals, 1)
+        elif (
+            self.config.selective_rollback_correction
+            and self._last_completed_mode == "forecast"
+            and score > 1.0
+            and not self._rollback_replay_active
+        ):
+            self._rollback_requested = True
+
     def finalize_step(self, run_id: int, step_id: int) -> None:
         step = self._require_step(run_id, step_id)
         if not step.calls:
+            if step.mode == "replay":
+                raise OfflineReplayAbort(
+                    "offline replay step did not reach the native H3 model wrapper"
+                )
             if step.fallback and self._disabled:
                 self._consecutive_forecasts = 0
                 self.stats.actual_steps += 1
@@ -539,6 +1030,22 @@ class SpectrumH3Runtime:
                 )
             return
 
+        if step.mode == "replay":
+            if any(call.observed_actual for call in step.calls) or not all(
+                call.used_forecast for call in step.calls
+            ):
+                raise OfflineReplayAbort("offline replay model-call transaction was incomplete")
+            archive_labels = self._offline_archive.labels if self._offline_archive is not None else ()
+            expected_rows = set(range(len(archive_labels or ())))
+            if step.used_history_rows != expected_rows:
+                raise OfflineReplayAbort("offline replay branch-row allocation was incomplete")
+            self.stats.offline_replay_steps += 1
+            self.stats.offline_replay_model_calls += len(step.calls)
+            self._last_completed_mode = "replay"
+            self._last_completed_step_id = step.step_id
+            self._step = None
+            return
+
         if step.mode == "forecast":
             if any(call.observed_actual for call in step.calls) or not all(call.used_forecast for call in step.calls):
                 raise ForecastRetryActual("forecast solver step was incomplete or mixed with an actual call")
@@ -549,13 +1056,27 @@ class SpectrumH3Runtime:
             self._required_actual_refreshes = self._run.min_actual_steps_after_forecast
             self.stats.forecast_steps += 1
             self.stats.forecast_model_calls += len(step.calls)
+            if step.used_pending_residual:
+                self.stats.residual_corrections += 1
+                self._release_pending_residual()
         else:
             if any(call.used_forecast for call in step.calls):
                 raise RuntimeError("actual solver step retained a forecasted subcall")
             started = time.perf_counter()
             try:
                 combined = self._aggregate_actual(step)
+                residual_result = self._aggregate_residual(step)
                 if combined is not None and not self._disabled:
+                    if self._offline_phase == "first_pass" and self._offline_archive is not None:
+                        assert self._history_labels is not None
+                        self._offline_archive.record_actual(
+                            step.step_id,
+                            step.coordinate,
+                            combined,
+                            labels=self._history_labels,
+                            topology=step.calls[0].topology,
+                            take_cpu_ownership=self.config.history_storage == "system_ram",
+                        )
                     try:
                         self.forecaster.update(step.coordinate, combined, take_ownership=True)
                     except ValueError as exc:
@@ -564,8 +1085,12 @@ class SpectrumH3Runtime:
                 self.stats.history_update_seconds += time.perf_counter() - started
             self._consecutive_forecasts = 0
             self._required_actual_refreshes = max(0, self._required_actual_refreshes - 1)
+            if step.consumes_feedback_refresh:
+                self._required_feedback_actuals = max(0, self._required_feedback_actuals - 1)
             self.stats.actual_steps += 1
             self.stats.actual_transformer_calls += len(step.actual_records)
+            if step.rollback_replay:
+                self.stats.replayed_transformer_calls += len(step.actual_records)
             if (
                 step.adaptive_recompute
                 and not step.fallback
@@ -577,15 +1102,140 @@ class SpectrumH3Runtime:
                     round(self._current_window + self.config.flex_window, 6),
                     window_ceiling,
                 )
+            if residual_result is not None and not self._experiment_disabled:
+                self.stats.residual_anchors += 1
+                self._apply_residual_policy(step, *residual_result)
+
+        if self._offline_phase == "first_pass" and self._offline_archive is not None:
+            self._offline_archive.record_step(
+                step.step_id,
+                step.coordinate,
+                step.mode == "actual",
+            )
 
         self.stats.current_window = self._current_window
+        self._last_completed_mode = step.mode
+        self._last_completed_step_id = step.step_id
         self._step = None
 
     def abort_step(self, run_id: int, step_id: int) -> None:
         step = self._require_step(run_id, step_id)
         if self._run is not None and self._run.next_step_id == step.step_id + 1:
             self._run.next_step_id = step.step_id
+        self._release_pending_residual()
+        self._rollback_requested = False
         self._step = None
+
+    def create_rollback_snapshot(self) -> RuntimeRollbackSnapshot:
+        if self._run is None or self._step is not None:
+            raise RuntimeError("rollback snapshots require an idle active run")
+        return RuntimeRollbackSnapshot(
+            next_step_id=self._run.next_step_id,
+            forecaster=self.forecaster.snapshot(),
+            history_topology=self._history_topology,
+            history_labels=self._history_labels,
+            current_window=self._current_window,
+            consecutive_forecasts=self._consecutive_forecasts,
+            required_actual_refreshes=self._required_actual_refreshes,
+            required_feedback_actuals=self._required_feedback_actuals,
+            disabled=self._disabled,
+            disable_reason=self._disable_reason,
+            experiment_disabled=self._experiment_disabled,
+            experiment_disable_reason=self._experiment_disable_reason,
+            pending_residual=self._pending_residual,
+            pending_residual_labels=self._pending_residual_labels,
+            pending_residual_gain=self._pending_residual_gain,
+            last_completed_mode=self._last_completed_mode,
+            last_completed_step_id=self._last_completed_step_id,
+            stats=replace(self.stats),
+        )
+
+    def restore_rollback_snapshot(self, snapshot: RuntimeRollbackSnapshot) -> None:
+        if self._run is None or self._step is not None:
+            raise RuntimeError("rollback restoration requires an idle active run")
+        if not isinstance(snapshot, RuntimeRollbackSnapshot):
+            raise TypeError("snapshot must be a RuntimeRollbackSnapshot")
+        current = self.stats
+        speculative_calls = max(
+            0, current.forecast_model_calls - snapshot.stats.forecast_model_calls
+        )
+        discarded_actual_calls = max(
+            0, current.actual_transformer_calls - snapshot.stats.actual_transformer_calls
+        )
+        restored = replace(snapshot.stats)
+        restored.forecast_model_calls += speculative_calls
+        restored.actual_transformer_calls += discarded_actual_calls
+        restored.speculative_forecast_calls += speculative_calls
+        restored.discarded_actual_calls += discarded_actual_calls
+        restored.rollback_count += 1
+        for name in (
+            "history_archive_seconds",
+            "history_update_seconds",
+            "forecast_prediction_seconds",
+            "residual_measure_seconds",
+        ):
+            setattr(
+                restored,
+                name,
+                getattr(restored, name) + max(0.0, getattr(current, name) - getattr(snapshot.stats, name)),
+            )
+        for name in (
+            "direct_history_updates",
+            "residual_anchors",
+            "residual_failures",
+            "residual_correction_chunks",
+        ):
+            setattr(
+                restored,
+                name,
+                getattr(restored, name) + max(0, getattr(current, name) - getattr(snapshot.stats, name)),
+            )
+        restored.residual_max_score = max(restored.residual_max_score, current.residual_max_score)
+        restored.residual_max_video_score = max(
+            restored.residual_max_video_score, current.residual_max_video_score
+        )
+        restored.residual_max_audio_score = max(
+            restored.residual_max_audio_score, current.residual_max_audio_score
+        )
+
+        self._run.next_step_id = snapshot.next_step_id
+        self.forecaster.restore(snapshot.forecaster)
+        self._history_topology = snapshot.history_topology
+        self._history_labels = snapshot.history_labels
+        self._current_window = snapshot.current_window
+        self._consecutive_forecasts = snapshot.consecutive_forecasts
+        self._required_actual_refreshes = snapshot.required_actual_refreshes
+        self._required_feedback_actuals = snapshot.required_feedback_actuals
+        self._disabled = snapshot.disabled
+        self._disable_reason = snapshot.disable_reason
+        self._experiment_disabled = snapshot.experiment_disabled
+        self._experiment_disable_reason = snapshot.experiment_disable_reason
+        self._pending_residual = snapshot.pending_residual
+        self._pending_residual_labels = snapshot.pending_residual_labels
+        self._pending_residual_gain = snapshot.pending_residual_gain
+        self._last_completed_mode = snapshot.last_completed_mode
+        self._last_completed_step_id = snapshot.last_completed_step_id
+        self._rollback_requested = False
+        self._forced_actual_reason = None
+        self._forced_actual_is_replay = False
+        self.stats = restored
+
+    def consume_rollback_request(self) -> bool:
+        requested = self._rollback_requested
+        self._rollback_requested = False
+        return requested
+
+    def force_next_actual(self, reason: str, *, rollback_replay: bool) -> None:
+        if self._step is not None:
+            raise RuntimeError("cannot force an actual step while another step is active")
+        self._forced_actual_reason = str(reason)
+        self._forced_actual_is_replay = bool(rollback_replay)
+
+    def begin_rollback_replay(self) -> None:
+        self._rollback_replay_active = True
+
+    def end_rollback_replay(self) -> None:
+        self._rollback_replay_active = False
 
     def debug_summary(self) -> str:
         return (
@@ -599,9 +1249,25 @@ class SpectrumH3Runtime:
             f"history_archive_s={self.stats.history_archive_seconds:.3f} "
             f"history_update_s={self.stats.history_update_seconds:.3f} "
             f"forecast_predict_s={self.stats.forecast_prediction_seconds:.3f} "
+            f"residual_measure_s={self.stats.residual_measure_seconds:.3f} "
+            f"residual_anchors={self.stats.residual_anchors} "
+            f"residual_failures={self.stats.residual_failures} "
+            f"residual_corrections={self.stats.residual_corrections} "
+            f"residual_score_max={self.stats.residual_max_score:.6f} "
+            f"residual_video_max={self.stats.residual_max_video_score:.6f} "
+            f"residual_audio_max={self.stats.residual_max_audio_score:.6f} "
+            f"speculative_calls={self.stats.speculative_forecast_calls} "
+            f"discarded_actual_calls={self.stats.discarded_actual_calls} "
+            f"rollbacks={self.stats.rollback_count} "
+            f"replayed_transformer_calls={self.stats.replayed_transformer_calls} "
+            f"offline_replay_steps={self.stats.offline_replay_steps} "
+            f"offline_replay_calls={self.stats.offline_replay_model_calls} "
+            f"offline_archive_mib={self.stats.offline_archive_bytes / (1024 * 1024):.1f} "
+            f"offline_archive_estimated_mib={self.stats.offline_estimated_archive_bytes / (1024 * 1024):.1f} "
             f"direct_history_updates={self.stats.direct_history_updates} "
             f"history_storage={self.config.history_storage} "
             f"history_device={str(self.forecaster.history_device)!r} "
             f"history_mib={self.forecaster.history_tensor_bytes / (1024 * 1024):.1f} "
-            f"reason={self.stats.disable_reason!r}"
+            f"reason={self.stats.disable_reason!r} "
+            f"experimental_reason={self._experiment_disable_reason!r}"
         )

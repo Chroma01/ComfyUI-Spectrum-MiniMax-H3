@@ -19,6 +19,25 @@ class SpectrumH3Config:
     debug: bool = False
     force_actual: bool = False
     bootstrap_first_forecast: bool = True
+    anchor_residual_feedback: bool = False
+    selective_rollback_correction: bool = False
+    offline_smoothing_replay: bool = False
+
+    def __post_init__(self) -> None:
+        experimental = {
+            "anchor_residual_feedback": self.anchor_residual_feedback,
+            "selective_rollback_correction": self.selective_rollback_correction,
+            "offline_smoothing_replay": self.offline_smoothing_replay,
+        }
+        for name, value in experimental.items():
+            if not isinstance(value, bool):
+                raise TypeError(f"{name} must be a boolean")
+        conflicts = [name for name, value in experimental.items() if value]
+        if self.enabled and len(conflicts) > 1:
+            raise ValueError(
+                "Spectrum H3 experimental modes are mutually exclusive; conflicting settings: "
+                + ", ".join(conflicts)
+            )
 
     @property
     def min_fit_points(self) -> int:
@@ -33,6 +52,27 @@ class SpectrumH3Config:
             raise TypeError("force_actual must be a boolean")
         if not isinstance(self.bootstrap_first_forecast, bool):
             raise TypeError("bootstrap_first_forecast must be a boolean")
+        for name in (
+            "anchor_residual_feedback",
+            "selective_rollback_correction",
+            "offline_smoothing_replay",
+        ):
+            if not isinstance(getattr(self, name), bool):
+                raise TypeError(f"{name} must be a boolean")
+        conflicts = [
+            name
+            for name in (
+                "anchor_residual_feedback",
+                "selective_rollback_correction",
+                "offline_smoothing_replay",
+            )
+            if getattr(self, name)
+        ]
+        if self.enabled and len(conflicts) > 1:
+            raise ValueError(
+                "Spectrum H3 experimental modes are mutually exclusive; conflicting settings: "
+                + ", ".join(conflicts)
+            )
         if not math.isfinite(self.blend_weight) or not 0.0 <= self.blend_weight <= 1.0:
             raise ValueError("blend_weight must be finite and in [0, 1]")
         if isinstance(self.degree, bool) or not isinstance(self.degree, int) or self.degree < 1:

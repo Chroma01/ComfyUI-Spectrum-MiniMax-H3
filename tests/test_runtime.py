@@ -813,3 +813,259 @@ def test_twenty_step_euler_schedule_refreshes_between_forecasts():
     assert forecast_indices == [1, 3, 5, 7, 9, 11, 13, 15, 17]
     assert runtime.stats.actual_steps == 11
     assert runtime.stats.forecast_steps == 9
+
+
+def _measured_anchor(runtime, timestep, *, video_values, audio_values):
+    decision = runtime.begin_step(torch.tensor([timestep]))
+    assert decision["actual"]
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert actual
+    probe = runtime.prepare_residual_probe(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert probe is not None
+    actual_feature = probe.shadow + 1.0
+    runtime.observe_actual(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        actual_feature,
+    )
+    actual_video, shadow_video, hold_video = (
+        torch.full((4,), value) for value in video_values
+    )
+    actual_audio, shadow_audio, hold_audio = (
+        torch.full((4,), value) for value in audio_values
+    )
+    runtime.record_residual_measurement(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        probe,
+        actual_feature=actual_feature,
+        actual_output=[actual_video, actual_audio],
+        shadow_output=[shadow_video, shadow_audio],
+        hold_output=[hold_video, hold_audio],
+    )
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+    return decision
+
+
+def _feedback_runtime():
+    runtime = _runtime(
+        anchor_residual_feedback=True,
+        warmup_steps=2,
+        window_size=2.0,
+        flex_window=0.75,
+    )
+    runtime.start_run(
+        torch.linspace(1.0, 0.0, 8),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    _actual_step(runtime, 1.0, [(LABEL, torch.zeros(1, 3, 4))])
+    _actual_step(runtime, 6.0 / 7.0, [(LABEL, torch.ones(1, 3, 4))])
+    _forecast_step(runtime, 5.0 / 7.0)
+    runtime._current_window = 4.0
+    return runtime
+
+
+def test_moderate_anchor_feedback_shrinks_window_and_corrects_one_forecast():
+    runtime = _feedback_runtime()
+    _measured_anchor(
+        runtime,
+        4.0 / 7.0,
+        video_values=(2.0, 0.5, 1.0),
+        audio_values=(2.0, 0.5, 1.0),
+    )
+    assert runtime.stats.residual_max_score == pytest.approx(1.5)
+    assert runtime.stats.current_window == pytest.approx(3.625)
+    assert runtime._pending_residual is not None
+    assert runtime._pending_residual.dtype is torch.float32
+
+    decision = runtime.begin_step(torch.tensor([3.0 / 7.0]))
+    assert not decision["actual"]
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert not actual
+    assert runtime.predict(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    ) is not None
+    assert runtime._pending_residual is not None
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+    assert runtime._pending_residual is None
+    assert runtime.stats.residual_corrections == 1
+
+
+def test_severe_anchor_feedback_forces_an_extra_actual_with_explicit_reason():
+    runtime = _feedback_runtime()
+    _measured_anchor(
+        runtime,
+        4.0 / 7.0,
+        video_values=(3.0, 0.0, 2.0),
+        audio_values=(3.0, 0.0, 2.0),
+    )
+    assert runtime.stats.residual_max_score == pytest.approx(3.0)
+    assert runtime.stats.current_window == pytest.approx(3.25)
+    decision = runtime.begin_step(torch.tensor([3.0 / 7.0]))
+    assert decision["actual"]
+    assert decision["reason"] == "anchor residual feedback refresh"
+    runtime.abort_step(decision["run_id"], decision["step_id"])
+
+
+def test_bootstrap_forecast_does_not_consume_pending_feedback():
+    runtime = _runtime(
+        anchor_residual_feedback=True,
+        bootstrap_first_forecast=True,
+        warmup_steps=1,
+    )
+    runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    _actual_step(runtime, 1.0, [(LABEL, torch.ones(1, 3, 4))])
+    runtime._pending_residual = torch.full((1, 3, 4), 2.0)
+    runtime._pending_residual_labels = LABEL
+    runtime._pending_residual_gain = 1.0
+    decision = runtime.begin_step(torch.tensor([0.5]))
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert not actual
+    runtime.predict(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    runtime.finalize_step(decision["run_id"], decision["step_id"])
+    assert runtime._pending_residual is not None
+
+
+def test_end_run_releases_pending_feedback_storage():
+    runtime = _feedback_runtime()
+    run_id = runtime.active_run_id
+    runtime._pending_residual = torch.ones(1, 3, 4)
+    runtime._pending_residual_labels = LABEL
+    runtime._pending_residual_gain = 1.0
+    runtime.end_run(run_id)
+    assert runtime._pending_residual is None
+
+
+def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_calls():
+    runtime = _runtime(
+        offline_smoothing_replay=True,
+        max_history=2,
+        warmup_steps=2,
+        tail_actual_steps=0,
+    )
+    sigmas = torch.linspace(1.0, 0.0, 7)
+    runtime.begin_offline_capture(total_steps=6, sampler_name="sample_euler")
+    run_id = runtime.start_run(
+        sigmas,
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    first_pass = []
+    for step, sigma in enumerate(torch.linspace(1.0, 1.0 / 6.0, 6)):
+        decision = runtime.begin_step(sigma)
+        first_pass.append(decision)
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=TOPOLOGY,
+            labels=LABEL,
+            expected_shape=(1, 3, 4),
+        )
+        if actual:
+            runtime.observe_actual(
+                decision["run_id"],
+                decision["step_id"],
+                call_id,
+                torch.full((1, 3, 4), float(step)),
+            )
+        else:
+            runtime.predict(
+                decision["run_id"],
+                decision["step_id"],
+                call_id,
+                device=torch.device("cpu"),
+                dtype=torch.float32,
+            )
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    assert runtime.forecaster.history_length == 2
+    assert runtime.complete_offline_capture()
+    archive = runtime.offline_archive
+    assert archive is not None
+    assert len(archive.anchors) == 4
+    actual_features = {anchor.step_id: anchor.feature.clone() for anchor in archive.anchors}
+    runtime.end_run(run_id)
+
+    runtime.begin_offline_replay()
+    replay_id = runtime.start_run(
+        sigmas,
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    for step, sigma in enumerate(torch.linspace(1.0, 1.0 / 6.0, 6)):
+        decision = runtime.begin_step(sigma)
+        assert not decision["actual"]
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=TOPOLOGY,
+            labels=LABEL,
+            expected_shape=(1, 3, 4),
+        )
+        assert not actual
+        prediction = runtime.predict(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        )
+        if step in actual_features:
+            torch.testing.assert_close(prediction, actual_features[step])
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    assert runtime.stats.actual_transformer_calls == 0
+    assert runtime.stats.offline_replay_steps == 6
+    assert runtime.stats.offline_replay_model_calls == 6
+    runtime.end_run(replay_id)
+    runtime.release_offline_archive()
+    assert runtime.offline_archive is None

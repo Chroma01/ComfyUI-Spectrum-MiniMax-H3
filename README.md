@@ -79,8 +79,77 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 | `debug` | `false` | Enables concise run, step, topology, fallback, sanitization, chunk, and teardown logs. |
 | `history_storage` | `system_ram` | Stores history in `system_ram`, or in `vram` to avoid transfer overhead when sufficient accelerator memory is free. |
 | `bootstrap_first_forecast` | `true` | Experimental one-point hold for `degree=1` and `warmup_steps<=1`. Incompatible node settings disable it with a console warning. |
+| `anchor_residual_feedback` | `false` | Experimental forward-only error feedback from actual anchors. |
+| `selective_rollback_correction` | `false` | Experimental local rollback for the exact deterministic Euler sampler contract. |
+| `offline_smoothing_replay` | `false` | Experimental two-pass anchor archive, bidirectional smoothing, and transformer-free replay. |
 
 Every value is validated. `max_history` must be at least `degree + 1`.
+
+The three trajectory-correction settings are mutually exclusive. Enabling more than one raises an error that lists every conflicting setting. Existing workflows do not contain these optional inputs and therefore load with all three disabled. With all three disabled, the v0.1.10 schedule and output path are unchanged.
+
+## Experimental trajectory correction
+
+These repository-specific experiments extend the published causal, online Spectrum algorithm. They are default-off and have not been validated with a real MiniMax H3 checkpoint. They carry no quality, speed, memory, or stability guarantee.
+
+| Setting | Sampler support | Passes | Behavior when unsupported |
+|---|---|---:|---|
+| `anchor_residual_feedback` | Euler, RES multistep, RES multistep CFG++ | 1 | Ordinary Spectrum/native fallback rules remain active. |
+| `selective_rollback_correction` | Exact deterministic `sample_euler`, with `s_churn=0` | 1, with local replay on a trigger | RES, CFG++, churned, ancestral, unknown, intercepted, and multi-GPU paths log once and run ordinary Spectrum. |
+| `offline_smoothing_replay` | Euler, RES multistep, RES multistep CFG++ | 2 | Unsupported samplers run one valid native pass. An incomplete first-pass archive returns the valid first-pass result. |
+
+### Shared anchor residual
+
+The first two experiments evaluate a shadow Spectrum forecast at a completed actual anchor using only the causal history that existed before that anchor. They also evaluate a zero-order hold of the latest previous actual hidden feature. Both candidates run through the current anchor's native `FinalLayer`, video reconstruction, audio reconstruction, and sigma-dependent processing. Video and audio are reduced independently in bounded FP32 chunks:
+
+```text
+E_forecast = RMS(actual output - shadow output)
+E_hold     = RMS(actual output - held output)
+score      = E_forecast / max(E_hold, scale-aware epsilon)
+```
+
+The maximum finite video/audio/branch score is used. A score at or below `1` means the shadow forecast is no worse than the hold baseline at that later actual coordinate. A score above `2` is treated as severe. This comparison does not reveal the native hidden feature at the earlier forecast coordinate; it measures a new actual anchor after the trajectory has already advanced.
+
+Missing, duplicate, incomplete, reordered-unmappable, or changed branch labels/topology disable only the experimental behavior for that run. Nonfinite scores or hidden residuals do the same. Ordinary Spectrum or the native fallback remains usable. Debug summaries report residual timing, maximum video/audio score, failures, corrections, speculative work, discarded work, rollback work, and offline archive size.
+
+### Anchor residual feedback
+
+This is forward error feedback. It never revises a completed latent step.
+
+- For `1 < score <= 2`, the next ordinary forecast receives one model-dtype hidden correction with gain `score - 1`, and the adaptive window shrinks by `flex_window * gain` without going below the configured initial `window_size`.
+- For `score > 2`, the correction gain is `1`, the window shrinks by the full `flex_window`, and the next logical step is forced actual with reason `anchor residual feedback refresh`.
+- For `score <= 1`, an obsolete pending correction is released.
+
+The correction is consumed once by the next ordinary forecast. The one-point bootstrap is a hold rather than an ordinary forecast and does not consume it. At most one model-dtype hidden residual is retained, following `history_storage`; FP32 correction arithmetic is chunked.
+
+### Selective rollback correction
+
+The Euler implementation owns a run-local sampler loop through ComfyUI's `SAMPLER_SAMPLE` wrapper. Before a forecast it checkpoints the pre-forecast latent, logical index, runtime scheduler, adaptive window, refresh counters, history references, statistics, and callback/progress position. If the immediately following actual anchor scores above `1`, it:
+
+1. discards that forecast-influenced anchor result;
+2. restores the pre-forecast latent and runtime checkpoint;
+3. recomputes the previous forecasted interval as an actual transformer step;
+4. advances from that corrected result;
+5. recomputes the current anchor as actual at the corrected latent; and
+6. continues from the corrected trajectory.
+
+The replayed interval cannot request another rollback. Speculative calls and the discarded actual call remain included in compute counters. Accepted callbacks and previews occur once per logical step. Cancellation and exceptions propagate through the normal ComfyUI path, and run teardown releases the checkpoint.
+
+Current deterministic RES stores solver-local `old_denoised`, `old_sigma_down`, and, for CFG++, unconditional denoised state inside `res_multistep`. Those values are outside the public `PREDICT_NOISE` transaction. This branch does not claim RES rollback support: selecting rollback with either RES variant logs one warning before sampler mutation and executes ordinary Spectrum.
+
+### Offline smoothing replay
+
+The first pass runs ordinary Spectrum with the external callback suppressed and retains every completed actual anchor in system RAM, independent of causal `max_history` eviction. It also records the exact initial noise, latent, sigma sequence, seed, sampler, schedule decisions, labels, topology, and input shapes needed to restart the same deterministic sampler.
+
+For a first-pass forecast step, the offline smoother combines:
+
+- a spectral prediction fitted over all retained actual anchors; and
+- linear interpolation between the nearest earlier and later actual anchors.
+
+The existing `blend_weight` mixes those components. First-pass actual coordinates reuse their stored feature exactly, and every smoothed forecast requires a future actual anchor. The replay restarts from cloned original inputs, invokes zero H3 transformer blocks, runs the current replay step's native output heads and reconstruction, and advances the same deterministic solver. External callbacks/previews run during the accepted replay pass only. Interruption checks remain active in both passes.
+
+This is an anchor-reuse approximation. The stored actual anchors were evaluated on the first-pass trajectory, while replay generally follows a different trajectory. Future anchors improve the hidden-feature interpolation but do not make those anchors native-equivalent at the replay latent. The method is not lossless, fully corrected, or guaranteed to improve quality.
+
+Offline memory includes cloned initial sampling inputs plus every actual hidden anchor in system RAM, even when causal history uses VRAM. Replay adds a second sampler pass and output-head work while eliminating H3 transformer calls only in that second pass. If the first pass is unsupported, intercepted, disabled, incomplete, or changes topology, replay is skipped and the valid first-pass result is returned with one warning.
 
 ### Preliminary performance preset (default)
 
@@ -249,6 +318,16 @@ PYTHONPATH=/path/to/ComfyUI \
 python -m pytest -q
 ```
 
+## Manual validation required for the experimental modes
+
+Before any experimental mode is considered for a default or release, test 20-step Euler and RES multistep, plus RES CFG++ where applicable, at approximately 0.6 MP, 7 seconds, and 24 fps. Keep prompt, seed, checkpoint, resolution, duration, sampler, scheduler, images, and audio references identical across:
+
+- native Spectrum-off;
+- ordinary Spectrum with all three settings false; and
+- each experimental setting enabled separately.
+
+Inspect video quality, generated audio, reference-audio distortion, audiovisual synchronization, total wall time, actual/discarded/replayed transformer calls, peak VRAM, and peak system RAM. Cancel during the first pass, residual evaluation, rollback replay, and offline replay. Run at least ten consecutive generations with Sol-Attn enabled and load old saved workflows to detect retained state, memory growth, deadlocks, callback duplication, WSL wedges, and compatibility regressions.
+
 ## Repository layout
 
 ```text
@@ -262,9 +341,11 @@ ComfyUI-Spectrum-MiniMax-H3/
 |-- comfyui_spectrum_h3/
 |   |-- __init__.py
 |   |-- config.py
+|   |-- experiments.py
 |   |-- forecast.py
 |   |-- nodes.py
 |   |-- runtime.py
+|   |-- rollback.py
 |   |-- sampling.py
 |   `-- minimax_h3.py
 `-- tests/

@@ -52,6 +52,80 @@ def test_preliminary_scheduler_defaults():
     assert "disable bootstrap_first_forecast" in required["degree"][1]["tooltip"]
     assert "disable bootstrap_first_forecast" in required["warmup_steps"][1]["tooltip"]
     assert apply_parameters["bootstrap_first_forecast"].default is True
+    for name in (
+        "anchor_residual_feedback",
+        "selective_rollback_correction",
+        "offline_smoothing_replay",
+    ):
+        assert getattr(config, name) is False
+        assert optional[name][0] == "BOOLEAN"
+        assert optional[name][1]["default"] is False
+        assert apply_parameters[name].default is False
+
+
+@pytest.mark.parametrize(
+    "name",
+    (
+        "anchor_residual_feedback",
+        "selective_rollback_correction",
+        "offline_smoothing_replay",
+    ),
+)
+@pytest.mark.parametrize("value", [0, 1, "false", None])
+def test_experimental_settings_require_strict_booleans(name, value):
+    with pytest.raises(TypeError, match=rf"{name} must be a boolean"):
+        SpectrumH3Config(**{name: value})
+
+
+@pytest.mark.parametrize(
+    "enabled",
+    (
+        ("anchor_residual_feedback", "selective_rollback_correction"),
+        ("anchor_residual_feedback", "offline_smoothing_replay"),
+        ("selective_rollback_correction", "offline_smoothing_replay"),
+        (
+            "anchor_residual_feedback",
+            "selective_rollback_correction",
+            "offline_smoothing_replay",
+        ),
+    ),
+)
+def test_experimental_settings_are_mutually_exclusive_on_construction(enabled):
+    values = {name: True for name in enabled}
+    with pytest.raises(ValueError) as error:
+        SpectrumH3Config(**values)
+    for name in enabled:
+        assert name in str(error.value)
+
+
+def test_disabled_config_allows_irrelevant_experimental_conflicts():
+    config = SpectrumH3Config(
+        enabled=False,
+        anchor_residual_feedback=True,
+        selective_rollback_correction=True,
+        offline_smoothing_replay=True,
+    )
+    config.validate()
+
+
+def test_disabled_node_returns_original_before_experimental_validation():
+    model = object()
+    (result,) = SpectrumApplyMiniMaxH3().apply(
+        model,
+        False,
+        0.5,
+        1,
+        0.1,
+        2.0,
+        0.75,
+        1,
+        1,
+        8,
+        False,
+        anchor_residual_feedback=True,
+        selective_rollback_correction=True,
+    )
+    assert result is model
 
 
 def test_aggressive_preset_explicitly_disables_degree_one_bootstrap():

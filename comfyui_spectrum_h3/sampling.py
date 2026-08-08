@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Any
 
-from .runtime import ForecastRetryActual, SpectrumH3Runtime
+import torch
+
+from .rollback import run_selective_rollback_euler
+from .runtime import ForecastRetryActual, OfflineReplayAbort, SpectrumH3Runtime
 
 LOG = logging.getLogger(__name__)
 
@@ -63,6 +67,17 @@ def min_tail_actual_steps(sampler: Any) -> int:
 def _binding_from_model_options(model_options: dict[str, Any] | None) -> SpectrumH3Binding | None:
     binding = (model_options or {}).get(BINDING_KEY)
     return binding if isinstance(binding, SpectrumH3Binding) else None
+
+
+def _copy_condition_structure(value: Any) -> Any:
+    """Copy mutable conditioning containers while sharing tensor/model payloads."""
+    if isinstance(value, dict):
+        return {key: _copy_condition_structure(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_copy_condition_structure(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_copy_condition_structure(item) for item in value)
+    return value
 
 
 def copy_model_options_with_step(
@@ -128,23 +143,81 @@ def outer_sample_wrapper(
 
     runtime = binding.runtime
     name = sampler_name(sampler)
-    run_id = runtime.start_run(
-        sigmas,
-        name,
-        supported_sampler=sampler_is_supported(sampler),
-        max_consecutive_forecasts=max_consecutive_forecasts(sampler),
-        min_actual_steps_after_forecast=min_actual_steps_after_forecast(sampler),
-        min_tail_actual_steps=min_tail_actual_steps(sampler),
-    )
-    if runtime.config.debug:
-        LOG.warning(
-            "Spectrum H3 run start run_id=%s sampler=%s steps=%s supported=%s",
-            run_id,
+
+    def execute_run(
+        run_noise,
+        run_latent,
+        run_sigmas,
+        run_mask,
+        run_callback,
+        run_disable_pbar,
+        *,
+        phase: str,
+        complete_offline_capture: bool = False,
+    ):
+        run_id = runtime.start_run(
+            run_sigmas,
             name,
-            runtime.stats.total_steps,
-            runtime.supported_sampler,
+            supported_sampler=sampler_is_supported(sampler),
+            max_consecutive_forecasts=max_consecutive_forecasts(sampler),
+            min_actual_steps_after_forecast=min_actual_steps_after_forecast(sampler),
+            min_tail_actual_steps=min_tail_actual_steps(sampler),
         )
-    try:
+        if runtime.config.debug:
+            LOG.warning(
+                "Spectrum H3 run start phase=%s run_id=%s sampler=%s steps=%s supported=%s",
+                phase,
+                run_id,
+                name,
+                runtime.stats.total_steps,
+                runtime.supported_sampler,
+            )
+        capture_complete = False
+        started = time.perf_counter()
+        try:
+            result = executor(
+                run_noise,
+                run_latent,
+                sampler,
+                run_sigmas,
+                run_mask,
+                run_callback,
+                run_disable_pbar,
+                seed,
+                latent_shapes=latent_shapes,
+            )
+            if complete_offline_capture:
+                capture_complete = runtime.complete_offline_capture()
+            return result, capture_complete
+        finally:
+            if runtime.config.debug:
+                LOG.warning(
+                    "Spectrum H3 run summary phase=%s wall_s=%.3f %s",
+                    phase,
+                    time.perf_counter() - started,
+                    runtime.debug_summary(),
+                )
+            runtime.end_run(run_id)
+            if runtime.config.debug:
+                LOG.warning("Spectrum H3 run teardown phase=%s run_id=%s", phase, run_id)
+
+    if not runtime.config.offline_smoothing_replay:
+        result, _ = execute_run(
+            noise,
+            latent_image,
+            sigmas,
+            denoise_mask,
+            callback,
+            disable_pbar,
+            phase="single_pass",
+        )
+        return result
+
+    if not sampler_is_supported(sampler):
+        LOG.warning(
+            "Spectrum H3 offline smoothing replay is unsupported for sampler %s; running one native pass",
+            name,
+        )
         return executor(
             noise,
             latent_image,
@@ -156,12 +229,75 @@ def outer_sample_wrapper(
             seed,
             latent_shapes=latent_shapes,
         )
+    if not all(torch.is_tensor(value) for value in (noise, latent_image, sigmas)):
+        LOG.warning(
+            "Spectrum H3 offline smoothing replay requires tensor sampling inputs; running one ordinary pass"
+        )
+        result, _ = execute_run(
+            noise,
+            latent_image,
+            sigmas,
+            denoise_mask,
+            callback,
+            disable_pbar,
+            phase="single_pass_fallback",
+        )
+        return result
+
+    replay_noise = noise.detach().clone()
+    replay_latent = latent_image.detach().clone()
+    replay_sigmas = sigmas.detach().clone()
+    replay_mask = denoise_mask.detach().clone() if torch.is_tensor(denoise_mask) else denoise_mask
+    initial_conds = _copy_condition_structure(guider.conds) if hasattr(guider, "conds") else None
+    runtime.begin_offline_capture(total_steps=max(0, sigmas.numel() - 1), sampler_name=name)
+    try:
+        first_result, capture_complete = execute_run(
+            noise,
+            latent_image,
+            sigmas,
+            denoise_mask,
+            None,
+            True,
+            phase="offline_first_pass",
+            complete_offline_capture=True,
+        )
+        if not capture_complete:
+            reason = (
+                runtime.offline_archive.failure_reason
+                if runtime.offline_archive is not None
+                else "offline archive was not retained"
+            )
+            LOG.warning(
+                "Spectrum H3 offline replay skipped; returning the valid first-pass result: %s",
+                reason,
+            )
+            return first_result
+
+        runtime.begin_offline_replay()
+        if initial_conds is not None:
+            # CFGGuider.inner_sample replaces ``guider.conds`` with processed
+            # conditions. Replay must begin from the same preprocessed input
+            # structure as the first pass, not process its output a second time.
+            guider.conds = _copy_condition_structure(initial_conds)
+        try:
+            replay_result, _ = execute_run(
+                replay_noise,
+                replay_latent,
+                replay_sigmas,
+                replay_mask,
+                callback,
+                disable_pbar,
+                phase="offline_replay",
+            )
+        except OfflineReplayAbort as exc:
+            LOG.warning(
+                "Spectrum H3 offline replay aborted; returning the valid first-pass result: %s",
+                exc,
+            )
+            return first_result
+        return replay_result
     finally:
-        if runtime.config.debug:
-            LOG.warning("Spectrum H3 run summary %s", runtime.debug_summary())
-        runtime.end_run(run_id)
-        if runtime.config.debug:
-            LOG.warning("Spectrum H3 run teardown run_id=%s", run_id)
+        runtime.release_offline_archive()
 
 
 def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
@@ -219,6 +355,97 @@ def predict_noise_wrapper(executor, x, timestep, model_options=None, seed=None):
         raise
 
 
+def sampler_sample_wrapper(
+    executor,
+    model_wrap,
+    sigmas,
+    extra_args,
+    callback,
+    noise,
+    latent_image=None,
+    denoise_mask=None,
+    disable_pbar=False,
+):
+    binding = _binding_from_model_options(getattr(model_wrap, "model_options", None))
+    if binding is None or binding.runtime.active_run_id is None:
+        return executor(
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+    runtime = binding.runtime
+    if not runtime.config.selective_rollback_correction or runtime.experiment_disabled_reason is not None:
+        return executor(
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+
+    import comfy.k_diffusion.sampling as native_sampling
+
+    sampler = executor.class_obj
+    function = getattr(sampler, "sampler_function", None)
+    options = dict(getattr(sampler, "extra_options", {}) or {})
+    unsupported_reason = None
+    if function is not native_sampling.sample_euler:
+        unsupported_reason = (
+            f"selective rollback supports only the exact reviewed sample_euler contract; got {sampler_name(sampler)}"
+        )
+    elif set(options) - {"s_churn", "s_tmin", "s_tmax", "s_noise"}:
+        unsupported_reason = "selective rollback received unknown Euler sampler options"
+    elif float(options.get("s_churn", 0.0)) != 0.0:
+        unsupported_reason = "selective rollback does not support Euler churn"
+    elif "multigpu_clones" in (extra_args.get("model_options") or {}):
+        unsupported_reason = "selective rollback does not support multi-GPU parallel sampling"
+    elif len(executor.wrappers) != 1:
+        unsupported_reason = "selective rollback does not support another SAMPLER_SAMPLE wrapper"
+    else:
+        import comfy.patcher_extension
+
+        predict_wrappers = comfy.patcher_extension.get_all_wrappers(
+            comfy.patcher_extension.WrappersMP.PREDICT_NOISE,
+            getattr(model_wrap, "model_options", {}) or {},
+            is_model_options=True,
+        )
+        if any(wrapper is not predict_noise_wrapper for wrapper in predict_wrappers):
+            unsupported_reason = "selective rollback does not support another PREDICT_NOISE wrapper"
+
+    if unsupported_reason is not None:
+        runtime.disable_experiment(unsupported_reason)
+        return executor(
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+    return run_selective_rollback_euler(
+        sampler,
+        runtime,
+        model_wrap,
+        sigmas,
+        extra_args,
+        callback,
+        noise,
+        latent_image,
+        denoise_mask,
+        disable_pbar,
+    )
+
+
 def model_clone_callback(source_model: Any, cloned_model: Any) -> None:
     source_binding = _binding_from_model_options(getattr(source_model, "model_options", None))
     if source_binding is None:
@@ -245,6 +472,9 @@ def install_sampler_wrappers(model: Any, runtime: SpectrumH3Runtime) -> None:
     existing_predict = model.get_wrappers(wrapper_types.PREDICT_NOISE, WRAPPER_KEY)
     if not existing_predict:
         model.add_wrapper_with_key(wrapper_types.PREDICT_NOISE, WRAPPER_KEY, predict_noise_wrapper)
+    existing_sampler = model.get_wrappers(wrapper_types.SAMPLER_SAMPLE, WRAPPER_KEY)
+    if not existing_sampler:
+        model.add_wrapper_with_key(wrapper_types.SAMPLER_SAMPLE, WRAPPER_KEY, sampler_sample_wrapper)
     callback_type = comfy.patcher_extension.CallbacksMP.ON_CLONE
     if not model.get_callbacks(callback_type, WRAPPER_KEY):
         model.add_callback_with_key(callback_type, WRAPPER_KEY, model_clone_callback)

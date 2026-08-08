@@ -12,6 +12,20 @@ class _HistoryEntry:
     feature_flat: torch.Tensor
 
 
+@dataclass(slots=True)
+class ForecasterSnapshot:
+    history: list[_HistoryEntry]
+    feature_shape: tuple[int, ...] | None
+    feature_dtype: torch.dtype | None
+    history_device: torch.device | None
+    generation: int
+    factor_generation: int
+    design: torch.Tensor | None
+    cholesky: torch.Tensor | None
+    factorization_count: int
+    jitter_attempts: int
+
+
 class HistoryWeightForecaster:
     """Chebyshev ridge forecasting without full-feature FP32 coefficients.
 
@@ -56,6 +70,36 @@ class HistoryWeightForecaster:
         self._cholesky: torch.Tensor | None = None
         self._factorization_count = 0
         self._jitter_attempts = 0
+        self.last_prediction_chunk_count = 0
+        self.last_prediction_max_fp32_elements = 0
+
+    def snapshot(self) -> ForecasterSnapshot:
+        return ForecasterSnapshot(
+            history=list(self._history),
+            feature_shape=self._feature_shape,
+            feature_dtype=self._feature_dtype,
+            history_device=self._history_device,
+            generation=self._generation,
+            factor_generation=self._factor_generation,
+            design=self._design,
+            cholesky=self._cholesky,
+            factorization_count=self._factorization_count,
+            jitter_attempts=self._jitter_attempts,
+        )
+
+    def restore(self, snapshot: ForecasterSnapshot) -> None:
+        if not isinstance(snapshot, ForecasterSnapshot):
+            raise TypeError("snapshot must be a ForecasterSnapshot")
+        self._history = list(snapshot.history)
+        self._feature_shape = snapshot.feature_shape
+        self._feature_dtype = snapshot.feature_dtype
+        self._history_device = snapshot.history_device
+        self._generation = snapshot.generation
+        self._factor_generation = snapshot.factor_generation
+        self._design = snapshot.design
+        self._cholesky = snapshot.cholesky
+        self._factorization_count = snapshot.factorization_count
+        self._jitter_attempts = snapshot.jitter_attempts
         self.last_prediction_chunk_count = 0
         self.last_prediction_max_fp32_elements = 0
 
@@ -184,6 +228,9 @@ class HistoryWeightForecaster:
         solved = torch.cholesky_solve(design.transpose(0, 1), cholesky)
         return (phi @ solved).reshape(-1)
 
+    def spectral_weights(self, coordinate: float) -> torch.Tensor:
+        return self._spectral_weights(coordinate)
+
     def _linear_weights(self, coordinate: float) -> torch.Tensor:
         weights = torch.zeros(len(self._history), dtype=torch.float32)
         if len(self._history) == 1:
@@ -254,6 +301,29 @@ class HistoryWeightForecaster:
         if len(self._history) != 1:
             raise RuntimeError("one-point hold requires exactly one actual history entry")
         weights = torch.ones(1, dtype=torch.float32)
+        return self._predict_with_weights(weights, rows=rows, device=device, dtype=dtype)
+
+    def predict_latest_hold(
+        self,
+        *,
+        rows: Sequence[int] | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
+        if not self._history:
+            raise RuntimeError("latest hold requires at least one actual history entry")
+        weights = torch.zeros(len(self._history), dtype=torch.float32)
+        weights[-1] = 1.0
+        return self._predict_with_weights(weights, rows=rows, device=device, dtype=dtype)
+
+    def predict_with_weights(
+        self,
+        weights: torch.Tensor,
+        *,
+        rows: Sequence[int] | None = None,
+        device: torch.device | str | None = None,
+        dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
         return self._predict_with_weights(weights, rows=rows, device=device, dtype=dtype)
 
     def _predict_with_weights(
