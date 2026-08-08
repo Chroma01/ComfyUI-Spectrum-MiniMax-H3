@@ -53,6 +53,52 @@ def test_chunked_row_subset_matches_full_prediction():
     assert forecaster.last_prediction_max_fp32_elements <= 1024
 
 
+def test_equal_segment_blends_reproduce_the_legacy_packed_prediction():
+    torch.manual_seed(22)
+    forecaster = HistoryWeightForecaster(degree=2, ridge_lambda=0.1, max_history=4, chunk_bytes=4096)
+    for index, coordinate in enumerate((-1.0, -0.25, 0.4)):
+        forecaster.update(coordinate, torch.randn(2, 3, 7) + index)
+
+    packed = forecaster.predict(0.7, blend_weight=0.5, rows=(1, 0))
+    segmented = forecaster.predict_segments(
+        0.7,
+        ((0, 1, 0.5), (1, 3, 0.5)),
+        rows=(1, 0),
+    )
+
+    torch.testing.assert_close(segmented, packed, rtol=0.0, atol=0.0)
+
+
+def test_segmented_prediction_applies_independent_weights_in_one_packed_result():
+    torch.manual_seed(23)
+    forecaster = HistoryWeightForecaster(degree=2, ridge_lambda=0.1, max_history=4, chunk_bytes=4096)
+    for index, coordinate in enumerate((-1.0, -0.25, 0.4)):
+        forecaster.update(coordinate, torch.randn(1, 3, 17) + index)
+
+    local = forecaster.predict(0.7, blend_weight=0.0)
+    spectral = forecaster.predict(0.7, blend_weight=0.75)
+    segmented = forecaster.predict_segments(
+        0.7,
+        ((0, 1, 0.0), (1, 3, 0.75)),
+    )
+
+    torch.testing.assert_close(segmented[:, :1], local[:, :1], rtol=0.0, atol=0.0)
+    torch.testing.assert_close(segmented[:, 1:], spectral[:, 1:], rtol=0.0, atol=0.0)
+    assert segmented.shape == (1, 3, 17)
+    assert forecaster.last_prediction_max_fp32_elements <= 1024
+
+
+def test_zero_blend_uses_linear_weights_without_spectral_factorization():
+    forecaster = HistoryWeightForecaster(degree=1, ridge_lambda=0.1, max_history=2)
+    forecaster.update(-1.0, torch.zeros(1, 2, 3))
+    forecaster.update(0.0, torch.ones(1, 2, 3))
+
+    prediction = forecaster.predict(0.5, blend_weight=0.0)
+
+    torch.testing.assert_close(prediction, torch.full_like(prediction, 1.5))
+    assert forecaster.factorization_count == 0
+
+
 def test_one_point_hold_reuses_canonical_rows_with_bounded_chunking_and_dtype_conversion():
     feature = torch.arange(3 * 40 * 40, dtype=torch.float32).reshape(3, 40, 40).to(torch.float16)
     forecaster = HistoryWeightForecaster(

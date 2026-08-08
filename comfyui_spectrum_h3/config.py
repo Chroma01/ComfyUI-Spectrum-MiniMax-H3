@@ -22,6 +22,7 @@ class SpectrumH3Config:
     anchor_residual_feedback: bool = False
     selective_rollback_correction: bool = False
     offline_smoothing_replay: bool = False
+    audio_blend_weight: float = 0.0
 
     def __post_init__(self) -> None:
         experimental = {
@@ -75,6 +76,8 @@ class SpectrumH3Config:
             )
         if not math.isfinite(self.blend_weight) or not 0.0 <= self.blend_weight <= 1.0:
             raise ValueError("blend_weight must be finite and in [0, 1]")
+        if not math.isfinite(self.audio_blend_weight) or not 0.0 <= self.audio_blend_weight <= 1.0:
+            raise ValueError("audio_blend_weight must be finite and in [0, 1]")
         if isinstance(self.degree, bool) or not isinstance(self.degree, int) or self.degree < 1:
             raise ValueError("degree must be an integer >= 1")
         if not math.isfinite(self.ridge_lambda) or self.ridge_lambda < 0.0:

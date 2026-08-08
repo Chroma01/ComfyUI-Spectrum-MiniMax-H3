@@ -243,6 +243,7 @@ class OfflineSmoother:
         degree: int,
         ridge_lambda: float,
         blend_weight: float,
+        audio_blend_weight: float = 0.0,
         chunk_bytes: int = DEFAULT_CHUNK_BYTES,
     ) -> None:
         if not archive.valid or not archive.anchors or archive.labels is None:
@@ -251,6 +252,9 @@ class OfflineSmoother:
         self.blend_weight = float(blend_weight)
         if not 0.0 <= self.blend_weight <= 1.0:
             raise ValueError("blend_weight must be in [0, 1]")
+        self.audio_blend_weight = float(audio_blend_weight)
+        if not 0.0 <= self.audio_blend_weight <= 1.0:
+            raise ValueError("audio_blend_weight must be in [0, 1]")
         self.degree = int(degree)
         self.ridge_lambda = float(ridge_lambda)
         self._anchor_ids = [anchor.step_id for anchor in archive.anchors]
@@ -266,6 +270,22 @@ class OfflineSmoother:
         for anchor in archive.anchors:
             self._forecaster.update(anchor.coordinate, anchor.feature, take_ownership=True)
         self._stream_ranges = self._resolve_stream_ranges()
+        if (
+            self._stream_ranges[0][0] == "packed"
+            and not math.isclose(
+                self.audio_blend_weight,
+                self.blend_weight,
+                rel_tol=0.0,
+                abs_tol=1e-12,
+            )
+        ):
+            raise ValueError(
+                "offline modality-specific blending requires target audio/video row metadata"
+            )
+        self.configured_stream_blends = {
+            name: self.audio_blend_weight if name == "audio" else self.blend_weight
+            for name, _, _ in self._stream_ranges
+        }
         self.validation_stream_count = len(self._stream_ranges)
         self.validation_stream_max_scores = {
             name: 0.0 for name, _, _ in self._stream_ranges
@@ -274,6 +294,16 @@ class OfflineSmoother:
         self.validation_anchor_count = 0
         self.attenuated_prediction_count = 0
         self.local_only_prediction_count = 0
+        self.attenuated_prediction_counts = {
+            name: 0 for name, _, _ in self._stream_ranges
+        }
+        self.local_only_prediction_counts = {
+            name: 0 for name, _, _ in self._stream_ranges
+        }
+        self.effective_blend_stream_stats = {
+            name: (blend, blend, blend)
+            for name, blend in self.configured_stream_blends.items()
+        }
         self.effective_blend_min = self.blend_weight
         self.effective_blend_mean = self.blend_weight
         self.effective_blend_max = self.blend_weight
@@ -424,9 +454,12 @@ class OfflineSmoother:
         ]
         return max(nearby, default=1.0)
 
-    def _build_forecast_weights(self) -> dict[tuple[int, int], torch.Tensor]:
-        weights_by_step: dict[tuple[int, int], torch.Tensor] = {}
+    def _build_forecast_weights(self) -> dict[tuple[int, int, int], torch.Tensor]:
+        weights_by_step: dict[tuple[int, int, int], torch.Tensor] = {}
         effective_blends: list[float] = []
+        stream_effective_blends = {
+            name: [] for name, _, _ in self._stream_ranges
+        }
         for record in self.archive.steps:
             if record.actual:
                 continue
@@ -445,24 +478,37 @@ class OfflineSmoother:
             local = torch.zeros(len(self.archive.anchors), dtype=torch.float32)
             local[position - 1] = 1.0 - ratio
             local[position] = ratio
-            for branch in range(self._branch_count):
-                validation_score = max(
-                    self._validation_score_for_interval(position, branch, stream_index)
-                    for stream_index in range(len(self._stream_ranges))
-                )
-                effective_blend = self.blend_weight / max(1.0, validation_score)
-                weights_by_step[(record.step_id, branch)] = (
-                    effective_blend * spectral + (1.0 - effective_blend) * local
-                )
-                effective_blends.append(effective_blend)
-                if effective_blend < self.blend_weight - 1e-7:
-                    self.attenuated_prediction_count += 1
-                if effective_blend <= 1e-7:
-                    self.local_only_prediction_count += 1
+            for stream_index, (stream_name, _, _) in enumerate(self._stream_ranges):
+                configured_blend = self.configured_stream_blends[stream_name]
+                for branch in range(self._branch_count):
+                    validation_score = self._validation_score_for_interval(
+                        position,
+                        branch,
+                        stream_index,
+                    )
+                    effective_blend = configured_blend / max(1.0, validation_score)
+                    weights_by_step[(record.step_id, branch, stream_index)] = (
+                        effective_blend * spectral + (1.0 - effective_blend) * local
+                    )
+                    effective_blends.append(effective_blend)
+                    stream_effective_blends[stream_name].append(effective_blend)
+                    if effective_blend < configured_blend - 1e-7:
+                        self.attenuated_prediction_count += 1
+                        self.attenuated_prediction_counts[stream_name] += 1
+                    if effective_blend <= 1e-7:
+                        self.local_only_prediction_count += 1
+                        self.local_only_prediction_counts[stream_name] += 1
         if effective_blends:
             self.effective_blend_min = min(effective_blends)
             self.effective_blend_mean = sum(effective_blends) / len(effective_blends)
             self.effective_blend_max = max(effective_blends)
+        for stream_name, values in stream_effective_blends.items():
+            if values:
+                self.effective_blend_stream_stats[stream_name] = (
+                    min(values),
+                    sum(values) / len(values),
+                    max(values),
+                )
         return weights_by_step
 
     def predict(
@@ -490,8 +536,16 @@ class OfflineSmoother:
         predictions = []
         chunks = 0
         for row in rows:
-            prediction = self._forecaster.predict_with_weights(
-                self._forecast_weights[(record.step_id, int(row))],
+            weighted_segments = [
+                (
+                    start,
+                    end,
+                    self._forecast_weights[(record.step_id, int(row), stream_index)],
+                )
+                for stream_index, (_, start, end) in enumerate(self._stream_ranges)
+            ]
+            prediction = self._forecaster.predict_with_segment_weights(
+                weighted_segments,
                 rows=(int(row),),
                 device=device,
                 dtype=dtype,

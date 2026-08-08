@@ -68,7 +68,7 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 | Parameter | Preliminary performance default | Meaning |
 |---|---:|---|
 | `enabled` | `true` | Enables the clone-local Spectrum runtime. |
-| `blend_weight` | `0.50` | Spectral share of the prediction. The remainder is a two-point local linear forecast. |
+| `blend_weight` | `0.50` | Video spectral share. The remainder is a two-point local linear prediction. |
 | `degree` | `1` | Maximum Chebyshev polynomial degree. At least `degree + 1` actual points are required. |
 | `ridge_lambda` | `0.10` | Ridge regularization applied to the small Gram matrix. |
 | `window_size` | `2.0` | Initial adaptive interval. |
@@ -82,8 +82,13 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 | `anchor_residual_feedback` | `false` | Experimental video-scored actual-refresh guard. It never injects a hidden residual. |
 | `selective_rollback_correction` | `false` | Experimental thresholded, budgeted rollback for the exact deterministic Euler sampler contract. |
 | `offline_smoothing_replay` | `false` | Experimental two-pass anchor archive, cross-validated bidirectional smoothing, and transformer-free replay. |
+| `audio_blend_weight` | `0.00` | Audio spectral share. Zero keeps audio on the two-point predictor independently of the video setting. |
 
 Every value is validated. `max_history` must be at least `degree + 1`.
+
+MiniMax H3 packs generated audio and video into one transformer sequence while conditioning their rows on different shifted timestep schedules. Earlier revisions applied one `blend_weight` to the complete packed target. In two matched runs with `blend_weight=0.5`, both ordinary Spectrum and offline replay produced an audio defect on the tested seed; the corresponding two `blend_weight=0` runs did not. The offline run also measured a worst held-out spectral/local error ratio of `3.095` for audio and still retained `0.162-0.309` spectral share, showing that proportional attenuation did not establish perceptual safety.
+
+The runtime now predicts both contiguous modalities into one packed output buffer with separate history weights. `blend_weight` remains the video control for saved-workflow compatibility, while `audio_blend_weight` defaults to `0`. A nonzero audio value remains available for controlled experiments. The exact cause of audio's poorer spectral fit is not proven; H3's separate audio sigma shift is a plausible contributor, while the demonstrated implementation fault was forcing one modality-agnostic blend policy across both trajectories.
 
 When `enabled=True`, the three trajectory-correction settings are mutually exclusive. Enabling more than one raises an error that lists every conflicting setting. Existing workflows do not contain these optional inputs and therefore load with all three disabled. With all three disabled, the v0.1.10 schedule and output path are unchanged.
 
@@ -152,11 +157,12 @@ For a first-pass forecast step, the offline smoother combines:
 Before replay, every interior actual anchor is withheld in turn. A deterministic sample of up to 16,384 hidden values per conditional branch and modality measures the leave-one-anchor-out spectral error against the error of interpolation between the adjacent actual anchors. Audio and video are validated separately. For each missing step, the worse score at the two bracketing anchors limits the spectral share:
 
 ```text
-validation_score = RMS(held-out spectral error) / max(RMS(local interpolation error), epsilon)
-effective_blend  = blend_weight / max(1, validation_score)
+validation_score        = RMS(held-out spectral error) / max(RMS(local interpolation error), epsilon)
+effective_video_blend   = blend_weight       / max(1, video_validation_score)
+effective_audio_blend   = audio_blend_weight / max(1, audio_validation_score)
 ```
 
-The configured `blend_weight` therefore remains an upper bound. A spectral fit that validates at least as well as local interpolation retains that share; a worse fit is attenuated in direct proportion to its error ratio. The worse audio/video score controls one packed-feature blend, preserving the coupled H3 hidden state without allocating separate full prediction buffers. Spectral weights receive a minimal affine correction so they sum to one, preventing ridge regularization from moving a constant hidden trajectory.
+Each configured modality weight remains an upper bound. A spectral fit that validates at least as well as local interpolation retains that modality's share; a worse fit is attenuated in direct proportion to its error ratio. Audio and video use their own validation score and history weights inside one streamed packed prediction buffer, so an unreliable audio fit neither enters the default audio result nor suppresses the video blend. Spectral weights receive a minimal affine correction so they sum to one, preventing ridge regularization from moving a constant hidden trajectory.
 
 First-pass actual coordinates reuse their stored feature exactly, and every smoothed forecast requires a future actual anchor. The replay restarts from cloned original inputs, invokes zero H3 transformer blocks, runs the current replay step's native output heads and reconstruction, and advances the same deterministic solver. External callbacks/previews run during the accepted replay pass only. Interruption checks remain active in both passes.
 
@@ -164,14 +170,15 @@ This is an anchor-reuse approximation. The stored actual anchors were evaluated 
 
 Offline memory includes cloned initial sampling inputs plus every actual hidden anchor on the selected history device. With `max_history=8` and the observed 11-anchor schedule, shared ownership retains 11 unique feature tensors rather than an eight-entry causal history plus a separate eleven-entry archive. At the supplied 0.65 MP / 8-second shape, this changes explicit `vram` storage from approximately 2.90 GiB VRAM plus 3.89 GiB system RAM to approximately 3.89 GiB VRAM total for history/archive, excluding allocator overhead and input clones. System-RAM storage remains approximately 3.89 GiB and avoids duplicate anchor copies.
 
-Replay adds a second sampler pass and output-head work while eliminating H3 transformer calls only in that second pass. Debug summaries separately report archive time, smoother-build and validation time, retained archive size and device, hypothetical full-schedule size, held-out sample/anchor/stream counts, maximum audio/video validation scores, effective blend range/mean, attenuated predictions, archived-anchor replay steps, smoothed replay steps, and the smoother's real history/chunk counters. If the first pass is unsupported, intercepted, disabled, incomplete, or changes topology, replay is skipped and the valid first-pass result is returned with one warning.
+Replay adds a second sampler pass and output-head work while eliminating H3 transformer calls only in that second pass. Debug summaries separately report the configured video/audio weights, archive time, smoother-build and validation time, retained archive size and device, hypothetical full-schedule size, held-out sample/anchor/stream counts, maximum audio/video validation scores, per-modality effective blend ranges and attenuation/local-only counts, archived-anchor replay steps, smoothed replay steps, and the smoother's real history/chunk counters. If the first pass is unsupported, intercepted, disabled, incomplete, or changes topology, replay is skipped and the valid first-pass result is returned with one warning.
 
-Across three supplied 0.65 MP / 8-second runs of the earlier fixed-blend implementation, the transformer-free replay added 8.49%, 8.63%, and 8.95% to its corresponding first-pass sampler time while retaining 11 first-pass H3 calls. The tested seed appeared equivalent to ordinary Spectrum. The cross-validated blend and shared-VRAM archive have not yet been measured on the full checkpoint, so this mode remains useful only when a matched A/B demonstrates a quality gain that justifies the second pass.
+Across three supplied 0.65 MP / 8-second runs of the earlier fixed-blend implementation, the transformer-free replay added 8.49%, 8.63%, and 8.95% to its corresponding first-pass sampler time while retaining 11 first-pass H3 calls. A later VRAM-resident local-only replay completed in `0.441 s`, while the matched ordinary Spectrum run used the same 11-call schedule. In the next matched pair, global `blend_weight=0.5` produced audio issues in both ordinary Spectrum and offline replay; global `blend_weight=0` did not in either of two runs. The new split policy (`video=0.5`, `audio=0`) has not yet been measured on the full checkpoint and requires an exact-seed A/B.
 
 ### Preliminary performance preset (default)
 
 ```text
 blend_weight = 0.50
+audio_blend_weight = 0.00
 degree = 1
 ridge_lambda = 0.10
 window_size = 2.0
@@ -187,6 +194,7 @@ bootstrap_first_forecast = true
 
 ```text
 blend_weight = 0.50
+audio_blend_weight = 0.00
 degree = 4
 ridge_lambda = 0.10
 window_size = 2.0
@@ -316,7 +324,8 @@ Automated tests cover:
 - refresh-only anchor feedback with video-only policy scoring, a `1.5` threshold, a three-refresh budget, and no retained/injected hidden residual;
 - terminal feedback-probe elimination while preserving the final rollback validation probe;
 - rollback threshold and three-correction budget enforcement;
-- separate residual output-head timing, offline archive/build timing, cross-validation and effective-blend reporting, replay anchor/smoothed counts, and replay smoother history/chunk reporting;
+- single-buffer modality-specific online and offline prediction with an audio-local default;
+- separate residual output-head timing, offline archive/build timing, per-modality cross-validation/effective-blend reporting, replay anchor/smoothed counts, and replay smoother history/chunk reporting;
 - downstream `predict_noise` passthroughs that never reach the native H3 wrapper, including one-warning disablement and retained-history release.
 
 A community compatibility report confirmed that revision `dc6291525112cb4246f864738e5bb4e2b85446da` ran without source changes on Windows 11 with a Radeon AI PRO R9700 32 GB, PyTorch 2.9.1 + ROCm 7.2.1, and ComfyUI 0.30.0. In the reported 20-step RES multistep, 864x480, 107-frame `system_ram` workflow, the expected 14 actual and 6 forecasted evaluations reduced warm elapsed time from 212.73 s to 160.97 s (24.33% lower time; about 1.32x throughput). This validates only that exact configuration; other AMD GPUs, ROCm builds, workflows, and quality cases remain unverified. See [issue #6](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues/6).
@@ -348,6 +357,8 @@ Before any experimental mode is considered for a default or release, test 20-ste
 - each experimental setting enabled separately.
 
 Inspect video quality, generated audio, reference-audio distortion, audiovisual synchronization, total wall time, actual/discarded/replayed transformer calls, peak VRAM, and peak system RAM. Cancel during the first pass, residual evaluation, rollback replay, and offline replay. Run at least ten consecutive generations with Sol-Attn enabled and load old saved workflows to detect retained state, memory growth, deadlocks, callback duplication, WSL wedges, and compatibility regressions.
+
+For the modality split specifically, repeat the affected exact seed with `video/audio` weights `0/0`, `0.5/0`, and `0.5/0.5` in ordinary Spectrum and offline replay. The current evidence establishes that global `0.5/0.5` triggered the audio defect and global `0/0` avoided it on this seed. It does not yet establish whether `0.5/0` preserves the clean audio while retaining a video benefit.
 
 ## Repository layout
 

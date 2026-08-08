@@ -6,7 +6,13 @@ import torch
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.runtime import ForecastRetryActual, SpectrumH3Runtime
 
-TOPOLOGY = (("video", (1, 24, 2, 4, 4)), ("audio", (1, 32, 2, 8)), ("hidden", 4))
+TOPOLOGY = (
+    ("video", (1, 24, 2, 4, 4)),
+    ("audio", (1, 32, 2, 8)),
+    ("hidden", 4),
+    ("target_audio_rows", 1),
+    ("target_video_rows", 2),
+)
 LABEL = ((0, "positive"),)
 
 
@@ -898,7 +904,7 @@ def test_residual_probe_reraises_cuda_oom(monkeypatch):
     def raise_oom(*_args, **_kwargs):
         raise torch.cuda.OutOfMemoryError("probe prediction OOM")
 
-    monkeypatch.setattr(runtime.forecaster, "predict", raise_oom)
+    monkeypatch.setattr(runtime.forecaster, "predict_segments", raise_oom)
     try:
         with pytest.raises(torch.cuda.OutOfMemoryError, match="probe prediction OOM"):
             runtime.prepare_residual_probe(
@@ -1015,7 +1021,14 @@ def test_audio_only_residual_does_not_change_anchor_feedback_schedule():
         expected_shape=(1, 3, 4),
     )
     assert not actual
-    expected = runtime.forecaster.predict(
+    expected_audio = runtime.forecaster.predict(
+        decision["coordinate"],
+        runtime.config.audio_blend_weight,
+        rows=(0,),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    expected_video = runtime.forecaster.predict(
         decision["coordinate"],
         runtime.config.blend_weight,
         rows=(0,),
@@ -1029,8 +1042,58 @@ def test_audio_only_residual_does_not_change_anchor_feedback_schedule():
         device=torch.device("cpu"),
         dtype=torch.float32,
     )
-    torch.testing.assert_close(observed, expected)
+    torch.testing.assert_close(observed[:, :1], expected_audio[:, :1])
+    torch.testing.assert_close(observed[:, 1:], expected_video[:, 1:])
     runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+
+def test_distinct_modality_blends_fail_closed_without_target_row_metadata():
+    runtime = _runtime()
+    runtime.start_run(
+        torch.tensor([1.0, 0.75, 0.5, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    topology = (("tiny", 1),)
+    for timestep in (1.0, 0.75):
+        decision = runtime.begin_step(torch.tensor([timestep]))
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=topology,
+            labels=LABEL,
+            expected_shape=(1, 3, 4),
+        )
+        assert actual
+        runtime.observe_actual(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            torch.zeros(1, 3, 4),
+        )
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    decision = runtime.begin_step(torch.tensor([0.5]))
+    call_id, actual = runtime.begin_model_call(
+        decision["run_id"],
+        decision["step_id"],
+        topology=topology,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert not actual
+    assert runtime.predict(
+        decision["run_id"],
+        decision["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    ) is None
+    assert runtime.disabled_reason == "packed H3 topology does not expose the target audio/video boundary"
+    runtime.abort_step(decision["run_id"], decision["step_id"])
+    runtime.end_run(decision["run_id"])
 
 
 def test_anchor_feedback_skips_probes_after_refresh_budget():
@@ -1156,6 +1219,13 @@ def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_call
     assert runtime.stats.offline_validation_anchors == 2
     assert runtime.stats.offline_attenuated_predictions == 2
     assert runtime.stats.offline_effective_blend_min < runtime.config.blend_weight
+    assert runtime.stats.offline_effective_audio_blend_min == 0.0
+    assert runtime.stats.offline_effective_audio_blend_mean == 0.0
+    assert runtime.stats.offline_effective_audio_blend_max == 0.0
+    assert runtime.stats.offline_local_only_audio_predictions == 2
+    assert runtime.stats.offline_attenuated_video_predictions == 2
+    assert 0.0 < runtime.stats.offline_effective_video_blend_min
+    assert runtime.stats.offline_effective_video_blend_max < runtime.config.blend_weight
     actual_features = {anchor.step_id: anchor.feature.clone() for anchor in archive.anchors}
     runtime.end_run(run_id)
 
@@ -1203,6 +1273,11 @@ def test_offline_archive_survives_causal_eviction_and_replay_uses_no_actual_call
     assert "offline_validation_samples_per_branch=12" in summary
     assert "offline_attenuated_predictions=2" in summary
     assert "offline_effective_blend_mean=" in summary
+    assert "video_blend_weight=0.500000" in summary
+    assert "audio_blend_weight=0.000000" in summary
+    assert "offline_effective_audio_blend_max=0.000000" in summary
+    assert "offline_effective_video_blend_mean=" in summary
+    assert "offline_local_only_audio_predictions=2" in summary
     assert "offline_full_schedule_estimated_mib=" in summary
     assert "history_device='cpu'" in summary
     runtime.end_run(replay_id)

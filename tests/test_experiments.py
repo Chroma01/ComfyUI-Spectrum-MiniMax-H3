@@ -111,12 +111,14 @@ def test_offline_smoother_uses_future_anchor_and_reuses_actual_features_exactly(
         degree=1,
         ridge_lambda=0.1,
         blend_weight=0.5,
+        audio_blend_weight=0.5,
     )
     second = OfflineSmoother(
         second_archive,
         degree=1,
         ridge_lambda=0.1,
         blend_weight=0.5,
+        audio_blend_weight=0.5,
     )
     kwargs = {"rows": (0,), "device": torch.device("cpu"), "dtype": torch.float16}
     first_middle = first.predict(1, **kwargs)
@@ -160,7 +162,8 @@ def test_offline_spectral_weights_preserve_constant_trajectories_under_ridge():
             dtype=torch.float32,
         )
         torch.testing.assert_close(prediction, torch.full_like(prediction, 4.0))
-        assert smoother._forecast_weights[(step_id, 0)].sum().item() == pytest.approx(1.0)
+        for stream_index in range(2):
+            assert smoother._forecast_weights[(step_id, 0, stream_index)].sum().item() == pytest.approx(1.0)
 
 
 def test_offline_smoother_attenuates_spectral_fit_that_loses_validation():
@@ -176,8 +179,12 @@ def test_offline_smoother_attenuates_spectral_fit_that_loses_validation():
     assert smoother.validation_stream_count == 2
     assert smoother.validation_anchor_count == 3
     assert smoother.attenuated_prediction_count == 4
-    assert 0.0 < smoother.effective_blend_min < smoother.effective_blend_max < 0.5
-    assert smoother.effective_blend_min < smoother.effective_blend_mean < smoother.effective_blend_max
+    assert smoother.local_only_prediction_counts["audio"] == 4
+    assert smoother.attenuated_prediction_counts["video"] == 4
+    assert smoother.effective_blend_stream_stats["audio"] == (0.0, 0.0, 0.0)
+    video_min, video_mean, video_max = smoother.effective_blend_stream_stats["video"]
+    assert 0.0 < video_min < video_max < 0.5
+    assert video_min < video_mean < video_max
 
 
 def test_offline_smoother_validates_audio_and_video_independently():
@@ -194,7 +201,8 @@ def test_offline_smoother_validates_audio_and_video_independently():
 
     assert smoother.validation_stream_max_scores["audio"] > 1.0
     assert smoother.validation_stream_max_scores["video"] <= 1.0
-    assert smoother.effective_blend_max < 0.5
+    assert smoother.effective_blend_stream_stats["audio"] == (0.0, 0.0, 0.0)
+    assert smoother.effective_blend_stream_stats["video"] == (0.5, 0.5, 0.5)
     prediction = smoother.predict(
         1,
         rows=(0,),
@@ -202,6 +210,19 @@ def test_offline_smoother_validates_audio_and_video_independently():
         dtype=torch.float32,
     )
     assert prediction.shape == (1, 2, 16)
+    local = OfflineSmoother(
+        archive,
+        degree=1,
+        ridge_lambda=0.1,
+        blend_weight=0.0,
+    ).predict(
+        1,
+        rows=(0,),
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    torch.testing.assert_close(prediction[:, :1], local[:, :1])
+    assert not torch.equal(prediction[:, 1:], local[:, 1:])
 
 
 def test_offline_archive_shares_owned_storage_on_selected_device():

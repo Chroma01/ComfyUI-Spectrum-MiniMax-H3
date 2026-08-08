@@ -74,6 +74,7 @@ def _run(
             flex_window=0.0,
             bootstrap_first_forecast=False,
             selective_rollback_correction=True,
+            audio_blend_weight=0.5,
         )
     )
     sigmas = torch.tensor([1.0, 0.75, 0.5, 0.25, 0.0])
@@ -190,6 +191,7 @@ def test_selective_rollback_replays_forecast_and_anchor_at_corrected_latents(mon
     assert runtime.stats.replayed_transformer_calls == 2
     assert runtime.stats.actual_transformer_calls == 5
     runtime.end_run(run_id)
+
 
 
 def test_selective_rollback_no_trigger_matches_the_unreplayed_euler_path(monkeypatch):

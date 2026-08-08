@@ -101,6 +101,16 @@ class RuntimeStats:
     offline_effective_blend_min: float = 0.0
     offline_effective_blend_mean: float = 0.0
     offline_effective_blend_max: float = 0.0
+    offline_effective_audio_blend_min: float = 0.0
+    offline_effective_audio_blend_mean: float = 0.0
+    offline_effective_audio_blend_max: float = 0.0
+    offline_effective_video_blend_min: float = 0.0
+    offline_effective_video_blend_mean: float = 0.0
+    offline_effective_video_blend_max: float = 0.0
+    offline_attenuated_audio_predictions: int = 0
+    offline_attenuated_video_predictions: int = 0
+    offline_local_only_audio_predictions: int = 0
+    offline_local_only_video_predictions: int = 0
 
 
 @dataclass(slots=True)
@@ -199,6 +209,7 @@ class SpectrumH3Runtime:
             max_history=self.config.max_history,
             history_storage=self.config.history_storage,
         )
+
         self.stats = RuntimeStats(current_window=self.config.window_size)
         self._run_counter = 0
         self._run: _RunState | None = None
@@ -308,6 +319,51 @@ class SpectrumH3Runtime:
         self.stats.offline_effective_blend_min = smoother.effective_blend_min
         self.stats.offline_effective_blend_mean = smoother.effective_blend_mean
         self.stats.offline_effective_blend_max = smoother.effective_blend_max
+        audio_blends = smoother.effective_blend_stream_stats.get("audio", (0.0, 0.0, 0.0))
+        video_blends = smoother.effective_blend_stream_stats.get("video", (0.0, 0.0, 0.0))
+        (
+            self.stats.offline_effective_audio_blend_min,
+            self.stats.offline_effective_audio_blend_mean,
+            self.stats.offline_effective_audio_blend_max,
+        ) = audio_blends
+        (
+            self.stats.offline_effective_video_blend_min,
+            self.stats.offline_effective_video_blend_mean,
+            self.stats.offline_effective_video_blend_max,
+        ) = video_blends
+        self.stats.offline_attenuated_audio_predictions = smoother.attenuated_prediction_counts.get("audio", 0)
+        self.stats.offline_attenuated_video_predictions = smoother.attenuated_prediction_counts.get("video", 0)
+        self.stats.offline_local_only_audio_predictions = smoother.local_only_prediction_counts.get("audio", 0)
+        self.stats.offline_local_only_video_predictions = smoother.local_only_prediction_counts.get("video", 0)
+
+    def _prediction_segments(self, call: _CallState) -> tuple[tuple[int, int, float], ...]:
+        topology = {
+            str(entry[0]): entry[1]
+            for entry in call.topology
+            if isinstance(entry, tuple) and len(entry) == 2
+        }
+        audio_rows = topology.get("target_audio_rows")
+        video_rows = topology.get("target_video_rows")
+        target_rows = call.expected_shape[1]
+        if (
+            isinstance(audio_rows, int)
+            and isinstance(video_rows, int)
+            and audio_rows > 0
+            and video_rows > 0
+            and audio_rows + video_rows == target_rows
+        ):
+            return (
+                (0, audio_rows, self.config.audio_blend_weight),
+                (audio_rows, target_rows, self.config.blend_weight),
+            )
+        if math.isclose(
+            self.config.audio_blend_weight,
+            self.config.blend_weight,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            return ((0, target_rows, self.config.blend_weight),)
+        raise ValueError("packed H3 topology does not expose the target audio/video boundary")
 
     def _residual_experiment_enabled(self) -> bool:
         return bool(
@@ -468,6 +524,7 @@ class SpectrumH3Runtime:
                 degree=self.config.degree,
                 ridge_lambda=self.config.ridge_lambda,
                 blend_weight=self.config.blend_weight,
+                audio_blend_weight=self.config.audio_blend_weight,
             )
             self._record_offline_smoother_stats()
         except (RuntimeError, ValueError) as exc:
@@ -799,9 +856,10 @@ class SpectrumH3Runtime:
 
         started = time.perf_counter()
         try:
-            shadow = self.forecaster.predict(
+            segments = self._prediction_segments(call)
+            shadow = self.forecaster.predict_segments(
                 step.coordinate,
-                self.config.blend_weight,
+                segments,
                 rows=positions,
                 device=device,
                 dtype=dtype,
@@ -928,6 +986,13 @@ class SpectrumH3Runtime:
                 "one-point bootstrap forecast requires exactly one actual history entry",
             )
             return None
+        segments = None
+        if step.mode != "replay" and not step.bootstrap_forecast:
+            try:
+                segments = self._prediction_segments(call)
+            except ValueError as exc:
+                self._fallback_or_retry(step, str(exc))
+                return None
         started = time.perf_counter()
         try:
             if step.mode == "replay":
@@ -946,9 +1011,10 @@ class SpectrumH3Runtime:
                     dtype=dtype,
                 )
             else:
-                predicted = self.forecaster.predict(
+                assert segments is not None
+                predicted = self.forecaster.predict_segments(
                     step.coordinate,
-                    self.config.blend_weight,
+                    segments,
                     rows=positions,
                     device=device,
                     dtype=dtype,
@@ -1375,6 +1441,8 @@ class SpectrumH3Runtime:
             f"forecast_calls={self.stats.forecast_model_calls} "
             f"fallbacks={self.stats.forecast_fallbacks} "
             f"bypassed_steps={self.stats.bypassed_steps} disabled={self.stats.disabled} "
+            f"video_blend_weight={self.config.blend_weight:.6f} "
+            f"audio_blend_weight={self.config.audio_blend_weight:.6f} "
             f"history_archive_s={self.stats.history_archive_seconds:.3f} "
             f"history_update_s={self.stats.history_update_seconds:.3f} "
             f"forecast_predict_s={self.stats.forecast_prediction_seconds:.3f} "
@@ -1418,6 +1486,16 @@ class SpectrumH3Runtime:
             f"offline_effective_blend_min={self.stats.offline_effective_blend_min:.6f} "
             f"offline_effective_blend_mean={self.stats.offline_effective_blend_mean:.6f} "
             f"offline_effective_blend_max={self.stats.offline_effective_blend_max:.6f} "
+            f"offline_effective_audio_blend_min={self.stats.offline_effective_audio_blend_min:.6f} "
+            f"offline_effective_audio_blend_mean={self.stats.offline_effective_audio_blend_mean:.6f} "
+            f"offline_effective_audio_blend_max={self.stats.offline_effective_audio_blend_max:.6f} "
+            f"offline_effective_video_blend_min={self.stats.offline_effective_video_blend_min:.6f} "
+            f"offline_effective_video_blend_mean={self.stats.offline_effective_video_blend_mean:.6f} "
+            f"offline_effective_video_blend_max={self.stats.offline_effective_video_blend_max:.6f} "
+            f"offline_attenuated_audio_predictions={self.stats.offline_attenuated_audio_predictions} "
+            f"offline_attenuated_video_predictions={self.stats.offline_attenuated_video_predictions} "
+            f"offline_local_only_audio_predictions={self.stats.offline_local_only_audio_predictions} "
+            f"offline_local_only_video_predictions={self.stats.offline_local_only_video_predictions} "
             f"offline_archive_mib={self.stats.offline_archive_bytes / (1024 * 1024):.1f} "
             f"offline_full_schedule_estimated_mib={self.stats.offline_estimated_archive_bytes / (1024 * 1024):.1f} "
             f"direct_history_updates={self.stats.direct_history_updates} "

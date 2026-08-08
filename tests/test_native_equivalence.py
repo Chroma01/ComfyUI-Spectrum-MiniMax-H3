@@ -128,6 +128,7 @@ def test_forced_actual_wrapper_is_native_equivalent_and_does_not_mutate_options(
     runtime.end_run(run_id)
 
 
+
 def test_actual_capture_avoids_full_audio_video_concatenation(monkeypatch):
     _, _, PackedLayout = _native_imports()
     model, _ = _tiny_model()
@@ -200,8 +201,8 @@ def test_exact_forecast_reproduces_the_native_audio_video_velocity(monkeypatch):
     # Patch the forecaster, not the runtime, so all step bookkeeping still runs.
     monkeypatch.setattr(
         HistoryWeightForecaster,
-        "predict",
-        lambda self, coordinate, blend_weight, *, rows, device, dtype: captured["target"].to(
+        "predict_segments",
+        lambda self, coordinate, segment_blends, *, rows, device, dtype: captured["target"].to(
             device=device, dtype=dtype
         ),
     )

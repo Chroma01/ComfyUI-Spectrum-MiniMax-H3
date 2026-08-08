@@ -185,6 +185,7 @@ def test_offline_outer_sample_restarts_from_cloned_inputs_and_callbacks_only_rep
             tail_actual_steps=0,
             bootstrap_first_forecast=False,
             offline_smoothing_replay=True,
+            audio_blend_weight=0.5,
         )
     )
     guider = SimpleNamespace(

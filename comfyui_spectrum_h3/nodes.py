@@ -35,7 +35,16 @@ class SpectrumApplyMiniMaxH3:
             "required": {
                 "model": ("MODEL",),
                 "enabled": ("BOOLEAN", {"default": True}),
-                "blend_weight": ("FLOAT", {"default": 0.50, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "blend_weight": (
+                    "FLOAT",
+                    {
+                        "default": 0.50,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": "Video spectral share. Audio uses the separate audio_blend_weight setting.",
+                    },
+                ),
                 "degree": (
                     "INT",
                     {
@@ -96,6 +105,19 @@ class SpectrumApplyMiniMaxH3:
                         "tooltip": "Experimental two-pass replay using past and future actual anchors.",
                     },
                 ),
+                "audio_blend_weight": (
+                    "FLOAT",
+                    {
+                        "default": 0.0,
+                        "min": 0.0,
+                        "max": 1.0,
+                        "step": 0.01,
+                        "tooltip": (
+                            "Audio spectral share. The default 0 uses two-point audio prediction because "
+                            "nonzero shared spectral blending caused repeatable speech distortion on H3."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -122,6 +144,7 @@ class SpectrumApplyMiniMaxH3:
         anchor_residual_feedback=False,
         selective_rollback_correction=False,
         offline_smoothing_replay=False,
+        audio_blend_weight=0.0,
     ):
         if not enabled:
             return (model,)
@@ -157,6 +180,7 @@ class SpectrumApplyMiniMaxH3:
             anchor_residual_feedback=anchor_residual_feedback,
             selective_rollback_correction=selective_rollback_correction,
             offline_smoothing_replay=offline_smoothing_replay,
+            audio_blend_weight=float(audio_blend_weight),
             debug=bool(debug),
         ).validate()
         patched = model.clone()
