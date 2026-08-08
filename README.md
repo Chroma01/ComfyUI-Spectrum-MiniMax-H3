@@ -10,14 +10,19 @@ This repository is independent from [ComfyUI-Spectrum-Proper](https://github.com
 
 Spectrum is an approximate accelerator, not a lossless or bit-identical execution path. Forecasted steps change the denoising trajectory, so outputs can differ even when the prompt, seed, model, sampler, and workflow are otherwise identical.
 
-Initial testing did not reveal obvious differences in several outputs, but broader exact-seed A/B testing has since exposed two distinct kinds of changes:
+The current `degree=1`, `warmup_steps=1`, `bootstrap_first_forecast=true` defaults are an aggressive, performance-oriented configuration. In local exact-seed testing with the pruned BF16 checkpoint at approximately 0.8 MP, they did not produce an obvious visible or audible quality decrease. That result does not establish the same tolerance for every checkpoint, resolution, generation mode, or prompt.
+
+Broader exact-seed A/B testing and early user reports have exposed several kinds of changes:
 
 - **Trajectory deviations:** during fast or brief actions, the motion, pose, timing, gaze, or action path can diverge from the fully native run. For example, a subject may look up, move differently, or follow a different short motion than in the native output.
-- **Localized quality degradation during fast motion:** when eyes, fingers, fingernails, or other small articulated details move quickly or are visible only briefly, those details can become malformed or unstable.
+- **Visual degradation:** eyes, fingers, fingernails, faces, limbs, or other articulated details can become malformed or unstable. Reported symptoms include distorted anatomy and additional limbs, especially in demanding motion.
+- **Audio degradation:** aggressive settings can distort generated audio as well as video. Reference-audio distortion has been reported with the Reference Model, and audiovisual synchronization should also be checked.
 
-These effects can occur independently or together. A rapid action may simply follow a different trajectory without obvious artifacting, while in another output the fast-moving or briefly visible details may also degrade. Further local testing and user reports have shown both behaviors. These are qualitative observations rather than a controlled quality benchmark; the effect varies with the prompt, motion, sampler, resolution, references, and Spectrum settings.
+These effects can occur independently or together. Current evidence does not isolate a single cause. Checkpoint type and precision, output resolution, prompt and motion complexity, reference-audio conditioning, sampler and scheduler, the number of early native steps, the one-point bootstrap, and the total sampling-step count may all affect stability. Lower resolutions and heavily quantized model configurations may have less margin for absorbing forecast error, but this remains a hypothesis rather than a controlled finding.
 
-Use Spectrum when the speed benefit is worth possible output differences. Disable it when maximum fidelity to the native MiniMax H3 trajectory is more important. For quality-critical work, compare the same prompt and seed with Spectrum enabled and disabled.
+For quality-critical work, compare the same prompt and seed with Spectrum enabled and disabled. If the aggressive defaults cause visible or audible degradation, increase `degree` and `warmup_steps` and disable `bootstrap_first_forecast`; the [conservative quality-first preset](#conservative-quality-first-preset) below is a starting point. Increasing the total sampling-step count may also be necessary for reference-audio generations. One user reported reference-audio distortion with the aggressive defaults: increasing `degree` and `warmup_steps` helped, and a 30-step run with those increased settings produced clean audio on their setup.
+
+Use Spectrum when the speed benefit is worth possible output differences. Disable it when maximum fidelity to the native MiniMax H3 trajectory is more important.
 
 ## Supported native path
 
@@ -60,7 +65,7 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 
 ## Parameters
 
-| Parameter | Preliminary default | Meaning |
+| Parameter | Preliminary performance default | Meaning |
 |---|---:|---|
 | `enabled` | `true` | Enables the clone-local Spectrum runtime. |
 | `blend_weight` | `0.50` | Spectral share of the prediction. The remainder is a two-point local linear forecast. |
@@ -77,7 +82,7 @@ The node accepts and returns `MODEL`. Disabled mode returns the original model o
 
 Every value is validated. `max_history` must be at least `degree + 1`.
 
-### Preliminary default preset
+### Preliminary performance preset (default)
 
 ```text
 blend_weight = 0.50
@@ -92,14 +97,14 @@ history_storage = system_ram
 bootstrap_first_forecast = true
 ```
 
-### Provisional aggressive preset
+### Conservative quality-first preset
 
 ```text
-blend_weight = 0.75
+blend_weight = 0.50
 degree = 4
 ridge_lambda = 0.10
 window_size = 2.0
-flex_window = 3.0
+flex_window = 0.75
 warmup_steps = 5
 tail_actual_steps = 1
 max_history = 8
@@ -107,7 +112,7 @@ history_storage = system_ram
 bootstrap_first_forecast = false
 ```
 
-The default degree, warmup, tail, and one-point bootstrap are preliminary pending broader prompt, sampler, and quality coverage. Existing workflows retain their saved input values. The aggressive preset remains an explicit alternative and disables the degree-1-only bootstrap.
+The preliminary defaults prioritize throughput and have not been established as universally quality-safe. Existing workflows retain their saved input values. The quality-first preset changes only the forecast degree, warmup, and bootstrap behavior relative to the defaults: it keeps the first five solver steps native, waits for the five actual history points required by degree 4, and does not use the one-point hold. It reduces the speed benefit and is a starting point rather than a guarantee; exact-seed Spectrum-on/Spectrum-off validation remains necessary for the intended workflow.
 
 ## Adaptive schedule
 
@@ -123,7 +128,7 @@ Schedule counts depend on the sampler safeguards and whether the experimental on
 
 ### Experimental one-point bootstrap
 
-`bootstrap_first_forecast=true` (the preliminary default) enables an H3-specific zero-order hold for solver step 1. It requires:
+`bootstrap_first_forecast=true` (the preliminary performance default) enables an H3-specific zero-order hold for solver step 1. It requires:
 
 ```text
 degree = 1
@@ -204,6 +209,8 @@ The native path is used when forecasting is unsupported or cannot be proven safe
 
 Split conditional calls are assigned by ComfyUI's `cond_or_uncond` and UUID labels. Row allocation is transactional. If correspondence becomes incomplete after an earlier subcall forecast, the entire `predict_noise` attempt is discarded and rerun as an actual step. Exceptions abort the active step without advancing scheduler state, preserve the original traceback, and outer-run teardown releases all history.
 
+If a downstream model or cache patch returns a successful `predict_noise` result without reaching the native MiniMax H3 wrapper, Spectrum accepts that result as a passthrough, disables itself for the rest of the run, and releases its forecast history. One warning identifies the bypass. This preserves the other patch's execution path without letting Spectrum continue from an unobserved solver step.
+
 Model wrappers are registered on the cloned `ModelPatcher`. A clone callback creates a new runtime for every downstream clone. The shared inner H3 module stores no Spectrum state and is never monkey-patched.
 
 ## Validation status
@@ -219,11 +226,12 @@ Automated tests cover:
 - target audio/video segment ordering and sanitization;
 - model detection and clone runtime isolation;
 - exact native versus wrapped forced-actual video/audio output on a deterministic tiny native H3 fixture;
-- proof that a forecast fixture invokes zero H3 transformer blocks.
+- proof that a forecast fixture invokes zero H3 transformer blocks;
+- downstream `predict_noise` passthroughs that never reach the native H3 wrapper, including one-warning disablement and retained-history release.
 
 A community compatibility report confirmed that revision `dc6291525112cb4246f864738e5bb4e2b85446da` ran without source changes on Windows 11 with a Radeon AI PRO R9700 32 GB, PyTorch 2.9.1 + ROCm 7.2.1, and ComfyUI 0.30.0. In the reported 20-step RES multistep, 864x480, 107-frame `system_ram` workflow, the expected 14 actual and 6 forecasted evaluations reduced warm elapsed time from 212.73 s to 160.97 s (24.33% lower time; about 1.32x throughput). This validates only that exact configuration; other AMD GPUs, ROCm builds, workflows, and quality cases remain unverified. See [issue #6](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues/6).
 
-No full MiniMax H3 checkpoint is available in the automated environment. The supplied real-checkpoint A/B runs validate the 0.5 MP VRAM allocation and show a small, variable timing benefit. Exact-seed full-checkpoint comparisons have also shown both trajectory deviations during fast or brief actions and localized degradation in rapidly moving or briefly visible details such as eyes, fingers, and fingernails. These effects can occur separately or together. Other resolutions, durations, CFG topologies, reference modes, hardware, decoded video metrics, audio metrics, and audiovisual synchronization remain unverified. Spectrum must not be treated as lossless or output-identical to native sampling.
+No full MiniMax H3 checkpoint is available in the automated environment. The supplied real-checkpoint A/B runs validate the 0.5 MP VRAM allocation and show a small, variable timing benefit. Local exact-seed testing with the pruned BF16 checkpoint at approximately 0.8 MP did not reveal an obvious visible or audible quality decrease with the preliminary performance defaults. Other exact-seed comparisons and user reports have shown trajectory deviations, malformed rapidly moving details, distorted anatomy, additional limbs, and reference-audio distortion on some setups. In the reported reference-audio case, increasing `degree` and `warmup_steps` helped, and a 30-step run with those increased settings produced clean audio. This evidence is qualitative and does not isolate checkpoint precision, resolution, bootstrap behavior, or total step count as the cause. Other resolutions, durations, CFG topologies, reference modes, hardware, decoded video metrics, audio metrics, and audiovisual synchronization remain unverified. Spectrum must not be treated as lossless or output-identical to native sampling.
 
 ## Tests
 

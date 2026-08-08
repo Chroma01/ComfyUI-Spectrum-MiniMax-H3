@@ -3,6 +3,7 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
@@ -13,6 +14,7 @@ from comfyui_spectrum_h3.sampling import (
     min_actual_steps_after_forecast,
     min_tail_actual_steps,
     outer_sample_wrapper,
+    predict_noise_wrapper,
     sampler_is_supported,
     sampler_name,
 )
@@ -126,3 +128,47 @@ def test_easycache_on_same_model_bypasses_spectrum_run(caplog):
     assert len(calls) == 1
     assert runtime.active_run_id is None
     assert "EasyCache or LazyCache is active" in caplog.text
+
+
+def test_predict_noise_passthrough_survives_a_downstream_model_bypass(caplog):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            warmup_steps=1,
+            tail_actual_steps=0,
+            bootstrap_first_forecast=True,
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_euler",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+    )
+    guider = SimpleNamespace(model_options={BINDING_KEY: SpectrumH3Binding(runtime)})
+    calls = []
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *args, **kwargs):
+            calls.append((args, kwargs))
+            return f"intercepted-result-{len(calls)}"
+
+    try:
+        with caplog.at_level("WARNING"):
+            first = predict_noise_wrapper(
+                Executor(), "latent", torch.tensor([1.0]), {"sentinel": True}, seed=7
+            )
+            second = predict_noise_wrapper(
+                Executor(), "latent", torch.tensor([0.5]), {"sentinel": True}, seed=7
+            )
+
+        assert first == "intercepted-result-1"
+        assert second == "intercepted-result-2"
+        assert len(calls) == 2
+        assert runtime.stats.bypassed_steps == 2
+        assert runtime.active_step_id is None
+        assert caplog.text.count("accepting the wrapped result as a passthrough") == 1
+    finally:
+        runtime.end_run(run_id)
