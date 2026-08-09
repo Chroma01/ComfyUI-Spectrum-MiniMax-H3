@@ -60,7 +60,7 @@ The node adds no third-party Python dependency. It uses PyTorch and ComfyUI modu
 
 ### Updating
 
-Use v0.2.1 or newer for the corrected default audio path. Use v0.2.2 or newer for live two-pass progress reporting. Update a Git clone with:
+Use v0.2.1 or newer for the corrected default audio path. Use v0.2.2 or newer for live two-pass progress reporting. Use v0.2.4 or newer for live KJNodes MiniMax H3 TAE previews during offline replay. Update a Git clone with:
 
 ```bash
 cd ComfyUI/custom_nodes/ComfyUI-Spectrum-MiniMax-H3
@@ -82,6 +82,12 @@ MiniMax H3 model loader
 ```
 
 The node accepts and returns `MODEL`. Disabled mode returns the original model object unchanged. Enabled mode clones the model and rejects anything other than the exact native MiniMax H3 model type with a precise error.
+
+### Live previews with MiniMax H3 TAE
+
+[Kijai's MiniMax H3 TAE](https://huggingface.co/Kijai/MiniMax-H3-TAE) currently requires KJNodes' `Model Preview Override`. With offline smoothing enabled, Spectrum keeps that observational wrapper inside its two-pass sampler wrapper regardless of whether the preview node appears before or after Spectrum in the model chain. The KJ preview widget therefore updates during the compute-heavy capture pass and again during replay. Capture frames show the provisional local-only trajectory; replay frames show the accepted smoothed trajectory.
+
+Other external sampler callbacks remain replay-only. Spectrum does not invoke arbitrary callback side effects twice merely to obtain a preview.
 
 ## Parameters
 
@@ -190,7 +196,7 @@ effective_audio_blend   = audio_blend_weight / max(1, audio_validation_score)
 
 Each configured modality weight remains an upper bound. A spectral fit that validates at least as well as local interpolation retains that modality's share; a worse fit is attenuated in direct proportion to its error ratio. Audio and video use their own validation score and history weights inside one streamed packed prediction buffer, so an unreliable audio fit neither enters the default audio result nor suppresses the video blend. Spectral weights receive a minimal affine correction so they sum to one, preventing ridge regularization from moving a constant hidden trajectory.
 
-First-pass actual coordinates reuse their stored feature exactly, and every smoothed forecast requires a future actual anchor. The replay restarts from cloned original inputs, invokes zero H3 transformer blocks, runs the current replay step's native output heads and reconstruction, and advances the same deterministic solver. H3's `FinalLayer` normalizes and projects the audio and video row slices independently, so replayed video features do not enter audio through joint attention or cross-row output-head mixing. ComfyUI progress covers capture plus replay; the normal sampler bar follows the compute-heavy capture and the transformer-free replay does not create a second terminal bar. External callbacks/previews still run during the accepted replay pass only. Interruption checks remain active in both passes.
+First-pass actual coordinates reuse their stored feature exactly, and every smoothed forecast requires a future actual anchor. The replay restarts from cloned original inputs, invokes zero H3 transformer blocks, runs the current replay step's native output heads and reconstruction, and advances the same deterministic solver. H3's `FinalLayer` normalizes and projects the audio and video row slices independently, so replayed video features do not enter audio through joint attention or cross-row output-head mixing. ComfyUI progress covers capture plus replay; the normal sampler bar follows the compute-heavy capture and the transformer-free replay does not create a second terminal bar. Ordinary external sampler callbacks and their previews run during the accepted replay pass only. KJNodes' `Model Preview Override` is the deliberate exception: its preview callback runs during capture and replay. Interruption checks remain active in both passes.
 
 This is an anchor-reuse approximation. The stored actual anchors were evaluated on the first-pass trajectory, while replay generally follows a different trajectory. Future anchors improve the hidden-feature interpolation but do not make those anchors native-equivalent at the replay latent. The method is not lossless, fully corrected, or guaranteed to improve quality.
 
@@ -368,10 +374,10 @@ Automated tests cover:
 - rollback threshold and three-correction budget enforcement;
 - single-buffer modality-specific online and offline prediction with an audio-local default;
 - separate residual output-head timing, offline archive/build timing, per-modality cross-validation/effective-blend reporting, replay anchor/smoothed counts, and replay smoother history/chunk reporting;
-- continuous two-pass ComfyUI progress, capture progress callbacks, replay-only previews and external callback side effects, and clean progress completion on recoverable replay fallbacks;
+- continuous two-pass ComfyUI progress, capture progress callbacks, capture-and-replay KJ preview updates, replay-only ordinary external callback side effects and previews, and clean progress completion on recoverable replay fallbacks;
 - downstream `predict_noise` passthroughs that never reach the native H3 wrapper, including one-warning disablement and retained-history release.
 
-The v0.2.2 suite passes 173 tests against attached ComfyUI source at commit `00d02f2854892ee5b9808bc2f6348b972017886a`; two CUDA-only tests are skipped in the CPU test environment.
+The v0.2.4 suite passes 175 tests against the attached current ComfyUI source; two CUDA-only tests are skipped in the CPU test environment. GitHub Actions also passes the full test suite against the three reviewed ComfyUI revisions listed in the test matrix.
 
 A community compatibility report confirmed that revision `dc6291525112cb4246f864738e5bb4e2b85446da` ran without source changes on Windows 11 with a Radeon AI PRO R9700 32 GB, PyTorch 2.9.1 + ROCm 7.2.1, and ComfyUI 0.30.0. In the reported 20-step RES multistep, 864x480, 107-frame `system_ram` workflow, the expected 14 actual and 6 forecasted evaluations reduced warm elapsed time from 212.73 s to 160.97 s (24.33% lower time; about 1.32x throughput). This validates only that exact configuration; other AMD GPUs, ROCm builds, workflows, and quality cases remain unverified. See [issue #6](https://github.com/xmarre/ComfyUI-Spectrum-MiniMax-H3/issues/6).
 
