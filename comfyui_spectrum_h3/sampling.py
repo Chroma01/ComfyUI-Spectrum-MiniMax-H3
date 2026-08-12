@@ -319,8 +319,8 @@ def outer_sample_wrapper(
         )
     if not sampler_supports_seeded_replay(sampler):
         LOG.warning(
-            "Spectrum H3 offline smoothing replay requires ER-SDE's default seeded "
-            "noise_sampler and a reviewed replay-safe noise_scaler; running one native pass"
+            "Spectrum H3 offline smoothing replay requires ER-SDE's native seeded "
+            "noise_sampler and noise_scaler; running one native pass"
         )
         return executor(
             noise,
