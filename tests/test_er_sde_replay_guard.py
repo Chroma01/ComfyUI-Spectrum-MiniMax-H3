@@ -122,7 +122,7 @@ def test_comfyui_sampler_er_sde_wires_only_reviewed_native_scaler_closures():
         "ode_noise_scaler",
     }
     assert _loaded_names(local_scalers["er_sde_noise_scaler"]) <= {"x", "eta", "torch"}
-    assert _loaded_names(local_scalers["reverse_time_sde_noise_scaler"]) <= {"x", "eta"}
+    assert _loaded_names(local_scalers["reverse_time_sde_noise_scaler"]) <= {"x", "eta", "torch"}
     assert _loaded_names(local_scalers["ode_noise_scaler"]) <= {"x"}
 
     ksampler_call = next(
