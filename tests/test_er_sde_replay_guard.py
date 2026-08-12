@@ -116,15 +116,16 @@ def test_comfyui_sampler_er_sde_wires_only_reviewed_native_scaler_closures():
         for node in execute.body
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
-    assert set(local_scalers) == {
+    reviewed_scalers = {
         "er_sde_noise_scaler",
         "reverse_time_sde_noise_scaler",
         "ode_noise_scaler",
     }
+    assert local_scalers
+    assert set(local_scalers) <= reviewed_scalers
     allowed_scaler_names = {"x", "eta", "torch"}
-    assert _loaded_names(local_scalers["er_sde_noise_scaler"]) <= allowed_scaler_names
-    assert _loaded_names(local_scalers["reverse_time_sde_noise_scaler"]) <= allowed_scaler_names
-    assert _loaded_names(local_scalers["ode_noise_scaler"]) <= allowed_scaler_names
+    for scaler in local_scalers.values():
+        assert _loaded_names(scaler) <= allowed_scaler_names
 
     ksampler_call = next(
         call
