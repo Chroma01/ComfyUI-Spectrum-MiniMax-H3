@@ -103,6 +103,8 @@ class _RunningPair:
 @dataclass(slots=True)
 class _StreamProbe:
     count: int = 0
+    horizon_sum: float = 0.0
+    horizon_max: float = 0.0
     disagreement_sum: float = 0.0
     disagreement_max: float = 0.0
     corrected_ratio_sum: float = 0.0
@@ -121,6 +123,7 @@ class _StreamProbe:
     def record(
         self,
         *,
+        horizon: float,
         disagreement: float,
         corrected_ratio: float,
         oracle_ratio: float,
@@ -128,6 +131,7 @@ class _StreamProbe:
         candidate_ratios: dict[float, float],
     ) -> None:
         values = (
+            float(horizon),
             float(disagreement),
             float(corrected_ratio),
             float(oracle_ratio),
@@ -139,6 +143,8 @@ class _StreamProbe:
         baseline = max(float(corrected_ratio), 1e-12)
         oracle_advantage = (float(corrected_ratio) - float(oracle_ratio)) / baseline
         self.count += 1
+        self.horizon_sum += float(horizon)
+        self.horizon_max = max(self.horizon_max, float(horizon))
         self.disagreement_sum += float(disagreement)
         self.disagreement_max = max(self.disagreement_max, float(disagreement))
         self.corrected_ratio_sum += float(corrected_ratio)
@@ -161,6 +167,7 @@ class _StreamProbe:
 @dataclass(slots=True)
 class _ProbeState:
     run_id: int | None = None
+    failures: int = 0
     audio: _StreamProbe = field(default_factory=_StreamProbe)
     video: _StreamProbe = field(default_factory=_StreamProbe)
 
@@ -218,6 +225,7 @@ def _record_shadow_probe(
 
     state = _state(runtime)
     horizon = _logical_horizon(step, forecaster)
+    horizon_decay = math.exp(-_RACER_A * max(horizon - 1.0, 0.0))
     for name, start, end in runtime._stream_ranges(step.calls[0]):
         if name == "packed":
             # The shipping generic path already rejects modality-specific packed
@@ -274,8 +282,11 @@ def _record_shadow_probe(
 
         candidate_ratios: dict[float, torch.Tensor] = {}
         for theta in _TRUST_THETAS:
-            kappa = trust_kappa(float(disagreement.detach().item()), horizon, theta=theta)
-            candidate = latest + float(kappa) * (proposal - latest)
+            kappa = float(horizon_decay) * torch.sigmoid(
+                disagreement.new_tensor(_RACER_B * float(theta))
+                - _RACER_B * disagreement
+            )
+            candidate = latest + kappa.to(dtype=proposal.dtype) * (proposal - latest)
             candidate_ratios[theta] = _tensor_rms(actual - candidate) / hold_rms
 
         values = torch.stack(
@@ -289,6 +300,7 @@ def _record_shadow_probe(
         )
         resolved = values.detach().to(device="cpu", dtype=torch.float32).tolist()
         stream_probe.record(
+            horizon=horizon,
             disagreement=float(resolved[0]),
             corrected_ratio=float(resolved[1]),
             oracle_ratio=float(resolved[2]),
@@ -317,15 +329,17 @@ def _generic_anchor_evidence_with_trust_probe(
         raise
     except (RuntimeError, TypeError, ValueError, KeyError, IndexError):
         # This probe is diagnostic and must never disable or perturb the already
-        # validated generic correction path. Missing probe evidence is surfaced
-        # through a zero sample count in the run summary.
-        pass
+        # validated generic correction path. Missing probe evidence is counted
+        # instead of disabling the shipping correction path.
+        _state(runtime).failures += 1
     return evidence
 
 
 def _stream_summary(name: str, probe: _StreamProbe) -> str:
     fields = [
         f"trust_probe_{name}_samples={probe.count}",
+        f"trust_probe_{name}_horizon_mean={probe.mean(probe.horizon_sum):.6f}",
+        f"trust_probe_{name}_horizon_max={probe.horizon_max:.6f}",
         f"trust_probe_{name}_disagreement_mean={probe.mean(probe.disagreement_sum):.6f}",
         f"trust_probe_{name}_disagreement_max={probe.disagreement_max:.6f}",
         f"trust_probe_{name}_corrected_ratio_mean={probe.mean(probe.corrected_ratio_sum):.6f}",
@@ -356,6 +370,7 @@ def _debug_summary(self: SpectrumH3Runtime) -> str:
         "trust_probe=shadow_only "
         "trust_probe_observer=unblended_spectral_vs_linear "
         "trust_probe_applied=0 "
+        f"trust_probe_failures={state.failures} "
         "trust_probe_extra_transformer_nfe=0 "
         f"{_stream_summary('audio', state.audio)} "
         f"{_stream_summary('video', state.video)}"
