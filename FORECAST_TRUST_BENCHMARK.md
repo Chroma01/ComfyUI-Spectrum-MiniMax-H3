@@ -129,21 +129,97 @@ debug: enabled
 
 First verify the mechanical invariants above. The summary must report nonzero trust-probe samples and `trust_probe_failures=0` while the actual/forecast schedule and NFE remain identical to `main`.
 
-### Gate B: calibration-quality trace
+### Exploratory result: supplied 25-step ordinary run
 
-A stronger calibration run should turn would-be forecasts into exact evaluations so the probe sees short-horizon ground truth at the actual locations. With the same `full` configuration, set:
+The first real trace was accidentally run at **25 steps**, so it is not the exact 20-step parity gate above. It is still valid mechanism evidence for the 25-step regime and contains more shadow samples.
+
+First-pass schedule and probe integrity:
+
+```text
+sampler                         sample_er_sde
+steps                           25
+actual_steps                    14
+forecast_steps                  11
+actual_transformer_calls        14
+model_aware_extra_nfes          0
+trust_probe_failures            0
+trust_probe_extra_transformer_nfe 0
+trust_probe_samples             12 audio / 12 video
+trust_probe_horizon_mean        1.833333 audio / 1.833333 video
+trust_probe_horizon_max         2.0 audio / 2.0 video
+```
+
+The generic PR-39 correction still helps, and the same-direction oracle shows a further modest gain:
+
+```text
+                              audio       video
+current corrected ratio      1.542742    1.240801
+bounded-delta ratio          1.484296    1.194263
+bounded-delta advantage      3.6977%     3.7016%
+```
+
+The trust segment exposes substantially larger headroom:
+
+```text
+                              audio       video
+oracle trust ratio           0.987258    0.998710
+oracle kappa                 0.089179    0.035404
+oracle relative advantage    34.9660%    19.3114%
+```
+
+The cache-only disagreement is also informative in this trace:
+
+```text
+                              audio       video
+disagreement mean            0.721785    0.670032
+error correlation            0.859295    0.559713
+required-shrink correlation  0.907817    0.751129
+```
+
+All three fixed trust candidates improve the sampled ratio at these evaluated anchors. `theta=0.15` is the strongest of the fixed sweep on both streams:
+
+```text
+                              audio       video
+theta=0.15 ratio             0.990551    1.005021
+theta=0.15 advantage         34.7545%    18.7989%
+theta=0.25 advantage         34.4788%    18.4254%
+theta=0.40 advantage         33.4501%    17.5175%
+```
+
+Two conclusions are justified from this trace:
+
+1. The trust branch dominates the remaining same-direction scalar-gain headroom in this 25-step regime. The measured oracle advantage is roughly 9.5x the bounded-delta advantage for audio and 5.2x for video.
+2. The current corrected sampled forecast ratio is above the hold baseline (`ratio=1`) on average at these evaluated exact anchors, while oracle shrinkage moves both streams back to approximately the hold-error level. This is strong evidence that forecast distance from the latest exact anchor is a real failure axis in this regime.
+
+One limitation is decisive before applying a controller: these ordinary-run probe samples are mostly **horizon 2** (`horizon_mean=1.8333`), because the probe scores the next exact anchor from the preceding actual history. The live ER-SDE forecast decisions in this run are horizon 1. Therefore the excellent `theta=0.15` result is not yet a direct same-horizon validation of the coefficient that would be applied at the live forecast steps.
+
+The 25-step run is therefore accepted as strong Branch-B evidence, not as the final applied-controller calibration and not as the exact 20-step parity gate.
+
+### Gate B: direct horizon-1 calibration trace
+
+The next run should keep the supplied **25-step configuration** fixed and turn would-be forecasts into exact evaluations so the probe sees ground truth at the same short horizon where an applied controller would act:
 
 ```text
 model_aware_risk_threshold = 0.0
 ```
 
-The existing force-actual rule then converts forecast candidates into exact steps once the model-aware path is active. This run is intentionally slower and is for calibration evidence only; it is not a shipping configuration.
+The existing force-actual rule then converts prospective model-aware forecasts into exact steps once the model-aware path is active. This run is intentionally slower and is for calibration evidence only; it is not a shipping configuration.
 
-Verify that the probe's reported `horizon_mean` is near the short forecast horizon being calibrated and that sample count is materially larger than in the normal accelerated gate.
+Required checks:
+
+- `trust_probe_failures=0`;
+- no probe-added transformer NFE beyond the exact evaluations intentionally caused by the threshold;
+- `trust_probe_horizon_mean` should move close to `1.0` for the direct forecast locations;
+- the fixed theta sweep must be evaluated again at that horizon;
+- do not promote `theta=0.15` merely because it was best at the horizon-2-heavy ordinary trace.
+
+If a fixed candidate remains materially positive for both streams at horizon 1, the next patch may add an **opt-in applied trust controller** for same-seed output A/B. The first applied experiment should change the causal first-pass forecast weights only and leave offline smoother weight construction unchanged until separate evidence justifies modifying that path. This isolates whether better causal anchors improve the final replay trajectory without conflating the result with a second change to offline interpolation.
+
+After an applied 25-step A/B, repeat the good 20-step regime as a regression check before considering any default change.
 
 ## Promotion gate for the next applied mechanism
 
-Do not alter `full` from this probe alone. Promote an applied mechanism only after real H3 evidence resolves which branch has actual headroom.
+Do not alter the default `full` path from this probe alone. Promote an applied mechanism only after real H3 evidence resolves which branch has actual headroom at the horizon where the controller acts.
 
 ### Branch A: improve the existing residual gain
 
@@ -157,17 +233,20 @@ Prefer this branch when all of the following hold:
 
 1. **Headroom exists:** oracle segment shrinkage materially improves the generic-corrected sampled forecast ratio. A mean relative improvement around or above 2% is enough to justify a real applied experiment.
 2. **The observer is informative:** disagreement has a stable positive relationship with current forecast error and/or required shrink. Small-sample correlation from one prompt is supporting evidence, not a universal calibration claim.
-3. **A causal mapping survives another seed/prompt:** at least one fixed theta candidate improves the sampled ratio without a meaningful regression in the other stream.
-4. **Applied A/B quality is real:** once a causal mapping is implemented, compare same-seed generated outputs and forecast telemetry against the current generic-correction baseline. Do not call a feature-space percentage a perceptual-quality percentage.
+3. **The mapping is validated at the live horizon:** at least one fixed theta candidate improves the sampled ratio at the same horizon where it will be applied, without a meaningful regression in the other stream.
+4. **A causal mapping survives another seed/prompt:** the selected fixed mapping should remain useful outside the calibration trace.
+5. **Applied A/B quality is real:** once an opt-in causal mapping is implemented, compare same-seed generated outputs and forecast telemetry against the current generic-correction baseline. Do not call a feature-space percentage a perceptual-quality percentage.
 
-If this branch passes, the smallest applied patch keeps the PR-39 correction and adds one scalar trust coefficient after it:
+When the trust branch materially dominates Branch A, as it does in the supplied 25-step horizon-2-heavy trace, it should be tested first after direct-horizon calibration rather than mechanically preferring the smaller scalar-gain change.
+
+If this branch passes, the smallest applied causal patch keeps the PR-39 correction and adds one scalar trust coefficient after it:
 
 ```text
 w_corrected = existing Spectrum weights + generic latest-delta correction
-w_final = kappa * w_corrected + (1 - kappa) * one_hot(latest_anchor)
+w_final = kappa * w_corrected + (1 - kappa) * one_hot(latest_causal_anchor)
 ```
 
-This applies the trust region directly in history-weight space, so it does not require a second full-feature forecast tensor. `kappa` must be computed from bounded sampled evidence before the forecast, persisted in the per-step offline decision, and replayed exactly. The generated-path change must remain zero-extra-transformer-NFE.
+The first applied experiment should operate on the causal first-pass weights only. Offline replay intentionally uses a different, future-bracketed smoother; copying the causal trust coefficient into that smoother would combine two mechanisms and is not justified by the current probe. If better first-pass trust improves the retained exact anchors, that improvement will already propagate into the replay archive.
 
 Hard refresh/re-pay scheduling is intentionally deferred. It changes exact-step placement and interacts with native sampler history, offline replay, ER-SDE tail protection, rollback, and schedule accounting. Continuous trust shrinkage is the lower-regression-risk mechanism to validate first.
 
@@ -176,7 +255,7 @@ Hard refresh/re-pay scheduling is intentionally deferred. It changes exact-step 
 The shadow telemetry is designed to make the next decision explicit:
 
 - **Large bounded-delta advantage:** improve causal gain estimation around the already-successful PR-39 correction.
-- **Large trust oracle advantage + useful disagreement correlation:** implement causal disagreement-controlled shrinkage.
+- **Large trust oracle advantage + useful disagreement correlation:** calibrate and then test causal disagreement-controlled shrinkage.
 - **Large trust oracle advantage + weak disagreement signal:** retain the trust-segment idea and search for a better cache-only observer.
-- **Both branches show material headroom:** test the scalar-gain improvement first because it is the smaller state-space change, then retest trust shrinkage on top of it.
+- **Both branches show material headroom:** follow the materially dominant branch after matching the calibration horizon; use implementation size only as a tie-breaker.
 - **Small headroom in both:** the PR-39 breach is close to saturated under this local geometry; move to a different forecast representation or coordinate rather than reviving rejected K=2/FinalLayer-adjoint families.
