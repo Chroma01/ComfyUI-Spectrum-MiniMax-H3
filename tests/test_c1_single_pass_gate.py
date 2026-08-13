@@ -133,7 +133,9 @@ def test_c1_single_pass_trust_is_mechanically_isolated():
     assert candidate["actual_calls"] == baseline["actual_calls"]
     assert candidate["actual_calls"] == sum(candidate["decisions"])
     assert candidate["fallbacks"] == baseline["fallbacks"] == 0
-    assert candidate["decisions"][-2:] == (True, True)
+    assert candidate["decisions"][-1] is True
+    assert candidate["reasons"][-1] == "final actual tail"
+    assert candidate["reasons"][-2] != "ER-SDE offline replay penultimate exact anchor"
 
     baseline_summary = str(baseline["summary"])
     candidate_summary = str(candidate["summary"])

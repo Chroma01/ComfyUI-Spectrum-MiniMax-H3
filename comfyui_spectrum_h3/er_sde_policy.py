@@ -28,8 +28,9 @@ def _begin_step(self: SpectrumH3Runtime, timestep: Any) -> dict[str, Any]:
         # naturally forecast penultimate step bracketed by exact steps 22 and 24.
         # Promote only that vulnerable decision. Schedules whose penultimate step
         # is already actual (including the normal 20- and 32-step schedules) are
-        # left completely untouched.
-        reason = "ER-SDE offline replay penultimate exact anchor"
+        # left completely untouched. Reuse the existing terminal-tail reason so
+        # diagnostics and saved expectations do not invent a second tail category.
+        reason = "final actual tail"
         step.mode = "actual"
         step.reason = reason
         step.adaptive_recompute = False
