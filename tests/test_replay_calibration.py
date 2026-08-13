@@ -161,8 +161,10 @@ def test_predictor_boundary_does_not_use_withheld_target():
             assert row_a[key] == pytest.approx(row_b[key])
         else:
             assert row_a[key] == row_b[key]
+    # Mutating only the withheld target changes post-target scoring state while
+    # the complete deployable predictor snapshot above remains unchanged.
     assert row_a["local_error_sq_mean"] != pytest.approx(row_b["local_error_sq_mean"])
-    assert row_a["oracle_weight"] != pytest.approx(row_b["oracle_weight"])
+    assert row_a["local_ratio"] != pytest.approx(row_b["local_ratio"])
 
 
 def test_calibration_is_video_only():
