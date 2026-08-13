@@ -2,143 +2,108 @@
 
 This document records the forecasting-quality investigation that follows PR #39.
 
-## Starting point
+## Starting point: PR #39
 
-PR #39 established one useful generic correction mechanism on real MiniMax-H3:
+PR #39 established one useful causal scalar correction mechanism on real MiniMax-H3:
 
 ```text
-d = latest_exact - previous_exact
+d_causal = latest_exact - previous_exact
 r = actual - forecast_uncorrected
-g = projection of r onto d
-corrected = forecast + g * d
+g = projection of r onto d_causal
+corrected = forecast + g * d_causal
 ```
 
-The scalar gain is confidence-scaled and bounded. The final same-seed PR #39 gate reduced the measured hidden-feature forecast ratio by approximately **6.2% for audio** and **5.5% for video** relative to the uncorrected forecast. These are hidden-feature forecast-error improvements. They are not perceptual-quality percentages.
+The gain is confidence-scaled and bounded. The final same-seed PR #39 gate reduced measured hidden-feature forecast ratio by about **6.2% for audio** and **5.5% for video** relative to the uncorrected forecast. These are hidden-feature forecast-error improvements, not perceptual-quality percentages.
 
-PR #39 retired K=2 causal trajectory correction, FinalLayer-transformed correction directions, previous-error directions, and related model-specific correction geometry after real H3 tests failed to materially beat the scalar latest-delta baseline.
+K=2 causal trajectory correction, FinalLayer-transformed directions, previous-error directions, and related model-specific correction families remain retired.
 
-PR #45 investigates forecast trust distance while preserving the successful PR #39 generic correction.
+PR #45 investigates the next forecast-quality breach while preserving the successful PR #39 causal mechanism.
 
-## Causal trust observer
+## Causal trust result remains supported
 
-The causal shadow probe compares the global Chebyshev forecast with the local linear/secant forecast on existing bounded per-stream evidence samples:
-
-```text
-p_spectral = global Chebyshev forecast
-p_linear   = local linear/secant forecast
-
-disagreement =
-    RMS(p_spectral - p_linear)
-    / max(RMS(p_spectral), epsilon)
-```
-
-The calibrated causal trust segment is:
+The causal observer compares the global Chebyshev proposal with the local linear/secant proposal on existing bounded cache evidence:
 
 ```text
-p_trust = latest_exact + kappa * (p_corrected - latest_exact)
+disagreement = RMS(p_spectral - p_linear) / max(RMS(p_spectral), epsilon)
 
 kappa =
     exp(-0.3 * max(horizon - 1, 0))
-    * sigmoid(4.0 * (theta - disagreement))
+    * sigmoid(4.0 * (0.15 - disagreement))
 ```
 
-The fixed applied causal candidate uses `theta=0.15`. The ordinary shadow sweep also reports `theta=0.25` and `theta=0.40`.
-
-## Causal calibration evidence
-
-### Normal accelerated 25-step ER-SDE trace
+The calibrated causal segment is:
 
 ```text
-sampler                         sample_er_sde
-steps                           25
+latest causal exact anchor -> corrected causal proposal
+```
+
+Normal accelerated 25-step native `sample_er_sde` trace:
+
+```text
 actual_steps                    14
 forecast_steps                  11
 actual_transformer_calls        14
-model_aware_extra_nfes          0
-trust_probe_samples             12 audio / 12 video
-trust_probe_horizon_mean        1.833333 audio / 1.833333 video
-```
+model_aware_extra_nfes           0
 
-Current PR #39 correction:
-
-```text
                               audio       video
 raw forecast ratio            1.650739    1.307939
-current corrected ratio       1.542742    1.240801
-```
-
-Causal trust oracle and fixed `theta=0.15`:
-
-```text
-                              audio       video
-oracle ratio                  0.987258    0.998710
-oracle kappa mean             0.089179    0.035404
-oracle advantage             +34.9660%   +19.3114%
+PR #39 corrected ratio        1.542742    1.240801
+causal oracle ratio           0.987258    0.998710
+causal oracle advantage      +34.9660%   +19.3114%
 theta=0.15 ratio              0.990551    1.005021
 theta=0.15 advantage         +34.7545%   +18.7989%
 ```
 
-### Direct horizon-1 calibration
+The direct horizon-1 calibration also remained strongly positive at `+30.1357%` audio / `+15.1502%` video for `theta=0.15`.
 
-A single 25-step `model_aware_risk_threshold=0.0` trace intentionally paid for exact targets at every logical step:
+**Conclusion:** causal trust distance remains a supported failure axis. This result applies to the causal/single-pass geometry.
 
-```text
-actual_steps                    25
-forecast_steps                  0
-actual_transformer_calls        25
-model_aware_extra_nfes          22
-first-pass sampler wall time    352.156 s
-trust_probe_samples             23 audio / 23 video
-trust_probe_horizon             exactly 1
-```
+## Single-pass and offline-replay semantics
 
-Results:
+Public option:
 
 ```text
-                              audio       video
-current corrected ratio       1.456770    1.204774
-oracle ratio                  0.987952    0.999173
-oracle kappa mean             0.075656    0.015570
-oracle advantage             +31.3663%   +17.0017%
-theta=0.15 ratio              1.006423    1.021728
-theta=0.15 advantage         +30.1357%   +15.1502%
+model_aware_trust_shrinkage: bool = false
 ```
 
-Disagreement correlations:
+It remains default-off and requires `model_aware_mode="full"`.
+
+### Single-pass
+
+With:
 
 ```text
-                              audio       video
-error correlation            +0.768393   -0.118432
-required-shrink correlation  +0.766415   +0.347676
+offline_smoothing_replay=false
 ```
 
-The causal trust-distance result remains strong. The existing observer is especially strong for audio. Video remains less clean and is not treated as universally calibrated from this sample count.
+causal trust remains applied:
 
-No additional dense `risk_threshold=0.0` calibration is currently justified.
+```text
+model_aware_trust_path=causal_single_pass
+```
 
-## Offline replay data-flow audit
+### Offline replay
 
-The default workflow uses:
+With:
 
 ```text
 offline_smoothing_replay=true
 ```
 
-The first pass is deliberately local-only:
+the first pass remains local-only and the rejected causal-kappa replay transfer remains disabled:
 
 ```text
-causal_video_blend_weight=0.0
-causal_audio_blend_weight=0.0
-model_aware_causal_correction_s=0.0
+model_aware_trust_path=offline_replay_shadow_only
+model_aware_trust_applied=0
+model_aware_trust_applications=0
+model_aware_trust_replay_application=disabled_rejected_causal_transfer
 ```
 
-The first-pass skipped feature drives the sampler state and therefore determines later exact anchors. `OfflineSmoother` subsequently rebuilds forecast weights from the full retained exact-anchor archive. It combines future-bracketed local interpolation with a spectral proposal, attenuates the configured spectral blend using its leave-one-out validation scores, and applies the persisted PR #39 correction.
+The PR #39 generic replay correction remains present while its replay-specific geometry is investigated.
 
-The causal trust calibration and the offline smoother therefore operate on different proposal geometries.
+## Authoritative replay-native run
 
-## Real applied 25-step run: mechanical PASS, replay-transfer rejection
-
-The first applied real run used:
+Configuration:
 
 ```text
 sampler = sample_er_sde
@@ -149,393 +114,306 @@ model_aware_trust_shrinkage = true
 offline_smoothing_replay = true
 ```
 
-The generated output looked fine in this run. This run is not an artifact-fix test. ER-SDE exact-tail handling is already a separate solved path.
+Same workflow/seed/settings as the preceding traces.
 
-### Mechanics
-
-The ordinary accelerated schedule was preserved exactly:
+### Mechanics: PASS
 
 ```text
-actual_steps                    14
-forecast_steps                  11
-actual_transformer_calls        14
-forecast_calls                  11
-```
-
-No extra transformer work:
-
-```text
-model_aware_extra_nfes                  0
-model_aware_trust_extra_transformer_nfe 0
-```
-
-No failures:
-
-```text
+actual_steps                              14
+forecast_steps                            11
+actual_transformer_calls                  14
+model_aware_extra_nfes                     0
 fallbacks                                  0
 model_aware_failures                       0
 trust_probe_failures                       0
 model_aware_trust_failures                 0
 model_aware_trust_replay_shadow_failures   0
+model_aware_trust_extra_transformer_nfe    0
 ```
 
-ER-SDE exact tail remained intact:
+ER-SDE steps 23 and 24 remained exact final-tail steps.
 
 ```text
-step 23 = actual, reason=final actual tail
-step 24 = actual, reason=final actual tail
+model_aware_trust_total_s                    0.143981
+model_aware_trust_replay_shadow_compute_s   0.028194
 ```
 
-The causal-kappa replay transfer was genuinely active in this historical run:
+The generated output looked fine. This run is replay-geometry evidence, not an ER-SDE artifact-repair test.
+
+## Closed replay axis: latest causal hold -> current replay
+
+The replay-native LOO oracle tested:
 
 ```text
-model_aware_trust_enabled=1
-model_aware_trust_applied=1
-model_aware_trust_path=offline_replay_causal_kappa_transfer
-model_aware_trust_applications=20
+latest causal hold anchor
+    ->
+validation-attenuated corrected replay proposal
 ```
 
-Controller cost:
-
-```text
-model_aware_trust_compute_s          0.071898
-model_aware_trust_scalar_transfer_s  0.004118
-model_aware_trust_weight_apply_s     0.000338
-model_aware_trust_total_s            0.076354
-```
-
-The scheduling, NFE accounting, exact tail, failure behavior, and controller overhead all passed.
-
-### Causal trust reproduced
-
-The ordinary causal shadow result reproduced the earlier 25-step trace:
+Result:
 
 ```text
                               audio       video
-current corrected ratio       1.542742    1.240801
-oracle ratio                  0.987258    0.998710
-oracle kappa mean             0.089179    0.035404
-oracle advantage             +34.9660%   +19.3114%
-theta=0.15 ratio              0.990551    1.005021
-theta=0.15 advantage         +34.7545%   +18.7989%
+current replay baseline       0.739193    0.769209
+oracle ratio                  0.739193    0.769209
+oracle kappa mean             1.000000    1.000000
+oracle kappa min              1.000000    1.000000
+oracle kappa max              1.000000    1.000000
 ```
 
-### Replay-transfer shadow rejected the applied mapping
+Every scored target selected `kappa=1`: full retention of the replay proposal and zero movement toward the latest causal anchor.
 
-The leave-one-out replay diagnostic reported:
+Fixed-kappa sweep:
 
 ```text
-model_aware_trust_replay_shadow=loo_unattenuated_future_bracket
+AUDIO
+kappa=0.50   ratio=0.853396   advantage=-16.0403%
+kappa=0.70   ratio=0.802909   advantage= -8.9545%
+kappa=0.85   ratio=0.769044   advantage= -4.1964%
+kappa=0.95   ratio=0.748662   advantage= -1.3313%
+kappa=1.00   ratio=0.739193   advantage=  0
+
+VIDEO
+kappa=0.50   ratio=0.858995   advantage=-11.8148%
+kappa=0.70   ratio=0.815726   advantage= -6.1206%
+kappa=0.85   ratio=0.789490   advantage= -2.6678%
+kappa=0.95   ratio=0.775276   advantage= -0.7978%
+kappa=1.00   ratio=0.769209   advantage=  0
 ```
 
-Audio:
+**Conclusion:** offline replay should not be shrunk toward the latest causal anchor for the current replay geometry. No further observer tuning is justified for this exact segment because its measured oracle optimum is identically `kappa=1`.
 
-```text
-samples                         11
-replay baseline ratio           0.739193
-causal-kappa transfer ratio     0.969816
-relative advantage             -32.2191%
-```
+The old hold-axis telemetry may remain as a documented negative control, but it is no longer the replay optimization target.
 
-Video:
+## New replay breach: local endpoint beats current replay
 
-```text
-samples                         11
-replay baseline ratio           0.795838
-causal-kappa transfer ratio     0.967608
-relative advantage             -22.1356%
-```
-
-The persisted causal coefficients were small:
+The same LOO run scored the raw future-bracketed local interpolation.
 
 ```text
                               audio       video
-disagreement mean             0.567507    0.512896
-kappa mean                    0.170582    0.201150
-kappa min                     0.073230    0.100513
-kappa max                     0.362033    0.367816
+current replay baseline       0.739193    0.769209
+raw local                     0.681730    0.722708
+local->current oracle         0.681449    0.718418
+oracle advantage             +7.9232%    +6.5366%
+local->current kappa mean     0.040767    0.151893
+local->current kappa min      0.000000    0.000000
+local->current kappa max      0.448442    0.964545
 ```
 
-The future-bracketed replay proposal already scored well below the normalized hold-anchor error of `1.0`. Applying the causal coefficient retained only about 17-20% of that replay proposal and moved the result near the hold anchor. The replay-specific shadow therefore rejects the direct causal-kappa transfer.
-
-## Architectural conclusion
-
-Two separate findings are now established.
-
-### Causal geometry
+For this axis:
 
 ```text
-current corrected causal proposal:
-    audio 1.542742
-    video 1.240801
-
-theta=0.15 causal trust:
-    audio 0.990551
-    video 1.005021
+p(kappa) = local + kappa * (current_replay - local)
 ```
 
-Trust distance is a validated causal failure axis on the measured traces.
+so `kappa=0` is pure local and `kappa=1` is the current replay construction.
 
-### Offline replay geometry
+### Audio diagnosis
+
+Audio replay spectral contribution was exactly zero:
 
 ```text
-existing replay proposal:
-    audio 0.739193
-    video 0.795838
-
-causal-kappa transfer:
-    audio 0.969816
-    video 0.967608
+effective_blend_mean = 0.000000
+effective_blend_min  = 0.000000
+effective_blend_max  = 0.000000
 ```
 
-The causal coefficient does not transfer directly to the future-bracketed replay proposal.
-
-## Revised implementation semantics
-
-### Single-pass mode
-
-With `offline_smoothing_replay=false`, the calibrated causal mechanism remains applied:
+Therefore, for audio in this trace:
 
 ```text
-model_aware_trust_path=causal_single_pass
+current replay = local + persisted PR #39 generic replay correction
 ```
 
-The existing model-aware corrected history weights are shrunk toward the latest causal exact anchor using the causal `kappa`.
-
-### Default offline replay mode
-
-With `offline_smoothing_replay=true` and trust requested:
+Measured:
 
 ```text
-model_aware_trust_path=offline_replay_shadow_only
-model_aware_trust_applied=0
-model_aware_trust_applications=0
-model_aware_trust_replay_application=disabled_rejected_causal_transfer
+local      = 0.681730
+corrected  = 0.739193
 ```
 
-The causal trust calculation remains available for telemetry and for comparison with replay-native results. The causal coefficient no longer modifies offline replay weights.
+This is direct evidence that the PR #39 scalar mechanism, while useful in its validated causal geometry, is harmful when its persisted gain is transplanted onto the future-bracket replay delta in this audio trace.
 
-The replay weight builder bypasses the rejected transfer for every `OfflineSmoother` construction, including direct/internal archive construction; when trust is disabled this remains baseline-identical because the preserved builder is the existing generic-correction replay path.
+Do not remove or weaken the causal PR #39 correction. The replay-specific application is the target of the next investigation.
 
-The existing PR #39 generic replay correction remains active.
+### Video uncertainty
 
-Replay-native investigation is shadow-only:
+Video retains a nonzero validation-attenuated spectral branch:
 
 ```text
-model_aware_trust_replay_shadow=loo_validation_attenuated_replay_native_calibration
-model_aware_trust_replay_shadow_reference=validation_attenuated_corrected_future_bracket
+effective_blend_mean = 0.250490
+effective_blend_min  = 0.185651
+effective_blend_max  = 0.413509
 ```
 
-No replay controller is applied at this stage.
-
-## Replay-native shadow geometry
-
-For each withheld exact target, the shadow first removes that target from the anchor archive. It then reconstructs the two replay proposals already used by `OfflineSmoother`:
-
-- future-bracketed local interpolation;
-- global spectral interpolation from the retained cache.
-
-To match the actual smoother more closely, it also reconstructs the nearby leave-one-out validation scores using the retained cache and applies the same per-branch attenuation rule:
+Measured:
 
 ```text
-effective_blend = configured_blend / max(1.0, validation_score)
+local                  = 0.722708
+current replay         = 0.769209
+local->current oracle  = 0.718418
 ```
 
-The corrected replay proposal used for oracle/sweep scoring is therefore validation-attenuated rather than the old unattenuated diagnostic proposal.
+The regression currently contains at least two contributions:
 
-Per-stream validation-attenuated blend telemetry:
+1. validation-attenuated spectral/local blending;
+2. persisted PR #39 generic replay correction.
+
+Their individual effects are not yet identified. No production video change is justified before decomposition.
+
+## Replay observer status
+
+Video spectral-vs-local disagreement from the authoritative run:
 
 ```text
-model_aware_trust_replay_shadow_{stream}_effective_blend_mean
-model_aware_trust_replay_shadow_{stream}_effective_blend_min
-model_aware_trust_replay_shadow_{stream}_effective_blend_max
+samples                     11
+disagreement mean           0.209262
+disagreement max            0.314062
+disagreement/error corr    +0.282510
 ```
 
-These fields let the next real run verify the expected audio local-only path and the attenuated video spectral contribution directly inside the same replay-native LOO experiment.
+The old replay-disagreement/shrink and causal-disagreement/shrink correlations used the now-dead hold-axis target `1 - hold_to_replay_oracle_kappa`. Because that oracle kappa is identically `1`, the target has zero variance and is no longer useful.
 
-## Replay-native oracle
+The relevant target is now the amount of replay enhancement beyond local that should be retained, represented by `local_to_current` oracle kappa or equivalently `1 - kappa` as required local weight.
 
-For each eligible withheld exact target:
+## Current implementation gate: shadow-only replay component decomposition
+
+No new replay controller is applied in this revision.
+
+The next LOO diagnostic constructs four candidates from the same target-withheld replay cache:
 
 ```text
-h = withheld exact target
-p = validation-attenuated corrected replay proposal constructed without h
-a = persisted latest causal exact anchor available at original forecast time
-u = p - a
+A = local
 
-kappa_replay_oracle =
-    clamp(<h - a, u> / <u, u>, 0, 1)
+B = validation-attenuated spectral/local blend
+    without generic correction
 
-p_oracle = a + kappa_replay_oracle * u
+C = local
+    + current generic replay correction
+
+D = validation-attenuated spectral/local blend
+    + current generic replay correction
+
+D = current replay baseline
 ```
 
-The implementation reports for audio/video:
+For audio, `A == B` because its configured/effective spectral blend is zero. Therefore `A -> C` cleanly isolates the generic replay correction.
+
+For video, all four candidates are measured so the blend, correction, and their interaction can be separated.
+
+### Candidate telemetry
+
+Per stream, the decomposition reports ratios and relative advantage versus the current replay baseline for:
 
 ```text
-model_aware_trust_replay_shadow_{stream}_oracle_ratio_mean
-model_aware_trust_replay_shadow_{stream}_oracle_advantage_mean
-model_aware_trust_replay_shadow_{stream}_oracle_kappa_mean
-model_aware_trust_replay_shadow_{stream}_oracle_kappa_min
-model_aware_trust_replay_shadow_{stream}_oracle_kappa_max
+local
+blend_uncorrected
+local_corrected
+blend_corrected
 ```
 
-`kappa=1` is the current replay baseline. Small oracle advantage with kappa near `1` means replay shrinkage is largely exhausted on this segment. Material oracle advantage establishes headroom for replay-specific calibration.
+The final candidate is the current replay baseline and therefore has zero advantage by definition.
 
-## Fixed replay-kappa sweep
-
-The shadow-only sweep evaluates:
+Correction-specific telemetry additionally reports the relative effect of adding the generic replay correction to:
 
 ```text
-kappa = 0.50
-kappa = 0.70
-kappa = 0.85
-kappa = 0.95
-kappa = 1.00
+local
+blend_uncorrected
 ```
 
-For every coefficient:
+and a ratio-space interaction term.
+
+### New oracle axes
+
+Shadow-only oracle coefficients are reported for:
 
 ```text
-model_aware_trust_replay_shadow_{stream}_kappa_0p50_ratio_mean
-model_aware_trust_replay_shadow_{stream}_kappa_0p50_advantage_mean
-...
-model_aware_trust_replay_shadow_{stream}_kappa_1p00_ratio_mean
-model_aware_trust_replay_shadow_{stream}_kappa_1p00_advantage_mean
+local -> blend_uncorrected
+local -> local_corrected
+blend_uncorrected -> blend_corrected
+local -> current replay
 ```
 
-The `1.00` candidate reproduces the replay baseline up to floating-point tolerance.
-
-These coefficients are telemetry only. They are not user controls.
-
-## Does the causal observer transfer?
-
-The persisted causal disagreement is correlated separately with replay baseline error and required replay shrinkage:
+Each axis reports:
 
 ```text
-model_aware_trust_replay_shadow_{stream}_causal_disagreement_error_corr
-model_aware_trust_replay_shadow_{stream}_causal_disagreement_shrink_corr
+oracle ratio
+oracle advantage versus current replay baseline
+oracle kappa mean/min/max
 ```
 
-The shrink target is:
+These oracle coefficients are never applied.
+
+### Retargeted observer correlations
+
+The decomposition correlates causal disagreement and, when available, replay spectral-vs-local disagreement against:
 
 ```text
-1 - kappa_replay_oracle
+local_to_current oracle kappa
+1 - local_to_current oracle kappa
 ```
 
-These metrics test observer transfer directly without assuming the causal `kappa` mapping transfers.
-
-## Replay-native observer
-
-The replay-native shadow also compares the pure spectral and local proposals that are naturally available from the same retained cache:
+Video replay disagreement is also correlated with the isolated:
 
 ```text
-r_replay =
-    RMS(p_spectral - p_local)
-    / max(RMS(p_replay_baseline), eps)
+local -> blend_uncorrected oracle kappa
 ```
 
-The scored replay baseline remains the validation-attenuated corrected proposal. The pure branch disagreement is an observer only; it does not replace that baseline.
+Audio does not fabricate a spectral observer when spectral blend is zero.
 
-The observer is enabled only when the configured replay stream has a nonzero spectral branch. A stream with zero spectral blend does not fabricate a spectral-vs-local observer.
+### Generic replay-correction direction audit
 
-Telemetry:
+The persisted causal scalar gain was learned for:
 
 ```text
-model_aware_trust_replay_shadow_{stream}_observer
-model_aware_trust_replay_shadow_{stream}_observer_samples
-model_aware_trust_replay_shadow_{stream}_replay_disagreement_mean
-model_aware_trust_replay_shadow_{stream}_replay_disagreement_max
-model_aware_trust_replay_shadow_{stream}_replay_disagreement_error_corr
-model_aware_trust_replay_shadow_{stream}_replay_disagreement_shrink_corr
+d_causal = latest_exact - previous_exact
 ```
 
-For the observed real run, audio had configured/effective spectral blend zero, so a replay spectral-vs-local observer is intentionally absent for audio. Video has a meaningful spectral replay branch and receives the replay-native observer.
-
-## Endpoint audit
-
-The shadow records the replay-local interpolation ratio:
+Offline replay applies it to:
 
 ```text
-model_aware_trust_replay_shadow_{stream}_local_ratio_mean
+d_replay = right_future_bracket_anchor - left_future_bracket_anchor
 ```
 
-It also evaluates the best interpolation coefficient on the segment from replay-local interpolation to the validation-attenuated corrected replay proposal:
+The decomposition therefore records bounded-sample diagnostics for:
 
 ```text
-model_aware_trust_replay_shadow_{stream}_local_oracle_ratio_mean
-model_aware_trust_replay_shadow_{stream}_local_oracle_advantage_mean
-model_aware_trust_replay_shadow_{stream}_local_oracle_kappa_mean
-model_aware_trust_replay_shadow_{stream}_local_oracle_kappa_min
-model_aware_trust_replay_shadow_{stream}_local_oracle_kappa_max
+<actual - local, d_replay> / ||d_replay||^2
+<actual - blend_uncorrected, d_replay> / ||d_replay||^2
+
+cos(actual - local, d_replay)
+cos(actual - blend_uncorrected, d_replay)
+cos(d_causal, d_replay)
+
+replay-optimal projection - persisted causal gain
 ```
 
-This gives a cheap replay-native endpoint audit using candidates the smoother already computes. The withheld target is used only for shadow scoring and oracle metrics. It never enters the retained LOO forecaster history, the reconstructed validation histories, or live controller state.
+This distinguishes a replay gain-magnitude problem from replay-direction misalignment without reviving K=2, FinalLayer, or previous-error correction families.
 
-The previous/next replay bracket is used to construct the local future-bracketed proposal. The latest causal anchor remains a separately persisted causal endpoint. The corrected future-bracketed proposal remains the replay baseline. No new live endpoint is selected from this telemetry.
+## Invariants
 
-## Direct-transfer counterfactual remains visible as shadow telemetry
-
-For continuity with the rejected run, the diagnostic still reports the counterfactual causal-kappa transfer without applying it:
-
-```text
-model_aware_trust_replay_shadow_{stream}_baseline_ratio_mean
-model_aware_trust_replay_shadow_{stream}_causal_transfer_ratio_mean
-model_aware_trust_replay_shadow_{stream}_causal_transfer_advantage_mean
-```
-
-This is diagnostic evidence only.
-
-## Safety invariants
-
-The revised path preserves these invariants:
-
-- `model_aware_trust_shrinkage=false` keeps existing workflow behavior;
+- default workflow remains unchanged when trust is false;
 - single-pass causal trust remains unchanged;
-- default offline first-pass local-only capture remains unchanged;
-- offline replay never applies causal `kappa`;
-- replay-native logic is shadow-only;
-- ordinary model-aware scheduling is unchanged;
-- no hard refresh/re-pay is added;
-- no transformer evaluation is added;
-- ER-SDE exact two-logical-step tail remains intact;
+- offline first-pass local-only capture remains unchanged;
+- offline replay never applies causal kappa;
+- replay decomposition is shadow-only;
+- current production replay weights are unchanged by the decomposition;
+- PR #39 causal correction remains intact;
+- current PR #39 replay correction remains intact until measured decomposition justifies a change;
+- ordinary 14/11 scheduling remains unchanged;
+- no hard refresh/re-pay is introduced;
+- zero trust-added transformer NFE;
 - exact replay anchors remain exact;
-- target audio/video streams remain independent;
-- packed topology does not fabricate a modality split;
-- LOO targets are excluded from the main retained shadow forecaster and from nested validation histories;
-- future exact targets are used only for offline scoring/oracle telemetry;
-- non-OOM diagnostic failures do not abort replay;
+- audio/video diagnostics remain independent;
+- packed topology does not fabricate modality decomposition;
+- the scored target anchor is excluded from candidate construction and nested validation histories;
+- ordinary diagnostic failures do not abort replay;
 - CUDA OOM propagates;
-- replay shadow state is archive-scoped and resets with a new capture.
-
-## Performance accounting
-
-The real applied run measured causal trust-controller cost at approximately:
-
-```text
-0.076354 s
-```
-
-The replay-native LOO calibration runs during offline smoother construction and is reported separately:
-
-```text
-model_aware_trust_replay_shadow_compute_s
-```
-
-It is not added to `model_aware_trust_total_s`, which continues to represent the causal controller computation/synchronization/weight-application path.
-
-The existing generic model-aware evidence cost from the real run was:
-
-```text
-model_aware_overhead_s=3.648930
-model_aware_evidence_s=3.647071
-model_aware_evidence_device_transfer_s=3.024835
-```
-
-That transfer cost remains a separate optimization topic.
+- ER-SDE final two logical steps remain exact;
+- replay diagnostic state is archive-scoped.
 
 ## Next real gate
 
-Use one ordinary accelerated run:
+Run one ordinary accelerated trace:
 
 ```text
 steps = 25
@@ -546,26 +424,30 @@ model_aware_trust_shrinkage = true
 offline_smoothing_replay = true
 ```
 
-Keep the same workflow, seed, prompt, checkpoint, precision, references, resolution, frame count, scheduler, CFG, and Spectrum settings.
+Keep the same workflow/seed/settings. Do not run another dense force-actual calibration.
 
-Do not run a dense force-actual calibration.
-
-Expected mechanics:
+Expected mechanics remain:
 
 ```text
 14 actual / 11 forecast
 zero extra transformer NFE
-zero trust failures
-ER-SDE exact tail
+zero trust/replay diagnostic failures
+exact ER-SDE tail
 model_aware_trust_path=offline_replay_shadow_only
 model_aware_trust_applied=0
 model_aware_trust_applications=0
 ```
 
-Inspect the replay oracle, validation-attenuated effective blends, fixed-kappa sweep, causal-disagreement correlations, replay-native disagreement correlations, and endpoint-audit fields listed above.
+The run must answer:
 
-## Stop point
+1. exactly how much the generic replay correction helps or hurts audio;
+2. how much of the video regression comes from spectral blending;
+3. how much comes from generic replay correction;
+4. whether there is a useful blend/correction interaction;
+5. whether replay correction has the wrong scalar magnitude or a misaligned future-bracket direction;
+6. whether replay spectral-vs-local disagreement predicts how much departure from local should be retained;
+7. whether the next viable mechanism is replay-correction removal/reduction, improved replay-correction geometry, dynamic local/spectral mixture, or a measured combination.
 
-After the replay-native shadow data is collected, choose the next step from the measured result. No new replay controller is applied in this revision.
+Stop after collecting this decomposition evidence. Do not apply a new replay controller before that result.
 
-`model_aware_trust_shrinkage` remains default-off. PR #45 remains draft. A green CI run establishes implementation correctness for the covered cases; it does not establish perceptual-quality gain.
+`model_aware_trust_shrinkage` remains **false by default** and PR #45 remains **draft**.
