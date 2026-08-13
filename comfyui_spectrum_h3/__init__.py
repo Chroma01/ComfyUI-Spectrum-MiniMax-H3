@@ -5,6 +5,7 @@ from .generic_correction import install_generic_residual_correction
 from .minimax_h3 import locate_minimax_h3_inner, require_native_minimax_h3
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from .replay_component_shadow import install_replay_component_decomposition
+from .replay_shadow_composition import install_replay_shadow_composition
 from .replay_trust_shadow import install_replay_native_trust_shadow
 from .runtime import SpectrumH3Runtime
 from .trust_probe import install_forecast_trust_probe
@@ -13,6 +14,7 @@ install_generic_residual_correction()
 install_forecast_trust_probe()
 install_replay_native_trust_shadow()
 install_replay_component_decomposition()
+install_replay_shadow_composition()
 install_er_sde_tail_policy()
 
 __all__ = [
