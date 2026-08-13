@@ -195,13 +195,13 @@ class SpectrumApplyMiniMaxH3:
                 "model_aware_replay_generic_correction": (
                     "BOOLEAN",
                     {
-                        "default": True,
+                        "default": False,
                         "tooltip": (
-                            "Offline replay-only gate for model_aware_mode='full'. True preserves the current "
-                            "replay behavior that transfers the causal PR #39 generic scalar onto the future "
-                            "bracket. False is the narrow D-to-B experiment: suppress only that replay correction "
-                            "while keeping causal correction, validation attenuation, local/spectral blending, "
-                            "scheduling, and transformer NFE unchanged."
+                            "Offline replay-only legacy/ablation switch for model_aware_mode='full'. False is "
+                            "the supported default: do not transplant the causal PR #39 latest-delta scalar onto "
+                            "the different future-bracket replay direction. True explicitly restores that old "
+                            "replay transfer for regression/scientific reproduction. The causal PR #39 correction, "
+                            "validation attenuation, local/spectral blending, scheduling, and transformer NFE are unchanged."
                         ),
                     },
                 ),
@@ -236,7 +236,7 @@ class SpectrumApplyMiniMaxH3:
         model_aware_mode="off",
         model_aware_risk_threshold=0.65,
         model_aware_trust_shrinkage=False,
-        model_aware_replay_generic_correction=True,
+        model_aware_replay_generic_correction=False,
     ):
         if not enabled:
             return (model,)
