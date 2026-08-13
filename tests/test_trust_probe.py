@@ -79,6 +79,21 @@ def _attach_trust(
     return aggregate
 
 
+def _shadow_record() -> trust_module._ReplayShadowRecord:
+    return trust_module._ReplayShadowRecord(
+        step_id=2,
+        coordinate=0.2,
+        latest_anchor_id=0,
+        stream_name="audio",
+        degree=1,
+        ridge_lambda=0.1,
+        blend_weight=0.0,
+        correction_gain=0.0,
+        disagreement=0.4,
+        kappa=0.2,
+    )
+
+
 def _profile_lookup() -> ProfileLookup:
     return ProfileLookup(
         profile=ModelForecastabilityProfile(
@@ -556,20 +571,7 @@ def test_offline_replay_trust_is_deterministic():
 def test_replay_shadow_setup_failure_does_not_abort_applied_replay(monkeypatch):
     archive = _archive()
     aggregate = _attach_trust(archive, audio_kappa=0.25, video_kappa=0.4)
-    archive._model_aware_trust_replay_shadow_records = [
-        trust_module._ReplayShadowRecord(
-            step_id=2,
-            coordinate=0.2,
-            latest_anchor_id=0,
-            stream_name="audio",
-            degree=1,
-            ridge_lambda=0.1,
-            blend_weight=0.0,
-            correction_gain=0.0,
-            disagreement=0.4,
-            kappa=0.2,
-        )
-    ]
+    archive._model_aware_trust_replay_shadow_records = [_shadow_record()]
 
     def fail_shadow_setup(*_args, **_kwargs):
         raise ValueError("diagnostic setup failed")
@@ -592,20 +594,7 @@ def test_replay_shadow_setup_failure_does_not_abort_applied_replay(monkeypatch):
 def test_replay_shadow_setup_oom_still_propagates(monkeypatch):
     archive = _archive()
     _attach_trust(archive, audio_kappa=0.25, video_kappa=0.4)
-    archive._model_aware_trust_replay_shadow_records = [
-        trust_module._ReplayShadowRecord(
-            step_id=2,
-            coordinate=0.2,
-            latest_anchor_id=0,
-            stream_name="audio",
-            degree=1,
-            ridge_lambda=0.1,
-            blend_weight=0.0,
-            correction_gain=0.0,
-            disagreement=0.4,
-            kappa=0.2,
-        )
-    ]
+    archive._model_aware_trust_replay_shadow_records = [_shadow_record()]
 
     def oom(*_args, **_kwargs):
         raise torch.cuda.OutOfMemoryError("oom")
