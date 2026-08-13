@@ -3,11 +3,103 @@ from __future__ import annotations
 import pytest
 import torch
 
+from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.experiments import (
     OfflineFeatureArchive,
     OfflineSmoother,
     measure_stream_residual,
 )
+from comfyui_spectrum_h3.model_aware import (
+    ModelAwareForecastDecision,
+    SubspaceCorrectionTelemetry,
+)
+from comfyui_spectrum_h3.runtime import SpectrumH3Runtime
+
+
+def _model_decision(*, audio_blend: float, video_blend: float, correction: float = 0.0):
+    return ModelAwareForecastDecision(
+        trajectory_risk=0.2,
+        model_risk=0.3,
+        patch_risk=0.1,
+        combined_risk=0.25,
+        confidence=0.75,
+        ridge_lambda=0.2,
+        degree=1,
+        audio_blend_weight=audio_blend,
+        video_blend_weight=video_blend,
+        audio_correction_gain=correction,
+        video_correction_gain=-correction,
+        forecast_horizon=1.0,
+        force_actual=False,
+    )
+
+
+def test_offline_k2_replay_uses_archived_causal_anchor_ids_without_future_leakage():
+    coefficients = (0.1, -0.05)
+    telemetry = SubspaceCorrectionTelemetry(
+        eligible=True,
+        used_scalar_fallback=False,
+        generic_coefficients=coefficients,
+        exact_coefficients=coefficients,
+        applied_coefficients=coefficients,
+    )
+    decision = ModelAwareForecastDecision(
+        trajectory_risk=0.2,
+        model_risk=0.3,
+        patch_risk=0.1,
+        combined_risk=0.25,
+        confidence=0.75,
+        ridge_lambda=0.2,
+        degree=1,
+        audio_blend_weight=0.5,
+        video_blend_weight=0.5,
+        audio_correction_gain=0.0,
+        video_correction_gain=0.0,
+        forecast_horizon=1.0,
+        force_actual=False,
+        audio_subspace_telemetry=telemetry,
+        video_subspace_telemetry=telemetry,
+        correction_anchor_ids=(0, 2, 4),
+    )
+
+    def build(with_correction: bool):
+        archive = OfflineFeatureArchive(total_steps=7, sampler_name="sample_euler")
+        coordinates = torch.linspace(-1.0, 1.0, 7).tolist()
+        for step_id, coordinate in enumerate(coordinates):
+            archive.record_step(
+                step_id,
+                coordinate,
+                step_id % 2 == 0,
+                model_aware_decision=(decision if with_correction and step_id == 5 else None),
+            )
+        for step_id in (0, 2, 4, 6):
+            archive.record_actual(
+                step_id,
+                coordinates[step_id],
+                torch.full((1, 2, 4), float(step_id), dtype=torch.float32),
+                labels=((0, "positive"),),
+                topology=(("target_audio_rows", 1), ("target_video_rows", 1)),
+                take_ownership=True,
+            )
+        assert archive.complete(minimum_anchors=2)
+        return OfflineSmoother(
+            archive,
+            degree=1,
+            ridge_lambda=0.2,
+            blend_weight=0.5,
+            audio_blend_weight=0.5,
+        )
+
+    baseline = build(False)
+    corrected = build(True)
+    base_weights = baseline._forecast_weights[(5, 0, 0)]
+    corrected_weights = corrected._forecast_weights[(5, 0, 0)]
+    difference = corrected_weights - base_weights
+
+    torch.testing.assert_close(
+        difference,
+        torch.tensor((0.05, -0.15, 0.1, 0.0), dtype=torch.float32),
+    )
 
 
 def _archive(right_value: float) -> OfflineFeatureArchive:
@@ -223,6 +315,107 @@ def test_offline_smoother_validates_audio_and_video_independently():
     )
     torch.testing.assert_close(prediction[:, :1], local[:, :1])
     assert not torch.equal(prediction[:, 1:], local[:, 1:])
+
+
+def test_offline_replay_preserves_per_forecast_model_aware_decisions_without_index_drift():
+    archive = OfflineFeatureArchive(total_steps=5, sampler_name="sample_er_sde")
+    coordinates = torch.linspace(-1.0, 1.0, 5).tolist()
+    first_decision = _model_decision(audio_blend=0.0, video_blend=0.2)
+    second_decision = _model_decision(audio_blend=0.0, video_blend=0.8, correction=0.1)
+    for step_id, coordinate in enumerate(coordinates):
+        archive.record_step(
+            step_id,
+            coordinate,
+            step_id % 2 == 0,
+            model_aware_decision={1: first_decision, 3: second_decision}.get(step_id),
+        )
+    for step_id, value in ((0, 0.0), (2, 1.0), (4, 2.0)):
+        feature = torch.empty(1, 2, 16)
+        feature[:, 0].fill_(value)
+        feature[:, 1].fill_(value)
+        archive.record_actual(
+            step_id,
+            coordinates[step_id],
+            feature,
+            labels=((0, "positive"),),
+            topology=(("target_audio_rows", 1), ("target_video_rows", 1)),
+            take_ownership=True,
+        )
+    assert archive.complete(minimum_anchors=2)
+
+    smoother = OfflineSmoother(
+        archive,
+        degree=1,
+        ridge_lambda=0.1,
+        blend_weight=0.5,
+        audio_blend_weight=0.0,
+    )
+
+    first_archived = archive.steps[1].model_aware_decision
+    second_archived = archive.steps[3].model_aware_decision
+    assert first_archived is not None and first_archived is not first_decision
+    assert second_archived is not None and second_archived is not second_decision
+    assert first_archived.audio_blend_weight == first_decision.audio_blend_weight
+    assert first_archived.video_blend_weight == first_decision.video_blend_weight
+    assert second_archived.audio_correction_gain == second_decision.audio_correction_gain
+    assert second_archived.video_correction_gain == second_decision.video_correction_gain
+    assert all(
+        isinstance(getattr(second_archived, field), (int, float))
+        for field in (
+            "degree",
+            "ridge_lambda",
+            "audio_blend_weight",
+            "video_blend_weight",
+            "audio_correction_gain",
+            "video_correction_gain",
+        )
+    )
+    assert smoother.effective_blend_stream_stats["audio"] == (0.0, 0.0, 0.0)
+    assert smoother.effective_blend_stream_stats["video"] == pytest.approx((0.2, 0.5, 0.8))
+    assert smoother.model_aware_offline_correction_applications == 2
+    assert smoother.model_aware_offline_correction_seconds > 0.0
+    assert (
+        smoother.model_aware_correction_seconds
+        == smoother.model_aware_offline_correction_seconds
+    )
+    runtime = SpectrumH3Runtime(SpectrumH3Config(model_aware_mode="full"))
+    runtime._offline_smoother = smoother
+    runtime._record_offline_smoother_stats()
+    assert runtime.stats.model_aware_offline_correction_applications == 2
+    assert runtime.stats.model_aware_offline_correction_seconds > 0.0
+    assert runtime.stats.model_aware_causal_correction_seconds == 0.0
+    assert (
+        runtime.stats.model_aware_correction_seconds
+        == runtime.stats.model_aware_offline_correction_seconds
+    )
+    assert runtime.stats.model_aware_overhead_seconds >= (
+        runtime.stats.model_aware_fit_seconds
+        + runtime.stats.model_aware_offline_correction_seconds
+    )
+    summary = runtime.debug_summary()
+    assert "model_aware_causal_correction_s=0.000000" in summary
+    assert "model_aware_offline_replay_correction_s=" in summary
+    assert "model_aware_offline_replay_correction_applications=2" in summary
+    spectral = smoother._affine_spectral_weights(
+        smoother._forecaster.model_aware_weights(
+            coordinates[3],
+            1.0,
+            degree=second_decision.degree,
+            ridge_lambda=second_decision.ridge_lambda,
+        )
+    )
+    local = torch.tensor([0.0, 0.5, 0.5])
+    expected_step_3_video = 0.8 * spectral + 0.2 * local
+    expected_step_3_video[1] += 0.1
+    expected_step_3_video[2] -= 0.1
+    torch.testing.assert_close(
+        smoother._forecast_weights[(3, 0, 1)],
+        expected_step_3_video,
+    )
+    assert not torch.equal(
+        smoother._forecast_weights[(1, 0, 1)],
+        smoother._forecast_weights[(3, 0, 1)],
+    )
 
 
 def test_offline_archive_shares_owned_storage_on_selected_device():

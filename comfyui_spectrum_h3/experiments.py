@@ -9,7 +9,7 @@ from typing import Any
 import torch
 
 from .forecast import HistoryWeightForecaster
-
+from .model_aware import ModelAwareForecastDecision
 
 DEFAULT_CHUNK_BYTES = 32 * 1024 * 1024
 OFFLINE_VALIDATION_SAMPLES = 16 * 1024
@@ -99,10 +99,57 @@ def measure_stream_residual(
 
 
 @dataclass(frozen=True, slots=True)
+class OfflineModelAwareDecision:
+    degree: int
+    ridge_lambda: float
+    audio_blend_weight: float
+    video_blend_weight: float
+    audio_correction_gain: float
+    video_correction_gain: float
+    audio_correction_coefficients: tuple[float, ...] = ()
+    video_correction_coefficients: tuple[float, ...] = ()
+    correction_anchor_ids: tuple[int, ...] = ()
+
+    @classmethod
+    def from_runtime(
+        cls,
+        decision: ModelAwareForecastDecision,
+    ) -> OfflineModelAwareDecision:
+        return cls(
+            degree=int(decision.degree),
+            ridge_lambda=float(decision.ridge_lambda),
+            audio_blend_weight=float(decision.audio_blend_weight),
+            video_blend_weight=float(decision.video_blend_weight),
+            audio_correction_gain=float(decision.audio_correction_gain),
+            video_correction_gain=float(decision.video_correction_gain),
+            audio_correction_coefficients=(
+                tuple(decision.audio_subspace_telemetry.applied_coefficients)
+                if decision.audio_subspace_telemetry.eligible
+                else (
+                    (float(decision.audio_correction_gain),)
+                    if decision.audio_correction_gain != 0.0
+                    else ()
+                )
+            ),
+            video_correction_coefficients=(
+                tuple(decision.video_subspace_telemetry.applied_coefficients)
+                if decision.video_subspace_telemetry.eligible
+                else (
+                    (float(decision.video_correction_gain),)
+                    if decision.video_correction_gain != 0.0
+                    else ()
+                )
+            ),
+            correction_anchor_ids=tuple(decision.correction_anchor_ids),
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class OfflineStepRecord:
     step_id: int
     coordinate: float
     actual: bool
+    model_aware_decision: OfflineModelAwareDecision | None = None
 
 
 @dataclass(slots=True)
@@ -151,14 +198,32 @@ class OfflineFeatureArchive:
             self.valid = False
             self.failure_reason = str(reason)
 
-    def record_step(self, step_id: int, coordinate: float, actual: bool) -> None:
+    def record_step(
+        self,
+        step_id: int,
+        coordinate: float,
+        actual: bool,
+        *,
+        model_aware_decision: ModelAwareForecastDecision | None = None,
+    ) -> None:
         if not self.valid:
             return
         expected = len(self.steps)
         if int(step_id) != expected:
             self.invalidate(f"offline step sequence changed: expected {expected}, got {step_id}")
             return
-        self.steps.append(OfflineStepRecord(int(step_id), float(coordinate), bool(actual)))
+        self.steps.append(
+            OfflineStepRecord(
+                int(step_id),
+                float(coordinate),
+                bool(actual),
+                (
+                    None
+                    if model_aware_decision is None
+                    else OfflineModelAwareDecision.from_runtime(model_aware_decision)
+                ),
+            )
+        )
 
     def record_actual(
         self,
@@ -268,7 +333,12 @@ class OfflineSmoother:
             history_storage=archive.history_storage,
         )
         for anchor in archive.anchors:
-            self._forecaster.update(anchor.coordinate, anchor.feature, take_ownership=True)
+            self._forecaster.update(
+                anchor.coordinate,
+                anchor.feature,
+                anchor_id=anchor.step_id,
+                take_ownership=True,
+            )
         self._stream_ranges = self._resolve_stream_ranges()
         if (
             self._stream_ranges[0][0] == "packed"
@@ -308,6 +378,8 @@ class OfflineSmoother:
         self.effective_blend_mean = self.blend_weight
         self.effective_blend_max = self.blend_weight
         self._last_prediction_chunk_count = 0
+        self.model_aware_offline_correction_seconds = 0.0
+        self.model_aware_offline_correction_applications = 0
         validation_started = time.perf_counter()
         try:
             self._validation_scores = self._build_validation_scores()
@@ -330,6 +402,17 @@ class OfflineSmoother:
     @property
     def last_prediction_chunk_count(self) -> int:
         return self._last_prediction_chunk_count
+
+    @property
+    def model_aware_fit_seconds(self) -> float:
+        return self._forecaster.model_aware_fit_seconds
+
+    @property
+    def model_aware_correction_seconds(self) -> float:
+        return (
+            self._forecaster.model_aware_correction_seconds
+            + self.model_aware_offline_correction_seconds
+        )
 
     @staticmethod
     def _affine_spectral_weights(weights: torch.Tensor) -> torch.Tensor:
@@ -463,8 +546,17 @@ class OfflineSmoother:
         for record in self.archive.steps:
             if record.actual:
                 continue
+            decision = record.model_aware_decision
+            spectral_degree = self.degree if decision is None else decision.degree
+            spectral_ridge = self.ridge_lambda if decision is None else decision.ridge_lambda
             spectral = self._affine_spectral_weights(
-                self._forecaster.spectral_weights(record.coordinate)
+                self._forecaster.model_aware_weights(
+                    record.coordinate,
+                    1.0,
+                    degree=spectral_degree,
+                    ridge_lambda=spectral_ridge,
+                    correction_gain=0.0,
+                )
             )
             position = bisect.bisect_left(self._anchor_ids, record.step_id)
             if position == 0 or position == len(self._anchor_ids):
@@ -480,6 +572,27 @@ class OfflineSmoother:
             local[position] = ratio
             for stream_index, (stream_name, _, _) in enumerate(self._stream_ranges):
                 configured_blend = self.configured_stream_blends[stream_name]
+                correction_coefficients: tuple[float, ...] = ()
+                if decision is not None:
+                    if stream_name == "audio":
+                        configured_blend = decision.audio_blend_weight
+                        correction_coefficients = decision.audio_correction_coefficients
+                    elif stream_name == "video":
+                        configured_blend = decision.video_blend_weight
+                        correction_coefficients = decision.video_correction_coefficients
+                    else:
+                        configured_blend = decision.video_blend_weight
+                        if len(decision.audio_correction_coefficients) == len(
+                            decision.video_correction_coefficients
+                        ):
+                            correction_coefficients = tuple(
+                                0.5 * (audio + video)
+                                for audio, video in zip(
+                                    decision.audio_correction_coefficients,
+                                    decision.video_correction_coefficients,
+                                    strict=True,
+                                )
+                            )
                 for branch in range(self._branch_count):
                     validation_score = self._validation_score_for_interval(
                         position,
@@ -487,9 +600,58 @@ class OfflineSmoother:
                         stream_index,
                     )
                     effective_blend = configured_blend / max(1.0, validation_score)
-                    weights_by_step[(record.step_id, branch, stream_index)] = (
+                    weights = (
                         effective_blend * spectral + (1.0 - effective_blend) * local
                     )
+                    if correction_coefficients and any(
+                        value != 0.0 for value in correction_coefficients
+                    ):
+                        correction_started = time.perf_counter()
+                        try:
+                            weights = weights.clone()
+                            required = len(correction_coefficients) + 1
+                            if (
+                                decision is not None
+                                and len(decision.correction_anchor_ids) == required
+                            ):
+                                try:
+                                    correction_positions = [
+                                        self._anchor_ids.index(anchor_id)
+                                        for anchor_id in decision.correction_anchor_ids
+                                    ]
+                                except ValueError as exc:
+                                    raise RuntimeError(
+                                        "offline correction anchor stencil is missing"
+                                    ) from exc
+                                if (
+                                    correction_positions != sorted(correction_positions)
+                                    or len(set(correction_positions)) != required
+                                    or correction_positions[-1] >= position
+                                ):
+                                    raise RuntimeError(
+                                        "offline correction anchor stencil violates first-pass chronology"
+                                    )
+                            elif len(correction_coefficients) == 1:
+                                correction_positions = [position - 1, position]
+                            else:
+                                raise RuntimeError(
+                                    "offline K=2 correction is missing explicit causal anchor IDs"
+                                )
+                            if len(correction_coefficients) == 1:
+                                gain = correction_coefficients[0]
+                                weights[correction_positions[-2]] -= gain
+                                weights[correction_positions[-1]] += gain
+                            else:
+                                g0, g1 = correction_coefficients
+                                weights[correction_positions[-3]] -= g1
+                                weights[correction_positions[-2]] += -g0 + g1
+                                weights[correction_positions[-1]] += g0
+                        finally:
+                            self.model_aware_offline_correction_seconds += (
+                                time.perf_counter() - correction_started
+                            )
+                        self.model_aware_offline_correction_applications += 1
+                    weights_by_step[(record.step_id, branch, stream_index)] = weights
                     effective_blends.append(effective_blend)
                     stream_effective_blends[stream_name].append(effective_blend)
                     if effective_blend < configured_blend - 1e-7:

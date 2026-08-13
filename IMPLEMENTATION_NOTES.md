@@ -1,110 +1,165 @@
-# MiniMax H3 integration notes
+# MiniMax H3 model-aware integration notes
 
 Source review date: 2026-08-12
 
-Reviewed native ComfyUI commits: `e377e263049f9338b4d12a3dd417b36ae62948ff`, `0dd9b154a1654fc699dcdc3af066c7cce096045a`, `5599a05fea715cb2aff11f30f5b06e16d0dfa0c4`, and current master `27bca654eb9a70237d93f56a6ea336ab55f8925d`
+Reviewed native ComfyUI revisions used by the PR matrix:
 
-Reviewed Spectrum paper: arXiv `2603.01623v1`
+- `e377e263049f9338b4d12a3dd417b36ae62948ff`
+- `0dd9b154a1654fc699dcdc3af066c7cce096045a`
+- `5599a05fea715cb2aff11f30f5b06e16d0dfa0c4`
+- `27bca654eb9a70237d93f56a6ea336ab55f8925d`
 
-Reviewed official Spectrum implementation commit: `11f317a87352e2c67daa2fac5a971cf04233d7d1`
+The experimental history and negative Feature-3 result are preserved in `MODEL_AWARE_BENCHMARK.md`. This file describes the final runtime architecture after that experiment was closed.
 
-The separate `ComfyUI-Spectrum-Proper` repository was inspected only for ComfyUI wrapper and clone-lifetime lessons. This repository does not import it, depend on it, or share code or runtime state with it.
+## Native execution boundary
 
-## Native execution path
+MiniMax-H3 sampling enters through the normal ComfyUI guider/sampler `PREDICT_NOISE` path. Actual Spectrum steps execute native H3 transformer blocks and capture only the packed target hidden immediately after the final transformer block and immediately before native `FinalLayer`:
 
-1. `comfy.samplers.CFGGuider.sample` packs the nested MiniMax H3 video/audio latent pair for sampler integration.
-2. `CFGGuider.outer_sample` prepares the cloned `ModelPatcher`, then `CFGGuider.inner_sample` copies model options and writes the supplied sigma sequence to `transformer_options["sample_sigmas"]`.
-3. A stock k-diffusion sampler calls `KSamplerX0Inpaint`, then `CFGGuider.outer_predict_noise` invokes `PREDICT_NOISE` wrappers around `CFGGuider.predict_noise`.
-4. `sampling_function` and `calc_cond_batch` form conditional/unconditional model calls. Each call receives copied/merged transformer options containing `cond_or_uncond`, `uuids`, the current `sigmas`, the full `sample_sigmas`, user patches, replacement patches, hooks, and model-management data.
-5. `comfy.model_base.MiniMaxH3._apply_model` converts the flat sampler latent back to the native pair `[video, audio]`, maps sampler sigma through `model_sampling.timestep`, copies transformer options, and calls `MiniMaxH3Model.forward`.
-6. `MiniMaxH3Model.forward` invokes ComfyUI `DIFFUSION_MODEL` wrappers around `MiniMaxH3Model._forward`. On cores with `ModelSamplingAV` the sampler carries the audio stream scaled onto the video schedule; `forward` removes that scale before the wrappers run and restores it after, so wrappers always observe the stream's own latent and velocity.
-7. `_forward` pads video to the model patch geometry, resolves or constructs `PackedLayout`, derives video and audio timesteps from the current video sigma and both sigma shifts, builds modality/timestep modulation segments, embeds target and conditioning rows, builds RoPE, and runs every transformer block. Per-block replacement patches and the native prefetch queue are applied inside this loop.
-8. The packed sequence is `[text | optional keyframe/reference segments | target audio | target video]`. This covers native `t2va`, `fl2va`, and `ref2va` conditioning. `PackedLayout.segments` proves that the target audio and target video spans are the final two contiguous segments, in that order.
-9. Immediately after the final transformer block, the packed hidden tensor contains the desired forecast target. Only the target audio and target video rows are cached, as a compact tensor ordered `[target audio rows | target video rows]`. Text, keyframe, image-reference, video-reference, and audio-reference rows are excluded.
-10. `FinalLayer.forward` consumes the current hidden rows plus the current exact timestep embeddings. It independently normalizes/modulates target video and target audio rows, then executes the checkpoint's FP32 output heads.
-11. Native reconstruction unpatchifies video and unpacks stereo channel-major audio. The audio velocity convention is core-dependent and is detected from the presence of `time_shift_slope` in `comfy.ldm.minimax.model`: cores that expose it expect `_forward` to apply the video-to-audio sigma-map derivative and return `[-video_velocity, -audio_slope * audio_velocity]`; cores that removed it perform the schedule conversion in `forward` instead, so `_forward` returns the unscaled `[-video_velocity, -audio_velocity]`. `BaseModel._apply_model` packs this native pair again for the sampler and applies the native denoised conversion.
+```text
+[target audio rows | target video rows]
+```
 
-## Integration invariant
+Text, keyframe/reference, image-reference, video-reference, and audio-reference rows are excluded from forecast history.
 
-The acceleration boundary is the post-final-block hidden feature immediately before `FinalLayer`. Actual steps run the native `_forward` unchanged, with a call-local wrapper around the existing final-block replacement solely to observe its output. Forecast steps compute only current layout and output-head timestep state, predict the compact target feature, remap its audio/video segments to the compact tensor, then call the native final layer and native reconstruction helpers.
+Forecast steps predict only this compact pre-`FinalLayer` target hidden. The current native FinalLayer and reconstruction path then execute normally, preserving current timestep conditioning, native audio schedule conversion, output heads, video unpatchification, audio unpacking, and return conventions.
 
-This preserves:
+No final shipping model-aware feature adds a transformer/denoiser evaluation.
 
-- current video and audio timestep conditioning;
-- sigma-shift mapping, and whichever audio velocity convention the installed core uses;
-- output-head weights and FP32 islands;
-- video unpatchification and audio unpacking;
-- native return structure;
-- existing transformer replacement patches on actual steps;
-- native prefetch/model-management behavior on actual steps;
-- clone-local runtime selection through call-local transformer options.
+## Model/patch profile
 
-## Sampler contract
+Before a generation, Spectrum lazily constructs a bounded process-local profile of the effective `ModelPatcher`. The profile exists to support Feature 1 scheduling and Feature 2 confidence/adaptive fitting.
 
-Solver-step IDs are assigned by a `PREDICT_NOISE` wrapper inside an `OUTER_SAMPLE` run transaction. Forecasting is allowlisted only for the reviewed native `sample_euler`, `sample_er_sde`, `sample_res_multistep`, and `sample_res_multistep_cfg_pp` functions plus Larryvrh's reviewed `_turbo_sampler`. Each performs exactly one `predict_noise` call per outer solver iteration. Euler, ER-SDE, and Turbo require one completed actual H3 evaluation after every forecast. RES stores each current denoised result for the following second-order update. The actual step after a forecast consumes that forecast-derived value, then replaces `old_denoised` with its native result; one completed actual evaluation therefore clears the retained forecast before forecasting resumes. RES also enforces a three-step actual tail. These sampler floors are applied at run time and cannot be weakened by an older saved workflow. Unreviewed ancestral variants and other samplers remain native and report a debug fallback reason.
+The profile retains compact metadata and scalar statistics only:
 
-Current ComfyUI `sample_er_sde` has one `model(x, sigmas[i] * s_in, ...)` evaluation in its sole outer loop. `stage_used = min(max_stage, i + 1)` changes only how that denoised result is combined with solver-local history. Stage 2 carries `old_denoised` and the current finite difference `denoised_d`; stage 3 additionally carries `old_denoised_d`. Both histories are initialized inside the function and replaced during the invocation, so no native ER state survives a separate sampler call. The final sigma-zero iteration assigns `x = denoised`, still invokes the callback once, and skips every ER update and SDE noise draw.
+- base-model identity and patch identity;
+- patch counts/coverage;
+- recognized LoRA and unknown-patch counts;
+- profile confidence;
+- aggregate model sensitivity;
+- audio/video scalar sensitivities;
+- patch and final-block perturbation estimates;
+- forecast-risk prior;
+- build/memory telemetry.
 
-With native defaults, the function constructs `default_noise_sampler(x, seed=extra_args["seed"])` once per invocation. ComfyUI's `CFGGuider.inner_sample` rebuilds `extra_args` with the same outer seed on each Spectrum pass. The default sampler owns a fresh device generator seeded identically for each invocation (with the same CPU seed offset), so identical initial packed noise, latent, sigmas, seed, and sampler options reconstruct the same random sequence. On every nonterminal iteration with effective `s_noise > 0`, one noise sample is generated after the stage update and injected into `x`; `s_noise <= 0` or a model `noise_scale <= 0` suppresses the draw. `max_stage` does not alter model-call or noise-draw counts. `s_noise`, `max_stage`, and the native default `noise_scaler` therefore preserve the reviewed logical-step contract.
+The scalar stream sensitivities are computed during profile construction from sampled native model weights, including the audio/video output heads. The output-head matrices are **not retained** afterward.
 
-A custom `noise_sampler` or `noise_scaler` object is stored in the persistent KSampler's `extra_options` and can retain mutable state between the capture and replay invocations. Spectrum cannot prove that such an override restarts deterministically. Ordinary single-pass Spectrum remains eligible because the one-model-call topology is unchanged; default-on offline replay detects either override before opening a run and executes one native pass. ER-SDE does not enable `anchor_residual_feedback` or `selective_rollback_correction`; those experiments remain limited to their independently reviewed contracts.
+The rejected Feature-3 experiments previously caused the profile to retain detached CPU FP32 copies of `FinalLayer.audio_out` / `video_out` plus Gram diagonals. Those tensors were approximately 2.6 MiB on real H3 and are no longer required by Feature 1 or Feature 2. Final runtime profile construction therefore discards them after deriving the compact scalar sensitivity information.
 
-Coordinates are derived from the actual supplied sigma sequence. Evaluated sigma values are affinely normalized between the run's evaluated minimum and maximum into `[-1, 1]`; no fixed step count is assumed.
+The process LRU remains keyed by clone lineage, patch identity, H3 architecture signature, and bypass-injection adapter metadata. Cached entries retain no model/module/GPU reference.
 
-The optional `bootstrap_first_forecast` path is evaluated after configured warmup and final-tail enforcement and before ordinary forecaster readiness. It is eligible only at solver step 1 with degree 1 and exactly one actual history entry. The step carries an explicit bootstrap flag through the existing branch-label transaction; sampler refresh limits and whole-step retry semantics are identical to an ordinary forecast. A successful bootstrap is counted only at finalization and requires the following actual solver step, while aborting it rolls the solver-step ID back without changing forecast or refresh accounting.
+## Public mode semantics
 
-Native EasyCache and LazyCache may terminate a diffusion-model wrapper chain without an H3 call. Their shared `transformer_options["easycache"]` holder is therefore detected before Spectrum opens a run transaction. Spectrum remains inactive for that run and the cache owns the acceleration path.
+The serialized mode values remain unchanged for workflow compatibility:
 
-Other downstream wrappers can also return a valid `predict_noise` result before the native H3 wrapper is reached. This cannot be detected reliably before execution. A zero-call step therefore commits as a passthrough boundary: Spectrum disables forecasting for the rest of the run, clears all retained history, resets forecast-refresh state, and accepts the wrapped result. It logs the transition once and tracks subsequent bypasses separately from actual and forecast steps.
+```text
+off
+    legacy Spectrum behavior
 
-## Forecast memory model
+schedule
+    Feature 1 only:
+    model/patch risk prior may convert a prospective forecast to an actual
 
-The forecaster stores at most `max_history` detached model-dtype snapshots in the configured history storage: system RAM by default, or the producing model device when the opt-in VRAM mode is selected. It solves only for history weights:
+schedule_confidence
+    Feature 1 + Feature 2:
+    adaptive confidence, degree, ridge and stream blend
+    no forecast correction
 
-`w(t*) = phi(t*) (Phi^T Phi + lambda I)^-1 Phi^T`
+full
+    Feature 1 + Feature 2
+    + bounded generic latest-delta residual correction
+    no model-specific Feature-3 correction
+```
 
-Spectral and two-point linear weights are combined before feature streaming. Prediction reads one bounded chunk from one history snapshot at a time, accumulates that chunk in FP32 on the output device, and writes the final model-dtype feature. No persistent full-feature FP32 right-hand side or coefficient tensor is created.
+A required actual step is never converted into a forecast by the model-aware controller. Existing sampler/warmup/history/tail constraints remain authoritative.
 
-The one-point bootstrap bypasses spectral and linear weight construction and supplies the same chunk engine with the explicit weight `[1.0]`. It requires exactly one history entry, performs no Chebyshev/ridge factorization, and does not modify history or ordinary `ready()` semantics. The held object remains the compact pre-`FinalLayer` `[target audio | target video]` hidden feature; current-step output-head conditioning and reconstruction still run normally.
+## Surviving generic scalar correction
 
-Native H3 lays out target rows as one contiguous `[audio | video]` packed tail. Actual capture archives that tail without materializing an audio/video concatenation. System-RAM mode copies the view directly to CPU. VRAM mode must clone it into compact owned device storage, because retaining the view would pin the complete final-block hidden tensor. When one model call contains the complete canonical branch set, the archived tensor transfers directly into forecaster history; split conditional calls retain the transactional canonicalization path and assemble rows only after all calls complete. Debug summaries expose the storage location and wall-clock archive, history-update, and forecast-prediction counters. Device-to-host archiving can synchronize outstanding CUDA work, while device cloning can be asynchronously enqueued.
+The useful correction is independent of the failed model-informed Feature-3 objective.
 
-## Default trajectory correction and retained experiments
+At a completed actual anchor, Spectrum reconstructs the uncorrected spectral prediction from history available before that anchor and forms:
 
-The published Spectrum procedure remains the causal online baseline. MiniMax H3 uses offline smoothing replay as its standard default-on correction because same-seed testing reproduced causal video-to-audio degradation in the single-pass path and removed it with isolated capture/replay. `anchor_residual_feedback` and `selective_rollback_correction` remain default-off repository experiments. When `enabled=True`, those two modes and `offline_smoothing_replay` are mutually exclusive. With all three false, no archive, probe, correction, or sampler controller is allocated and the node executes the explicit single-pass comparison path.
+```text
+d = h[-1] - h[-2]
+r = h_actual - h_pred_uncorrected
+```
 
-### Residual boundary and policy
+The generic scalar projection is:
 
-`experiments.py` owns bounded FP32 output reductions and offline smoothing primitives. `runtime.py` owns branch transactions and policy state. `minimax_h3.py` owns native output-head reconstruction.
+```text
+g_raw = <r, d> / <d, d>
+```
 
-On an eligible actual call, `prepare_residual_probe` maps that call's labels to canonical history rows without touching `used_history_rows`. It predicts a shadow feature and latest-actual hold before the current feature reaches forecaster history. After native `_forward` completes, `_execute_actual` runs both candidates through the current `_OutputState` and `_execute_forecast`, then reduces native actual versus candidate video/audio outputs. Shadow/hold output-head time is recorded separately from prediction and reduction time; only scalar scores survive the reduction.
+The existing controller confidence convention is preserved, and the scalar is passed through the existing rational 0.25 trust region. In the controller's existing scalar notation this is equivalent to the bounded generic gain:
 
-Split calls retain per-call scalar scores until actual-step finalization. Finalization requires the residual records to cover exactly the same canonical label set as the actual records. Anchor feedback uses the maximum video/subcall score; rollback uses the maximum video/audio/subcall score. Any missing, duplicate, incomplete, changed, or nonfinite experimental state disables the experiment without weakening base Spectrum's existing fallback rules.
+```text
+g = g_raw_scaled / (1 + |g_raw_scaled| / 0.25)
+```
 
-Real H3 validation found speech timing and slight image regressions from transporting an anchor's hidden residual to the next coordinate. Forward feedback therefore never stores or injects a hidden residual. A video policy score of at least `1.5` requests one actual step, with at most three feedback refreshes per run. Terminal probes and probes after budget exhaustion are skipped. The refresh counter is consumed only at actual-step finalization, so aborting the forced step leaves the requirement intact.
+`full` applies this gain to the latest-delta correction exactly. The retired exact-head and Gram-diagonal candidates no longer alter the applied value:
 
-### Euler rollback ownership
+```text
+applied_gain == generic_gain
+```
 
-`PREDICT_NOISE` can replace a denoised result but cannot restore the sampler's latent. True rollback therefore lives in a `SAMPLER_SAMPLE` wrapper implemented by `rollback.py`. The controller accepts only the exact current `comfy.k_diffusion.sampling.sample_euler` function with zero churn and no multi-GPU state.
+K=2 coefficient vectors are not applied. The current anchor is used to train future generic projection state only after its counterfactual prediction has been formed, preserving the existing causal chronology.
 
-The controller mirrors `KSAMPLER.sample` setup and deterministic Euler advancement. Runtime state is snapshotted before each evaluation without cloning immutable history tensors. If that evaluation commits as a forecast, the pre-forecast latent is cloned before the solver advances and the callback is deferred. The following actual anchor can request rollback at an aggregate score of at least `1.5`, up to three times per run. Restoration removes the speculative schedule/history mutations while preserving their compute and timing counters, then two forced-actual calls replay the forecast interval and corrected anchor. Their callbacks replace the deferred speculative callbacks one-for-one.
+## Feature-3 negative result and runtime retirement
 
-This mirrored setup was reviewed and integration-tested against ComfyUI commit `5599a05fea715cb2aff11f30f5b06e16d0dfa0c4`. Compatibility review must re-check `KSamplerX0Inpaint`, `sampler.inpaint_options`, `model_sampling.noise_scaling`, `sampler.max_denoise`, `sampling.to_d`, and `sampling.trange` whenever the corresponding `KSAMPLER.sample` internals change.
+The following investigated mechanisms are not part of normal runtime:
 
-RES rollback is intentionally unsupported. `old_denoised`, `old_sigma_down`, and the CFG++ `uncond_denoised` closure belong to `res_multistep`, below the public wrapper boundary. Reimplementing that sampler would require a separate exact contract and state-restoration test suite. The setting fails closed to ordinary Spectrum before the RES sampler mutates state.
+- exact static output-head trust-mixed correction;
+- Gram-diagonal correction ablation;
+- K=2 causal trajectory correction;
+- `W^T W d` transformed trajectory direction;
+- `J_t^T J_t d` transformed trajectory direction;
+- previous-hidden-residual persistence as a correction source;
+- `W^T e_previous` output-error adjoint;
+- `J_t^T e_previous` current-FinalLayer adjoint.
 
-### Offline archive and replay
+The large experimental modules, FinalLayer geometry hooks, sampled previous-error state, previous-error alpha state, transformed-direction row histories, normalization runtime, JVP/VJP runtime, and associated snapshot/logging/workspace extensions were removed from the production package.
 
-The `OUTER_SAMPLE` wrapper owns the two-pass lifetime. It clones the original packed noise, latent, sigma schedule, and optional mask before the first call. The first pass keeps the ordinary Spectrum schedule but forces both causal blend weights to zero and suppresses the external callback. This reproduces the local-only capture policy that avoided the speech defect in the observed runs, independently of the configured replay weights. Actual-step finalization retains canonical model-dtype anchors before causal history eviction. `history_storage` controls the `max_history`-bounded causal forecaster; `offline_archive_storage` independently controls the all-anchor replay lifetime and defaults to system RAM. Capture first makes one compact target copy on-device when either consumer requests VRAM, or directly on CPU when neither does. Finalization shares that immutable tensor when both consumers resolve to the same device and creates one compact copy per selected device when they differ. This prevents a pre-existing causal `vram` selection from silently turning into all-anchor VRAM retention when offline replay is enabled.
+Debug summary marks the scientific/runtime state explicitly:
 
-Archive completion requires every logical decision, an exact actual-step/anchor match, stable labels/topology/shape/dtype/device, enough anchors for the configured degree, and an earlier and later anchor around every forecast. `OfflineSmoother` fits spectral weights over all anchors and combines them with bracketing interpolation. Spectral weights are minimally affine-corrected to sum to one, preserving constant trajectories despite ridge shrinkage.
+```text
+feature3_model_informed_correction=retired_no_material_gain
+feature3_applied_correction=generic_scalar_latest_delta
+feature3_k2_runtime=retired
+feature3_transformed_trajectory_runtime=retired
+feature3_previous_error_runtime=retired
+feature3_direction_evidence_bytes=0
+feature3_direction_workspace_bytes=0
+feature3_error_evidence_bytes=0
+feature3_error_workspace_bytes=0
+feature3_extra_transformer_nfe=0
+```
 
-The causal and offline predictors treat the contiguous target audio/video segments as separate weighting domains while streaming them into one packed result buffer. `blend_weight` remains the video spectral share; `audio_blend_weight` is an independent optional share with a default of zero. This boundary is required because full-H3 A/B runs reproduced an audio defect in both ordinary Spectrum and offline replay at a shared weight of `0.5`, while two corresponding global-zero runs did not. H3's audio rows use a separately shifted timestep schedule, making a shared fit structurally unjustified even though the packed transformer couples both modalities.
+## Generic evidence storage
 
-Direct row separation did not remove the entire defect in ordinary single-pass Spectrum. With audio fixed at zero, a video share of `0.5` still caused speech tripping, while a video share of `0` was clean with somewhat worse image quality. During causal capture, a video forecast advances the video latent along a changed path; the next actual H3 evaluation runs joint audio-video attention and can therefore alter the archived audio anchor. For offline mode only, causal capture now uses `video=0, audio=0`. The configured weights remain owned by `OfflineSmoother` and affect replayed missing steps only. On the same affected seed, revised offline replay at `video=0.5, audio=0` removed the stutter; disabling offline replay with those weights reproduced it. This validates the isolated capture/replay mechanism for that case. Ordinary single-pass Spectrum is unchanged and retains the indirect coupling path.
+Feature 2 and the surviving generic scalar correction continue to use the existing deterministic sampled hidden evidence. The sample is bounded and device-local; only reduced scalars are transferred to controller state.
 
-The smoother withholds each interior anchor and evaluates a deterministic sample of at most 16,384 elements per conditional branch for the packed audio and video segments independently. It compares leave-one-out spectral RMS error with adjacent-anchor interpolation RMS error. Each modality's own ratio attenuates only its configured spectral share for a missing step by `1 / max(1, score)`. With the default audio share of zero, offline audio is exact bracketing interpolation and cannot receive a spectral contribution; online audio is the causal two-point predictor. Video retains its independently validated spectral/local mixture. Stored actual steps use one-hot weights and therefore reproduce their archived feature exactly. Telemetry reports configured weights, validation samples, anchors, streams, per-modality maxima, per-modality effective blend ranges and counts, exact-anchor versus smoothed replay steps, and the smoother's history/chunk state.
+Exact-head projected-row history is no longer populated by normal runtime. Full head materialization, exact-head evidence storage, exact-head projection calls, exact-head temporary workspace, and exact-head projection timing are therefore zero in normal `full`.
 
-Replay opens a fresh runtime run from the cloned inputs. Because `CFGGuider.inner_sample` replaces `guider.conds` with processed conditions, the wrapper also restores a structural copy of the pre-first-pass condition containers; tensors and model/control payloads remain shared. Every step has runtime mode `replay`, so `DIFFUSION_MODEL` obtains an archived or smoothed target and never enters `_execute_actual`. The current native H3 `FinalLayer` applies per-row normalization/modulation and separate linear projections to the audio and video slices; it performs no cross-row attention. Configured video replay weights therefore cannot change the predicted audio rows through a later joint transformer call. Replay validates coordinates, topology, labels, row coverage, and output shape. An `OfflineReplayAbort` unwinds the second ComfyUI sampling call transactionally and lets the outer wrapper return the already valid local-only first-pass result. OOM and cancellation remain fatal and preserve their original traceback. The outer `finally` releases input clones, the independently selected archive, and smoother references.
+The regular forecast history still obeys `max_history` and `history_storage`. No second full hidden history is added by the final model-aware architecture.
 
-First-pass anchors remain tied to the first-pass latent trajectory. Later anchors provide bidirectional information about hidden-feature evolution; they do not expose a native feature at an earlier forecast coordinate or make replay anchors native-equivalent at the changed replay latent.
+## Offline smoothing replay
+
+Offline replay remains the standard scalar replay path. Capture records the selected schedule/fitting/blend decisions plus the same surviving generic scalar correction gain. Replay consumes that recorded scalar decision after dynamically inserted anchors.
+
+First-pass `full` and replay therefore use the same correction semantics. No rejected Feature-3 tensor state is archived. Replay remains transformer-free and preserves the existing ER-SDE seeded replay ownership rules.
+
+For native `sample_er_sde`, Spectrum still requires the native seeded noise components for replay and does not mutate generator/noise-sampler/solver-derivative state.
+
+## Performance/lifetime invariants
+
+Final model-aware runtime must preserve:
+
+- zero extra transformer NFE;
+- no full output-head tensor retained in the profile;
+- no generated full hidden tensor transfer to CPU for model-aware correction;
+- no explicit `torch.cuda.synchronize()` for timing;
+- no previous-error or transformed-direction workspace;
+- no exact-head materialization/projection in `full`;
+- process-profile cache entries with no model/module/GPU reference;
+- no Feature-3 correction work in `schedule` or `schedule_confidence`.
+
+The final real mechanical gate described in `MODEL_AWARE_BENCHMARK.md` is intended to verify these invariants and measure the simplified `full` overhead. It is not a new Feature-3 discovery experiment.
