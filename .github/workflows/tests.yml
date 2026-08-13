@@ -67,6 +67,7 @@ jobs:
             tests/test_generic_correction.py \
             tests/test_trust_probe.py \
             tests/test_replay_component_shadow.py \
+            tests/test_replay_shadow_composition.py \
             tests/test_replay_generic_correction_gate.py \
             tests/test_model_aware.py \
             tests/conftest.py \
