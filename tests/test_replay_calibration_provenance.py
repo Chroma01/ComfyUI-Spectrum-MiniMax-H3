@@ -34,6 +34,7 @@ def _base_block() -> dict[str, object]:
         },
         "target_rows": [
             {
+                "run_id": 1,
                 "target_step_id": 3,
                 "coordinate": 0.75,
                 "left_anchor_step_id": 2,
@@ -42,6 +43,10 @@ def _base_block() -> dict[str, object]:
                 "causal_disagreement": 0.4,
                 "validation_penalty": 1.5,
                 "spectral_gap": 0.2,
+                "local_error_sq_mean": 0.6,
+                "spectral_delta_sq_mean": 0.4,
+                "local_error_dot_spectral_delta_mean": -0.1,
+                "oracle_weight": 0.25,
                 "trace_fingerprint": "old-trace",
             }
         ],
@@ -98,6 +103,9 @@ def test_block_provenance_uses_run_config_hash_and_seed_in_trace_fingerprint(mon
     assert first == second
     assert first["provenance"]["seed"] == 42
     assert first["metadata"]["seed_source"] == "ComfyUI OUTER_SAMPLE seed"
+    assert "calibration-content signature" in first["metadata"][
+        "trace_fingerprint_definition"
+    ]
     expected_config_hash = calibration._sha256_json(
         {
             "spectrum_config": first["config"],
@@ -128,6 +136,49 @@ def test_seed_changes_trace_fingerprint_but_not_run_config_hash(monkeypatch):
 
     assert first["provenance"]["config_hash"] == second["provenance"]["config_hash"]
     assert first["provenance"]["trace_fingerprint"] != second["provenance"]["trace_fingerprint"]
+
+
+def test_distinct_calibration_content_changes_trace_with_same_seed_and_config(monkeypatch):
+    runtime = SpectrumH3Runtime(SpectrumH3Config())
+    state = calibration._CalibrationState(enabled=True, config_snapshot={})
+    current = _base_block()
+
+    def original(_runtime, _state):
+        block = _base_block()
+        block["target_rows"][0]["local_error_sq_mean"] = current["target_rows"][0][
+            "local_error_sq_mean"
+        ]
+        return block
+
+    monkeypatch.setattr(provenance, "_ORIGINAL_BUILD_BLOCK", original)
+    setattr(runtime, provenance._RUNTIME_SEED_ATTR, 42)
+    first = provenance._build_block_with_provenance(runtime, state)
+    current["target_rows"][0]["local_error_sq_mean"] = 0.7
+    second = provenance._build_block_with_provenance(runtime, state)
+
+    assert first["provenance"]["seed"] == second["provenance"]["seed"] == 42
+    assert first["provenance"]["config_hash"] == second["provenance"]["config_hash"]
+    assert first["provenance"]["trace_fingerprint"] != second["provenance"]["trace_fingerprint"]
+
+
+def test_run_id_does_not_change_trace_fingerprint(monkeypatch):
+    runtime = SpectrumH3Runtime(SpectrumH3Config())
+    state = calibration._CalibrationState(enabled=True, config_snapshot={})
+    current = _base_block()
+
+    def original(_runtime, _state):
+        block = _base_block()
+        block["target_rows"][0]["run_id"] = current["target_rows"][0]["run_id"]
+        return block
+
+    monkeypatch.setattr(provenance, "_ORIGINAL_BUILD_BLOCK", original)
+    setattr(runtime, provenance._RUNTIME_SEED_ATTR, 42)
+    first = provenance._build_block_with_provenance(runtime, state)
+    current["target_rows"][0]["run_id"] = 999
+    second = provenance._build_block_with_provenance(runtime, state)
+    assert first["provenance"]["trace_fingerprint"] == second["provenance"][
+        "trace_fingerprint"
+    ]
 
 
 def test_unknown_seed_is_explicit_not_fabricated(monkeypatch):
