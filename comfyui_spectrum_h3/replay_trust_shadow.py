@@ -38,6 +38,9 @@ class _ReplayNativeStream:
     local_oracle_kappa_sum: float = 0.0
     local_oracle_kappa_min: float = 1.0
     local_oracle_kappa_max: float = 0.0
+    effective_blend_sum: float = 0.0
+    effective_blend_min: float = 1.0
+    effective_blend_max: float = 0.0
     causal_error_correlation: _trust._RunningPair = field(default_factory=_trust._RunningPair)
     causal_shrink_correlation: _trust._RunningPair = field(default_factory=_trust._RunningPair)
     replay_observer_count: int = 0
@@ -62,6 +65,9 @@ class _ReplayNativeStream:
         oracle_kappa: float,
         local_oracle_ratio: float,
         local_oracle_kappa: float,
+        effective_blend_mean: float,
+        effective_blend_min: float,
+        effective_blend_max: float,
         causal_disagreement: float,
         candidate_ratios: dict[float, float],
         replay_disagreement: float | None,
@@ -74,6 +80,9 @@ class _ReplayNativeStream:
             oracle_kappa,
             local_oracle_ratio,
             local_oracle_kappa,
+            effective_blend_mean,
+            effective_blend_min,
+            effective_blend_max,
             causal_disagreement,
             *[candidate_ratios[kappa] for kappa in _REPLAY_KAPPAS],
         )
@@ -105,6 +114,13 @@ class _ReplayNativeStream:
         )
         self.local_oracle_kappa_max = max(
             self.local_oracle_kappa_max, float(local_oracle_kappa)
+        )
+        self.effective_blend_sum += float(effective_blend_mean)
+        self.effective_blend_min = min(
+            self.effective_blend_min, float(effective_blend_min)
+        )
+        self.effective_blend_max = max(
+            self.effective_blend_max, float(effective_blend_max)
         )
         self.causal_error_correlation.add(causal_disagreement, baseline_ratio)
         self.causal_shrink_correlation.add(causal_disagreement, oracle_shrink)
@@ -139,6 +155,12 @@ class _ReplayNativeStream:
 
     def resolved_local_oracle_kappa_max(self) -> float:
         return self.local_oracle_kappa_max if self.count else 0.0
+
+    def resolved_effective_blend_min(self) -> float:
+        return self.effective_blend_min if self.count else 0.0
+
+    def resolved_effective_blend_max(self) -> float:
+        return self.effective_blend_max if self.count else 0.0
 
 
 @dataclass(slots=True)
@@ -178,6 +200,129 @@ def _begin_offline_capture_with_replay_shadow(
         setattr(archive, _ARCHIVE_SHADOW_ONLY_ATTR, bool(_trust._trust_requested(self)))
 
 
+def _spectral_prediction_without_anchor(
+    smoother: OfflineSmoother,
+    record: _trust._ReplayShadowRecord,
+    samples: torch.Tensor,
+    anchor_ids: list[int],
+    retained: list[int],
+    coordinate: float,
+) -> torch.Tensor:
+    validator = HistoryWeightForecaster(
+        degree=record.degree,
+        ridge_lambda=record.ridge_lambda,
+        max_history=max(len(retained), record.degree + 1, 2),
+        history_storage="system_ram",
+    )
+    for index in retained:
+        validator.update(
+            smoother.archive.anchors[index].coordinate,
+            samples[index],
+            anchor_id=anchor_ids[index],
+            take_ownership=True,
+        )
+    spectral = smoother._affine_spectral_weights(
+        validator.model_aware_weights(
+            coordinate,
+            1.0,
+            degree=record.degree,
+            ridge_lambda=record.ridge_lambda,
+            correction_gain=0.0,
+        )
+    )
+    return torch.einsum("k,kbs->bs", spectral, samples[retained])
+
+
+def _retained_validation_scores(
+    smoother: OfflineSmoother,
+    record: _trust._ReplayShadowRecord,
+    samples: torch.Tensor,
+    anchor_ids: list[int],
+    retained: list[int],
+    retained_position: int,
+) -> list[float] | None:
+    if retained_position <= 0 or retained_position >= len(retained) - 1:
+        return None
+    target_original_index = retained[retained_position]
+    validation_retained = [
+        index for position, index in enumerate(retained) if position != retained_position
+    ]
+    if len(validation_retained) < max(2, record.degree + 1):
+        return None
+    spectral_prediction = _spectral_prediction_without_anchor(
+        smoother,
+        record,
+        samples,
+        anchor_ids,
+        validation_retained,
+        smoother.archive.anchors[target_original_index].coordinate,
+    )
+    left_original_index = retained[retained_position - 1]
+    right_original_index = retained[retained_position + 1]
+    left = smoother.archive.anchors[left_original_index]
+    target = smoother.archive.anchors[target_original_index]
+    right = smoother.archive.anchors[right_original_index]
+    spacing = right.coordinate - left.coordinate
+    if abs(spacing) <= 1e-12:
+        raise RuntimeError("replay-native validation anchors have duplicate coordinates")
+    ratio = (target.coordinate - left.coordinate) / spacing
+    local_prediction = torch.lerp(
+        samples[left_original_index], samples[right_original_index], ratio
+    )
+    actual = samples[target_original_index]
+    scores: list[float] = []
+    for branch in range(int(actual.shape[0])):
+        spectral_rms = _trust._tensor_rms(spectral_prediction[branch] - actual[branch])
+        local_rms = _trust._tensor_rms(local_prediction[branch] - actual[branch])
+        epsilon = _trust._tensor_rms(actual[branch]).mul(1e-6).clamp_min(_trust._EPS)
+        if float(spectral_rms) <= float(epsilon) and float(local_rms) <= float(epsilon):
+            score = 0.0
+        else:
+            score = float((spectral_rms / local_rms.clamp_min(epsilon)).item())
+        if not math.isfinite(score):
+            raise RuntimeError("replay-native validation score is nonfinite")
+        scores.append(score)
+    return scores
+
+
+def _effective_blends_for_withheld_target(
+    smoother: OfflineSmoother,
+    record: _trust._ReplayShadowRecord,
+    samples: torch.Tensor,
+    anchor_ids: list[int],
+    retained: list[int],
+    left_position: int,
+    right_position: int,
+) -> torch.Tensor:
+    left_scores = _retained_validation_scores(
+        smoother,
+        record,
+        samples,
+        anchor_ids,
+        retained,
+        left_position,
+    )
+    right_scores = _retained_validation_scores(
+        smoother,
+        record,
+        samples,
+        anchor_ids,
+        retained,
+        right_position,
+    )
+    branch_count = int(samples.shape[1])
+    effective = []
+    for branch in range(branch_count):
+        nearby = []
+        if left_scores is not None:
+            nearby.append(left_scores[branch])
+        if right_scores is not None:
+            nearby.append(right_scores[branch])
+        validation_score = max(nearby, default=1.0)
+        effective.append(record.blend_weight / max(1.0, validation_score))
+    return torch.tensor(effective, dtype=torch.float32)
+
+
 def _replay_shadow_case(
     smoother: OfflineSmoother,
     record: _trust._ReplayShadowRecord,
@@ -199,29 +344,14 @@ def _replay_shadow_case(
     if record.step_id in retained_ids:
         raise RuntimeError("replay-native LOO target leaked into retained anchors")
 
-    validator = HistoryWeightForecaster(
-        degree=record.degree,
-        ridge_lambda=record.ridge_lambda,
-        max_history=max(len(retained), record.degree + 1, 2),
-        history_storage="system_ram",
+    spectral_prediction = _spectral_prediction_without_anchor(
+        smoother,
+        record,
+        samples,
+        anchor_ids,
+        retained,
+        record.coordinate,
     )
-    for index in retained:
-        validator.update(
-            smoother.archive.anchors[index].coordinate,
-            samples[index],
-            anchor_id=anchor_ids[index],
-            take_ownership=True,
-        )
-    spectral = smoother._affine_spectral_weights(
-        validator.model_aware_weights(
-            record.coordinate,
-            1.0,
-            degree=record.degree,
-            ridge_lambda=record.ridge_lambda,
-            correction_gain=0.0,
-        )
-    )
-
     left_id = anchor_ids[target_index - 1]
     right_id = anchor_ids[target_index + 1]
     left_position = retained_ids.index(left_id)
@@ -233,40 +363,41 @@ def _replay_shadow_case(
     if abs(spacing) <= 1e-12:
         raise RuntimeError("replay-native shadow bracket has duplicate coordinates")
     ratio = (record.coordinate - left.coordinate) / spacing
-    local = torch.zeros(len(retained), dtype=torch.float32)
-    local[left_position] = 1.0 - ratio
-    local[right_position] = ratio
-
-    baseline_weights = record.blend_weight * spectral + (1.0 - record.blend_weight) * local
-    if record.correction_gain != 0.0:
-        baseline_weights = baseline_weights.clone()
-        baseline_weights[left_position] -= record.correction_gain
-        baseline_weights[right_position] += record.correction_gain
-
     retained_samples = samples[retained]
-    # All proposals are constructed before the withheld target is read for scoring.
-    spectral_prediction = torch.einsum("k,kbs->bs", spectral, retained_samples)
-    local_prediction = torch.einsum("k,kbs->bs", local, retained_samples)
-    baseline = torch.einsum("k,kbs->bs", baseline_weights, retained_samples)
-    causal_weights = _trust.apply_trust_to_history_weights(
-        baseline_weights,
-        record.kappa,
-        latest_position,
-    )
-    causal_transfer = torch.einsum("k,kbs->bs", causal_weights, retained_samples)
-    fixed_predictions: dict[float, torch.Tensor] = {}
-    for kappa in _REPLAY_KAPPAS:
-        candidate_weights = _trust.apply_trust_to_history_weights(
-            baseline_weights,
-            kappa,
-            latest_position,
-        )
-        fixed_predictions[kappa] = torch.einsum(
-            "k,kbs->bs", candidate_weights, retained_samples
-        )
+    local_weights = torch.zeros(len(retained), dtype=torch.float32)
+    local_weights[left_position] = 1.0 - ratio
+    local_weights[right_position] = ratio
+    local_prediction = torch.einsum("k,kbs->bs", local_weights, retained_samples)
 
-    actual = samples[target_index]
+    effective_blends = _effective_blends_for_withheld_target(
+        smoother,
+        record,
+        samples,
+        anchor_ids,
+        retained,
+        left_position,
+        right_position,
+    )
+    baseline = (
+        effective_blends[:, None] * spectral_prediction
+        + (1.0 - effective_blends[:, None]) * local_prediction
+    )
+    if record.correction_gain != 0.0:
+        correction_delta = (
+            retained_samples[right_position] - retained_samples[left_position]
+        )
+        baseline = baseline + float(record.correction_gain) * correction_delta
+
     hold = samples[latest_index]
+    causal_transfer = hold + float(record.kappa) * (baseline - hold)
+    fixed_predictions = {
+        kappa: hold + float(kappa) * (baseline - hold)
+        for kappa in _REPLAY_KAPPAS
+    }
+
+    # The target is intentionally read only after every proposal has been built from
+    # the retained cache, so future ground truth cannot enter the candidate state.
+    actual = samples[target_index]
     epsilon = _trust._tensor_rms(actual).mul(1e-6).clamp_min(_trust._EPS)
     hold_rms = _trust._tensor_rms(actual - hold).clamp_min(epsilon)
     baseline_ratio = _trust._tensor_rms(actual - baseline) / hold_rms
@@ -302,6 +433,9 @@ def _replay_shadow_case(
             oracle_kappa,
             local_oracle_ratio,
             local_oracle_kappa,
+            effective_blends.mean(),
+            effective_blends.min(),
+            effective_blends.max(),
             *[candidate_ratios[kappa] for kappa in _REPLAY_KAPPAS],
             *(() if replay_disagreement is None else (replay_disagreement,)),
         )
@@ -316,8 +450,11 @@ def _replay_shadow_case(
         "oracle_kappa": float(scalars[cursor + 4]),
         "local_oracle_ratio": float(scalars[cursor + 5]),
         "local_oracle_kappa": float(scalars[cursor + 6]),
+        "effective_blend_mean": float(scalars[cursor + 7]),
+        "effective_blend_min": float(scalars[cursor + 8]),
+        "effective_blend_max": float(scalars[cursor + 9]),
     }
-    cursor += 7
+    cursor += 10
     result["candidate_ratios"] = {
         kappa: float(scalars[cursor + index])
         for index, kappa in enumerate(_REPLAY_KAPPAS)
@@ -380,6 +517,9 @@ def _validate_replay_native_shadow(
                     oracle_kappa=case["oracle_kappa"],
                     local_oracle_ratio=case["local_oracle_ratio"],
                     local_oracle_kappa=case["local_oracle_kappa"],
+                    effective_blend_mean=case["effective_blend_mean"],
+                    effective_blend_min=case["effective_blend_min"],
+                    effective_blend_max=case["effective_blend_max"],
                     causal_disagreement=record.disagreement,
                     candidate_ratios=case["candidate_ratios"],
                     replay_disagreement=case["replay_disagreement"],
@@ -406,12 +546,13 @@ def _offline_build_forecast_weights_shadow_only(
 ):
     if _ORIGINAL_OFFLINE_BUILD_FORECAST_WEIGHTS is None:
         raise RuntimeError("replay-native trust shadow was not installed correctly")
-    if not _archive_shadow_only(self.archive):
-        return _ORIGINAL_OFFLINE_BUILD_FORECAST_WEIGHTS(self)
-
     base_builder = _trust._ORIGINAL_OFFLINE_BUILD_FORECAST_WEIGHTS
     if base_builder is None:
         raise RuntimeError("causal trust base replay builder is unavailable")
+
+    # Always bypass the rejected causal-kappa replay wrapper. When trust is disabled
+    # this is baseline-identical because base_builder is the already-installed
+    # generic-correction replay builder.
     weights_by_step = base_builder(self)
     aggregate = getattr(self.archive, "_model_aware_trust_aggregate", None)
     if isinstance(aggregate, _trust._TrustAggregate):
@@ -434,6 +575,9 @@ def _native_stream_summary(name: str, stream: _ReplayNativeStream) -> str:
         f"model_aware_trust_replay_shadow_{name}_oracle_kappa_mean={stream.mean(stream.oracle_kappa_sum):.6f}",
         f"model_aware_trust_replay_shadow_{name}_oracle_kappa_min={stream.resolved_oracle_kappa_min():.6f}",
         f"model_aware_trust_replay_shadow_{name}_oracle_kappa_max={stream.resolved_oracle_kappa_max():.6f}",
+        f"model_aware_trust_replay_shadow_{name}_effective_blend_mean={stream.mean(stream.effective_blend_sum):.6f}",
+        f"model_aware_trust_replay_shadow_{name}_effective_blend_min={stream.resolved_effective_blend_min():.6f}",
+        f"model_aware_trust_replay_shadow_{name}_effective_blend_max={stream.resolved_effective_blend_max():.6f}",
         f"model_aware_trust_replay_shadow_{name}_local_ratio_mean={stream.mean(stream.local_ratio_sum):.6f}",
         f"model_aware_trust_replay_shadow_{name}_local_oracle_ratio_mean={stream.mean(stream.local_oracle_ratio_sum):.6f}",
         f"model_aware_trust_replay_shadow_{name}_local_oracle_advantage_mean={stream.mean(stream.local_oracle_advantage_sum):.6f}",
@@ -474,7 +618,7 @@ def _debug_summary_with_replay_shadow(self: SpectrumH3Runtime) -> str:
         "model_aware_trust_path=offline_replay_shadow_only",
     ).replace(
         "model_aware_trust_replay_shadow=loo_unattenuated_future_bracket",
-        "model_aware_trust_replay_shadow=loo_unattenuated_replay_native_calibration",
+        "model_aware_trust_replay_shadow=loo_validation_attenuated_replay_native_calibration",
     )
     native = getattr(archive, _ARCHIVE_NATIVE_SHADOW_ATTR, None)
     if not isinstance(native, _ReplayNativeAggregate):
@@ -482,7 +626,7 @@ def _debug_summary_with_replay_shadow(self: SpectrumH3Runtime) -> str:
     return (
         f"{summary} "
         "model_aware_trust_replay_application=disabled_rejected_causal_transfer "
-        "model_aware_trust_replay_shadow_reference=corrected_future_bracket "
+        "model_aware_trust_replay_shadow_reference=validation_attenuated_corrected_future_bracket "
         f"model_aware_trust_replay_shadow_compute_s={native.compute_seconds:.6f} "
         f"{_native_stream_summary('audio', native.audio)} "
         f"{_native_stream_summary('video', native.video)}"
