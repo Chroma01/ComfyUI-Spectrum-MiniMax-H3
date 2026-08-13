@@ -437,67 +437,85 @@ def _decomposition_case(
         - (local_corrected_ratio - local_ratio)
     )
 
-    tensors = [
-        *[ratio_tensors[name] for name in _CANDIDATES],
-        local_correction_advantage,
-        blend_correction_advantage,
-        interaction,
-        local_projection,
-        blend_projection,
-        local_cosine,
-        blend_cosine,
-        *[
-            value
-            for name in _AXES
-            for value in axis_tensors[name]
-        ],
+    named_tensors: list[tuple[str, torch.Tensor]] = [
+        *[(f"candidate:{name}", ratio_tensors[name]) for name in _CANDIDATES],
+        ("local_correction_advantage", local_correction_advantage),
+        ("blend_correction_advantage", blend_correction_advantage),
+        ("correction_blend_interaction_ratio_delta", interaction),
+        ("local_residual_replay_delta_projection", local_projection),
+        ("blend_residual_replay_delta_projection", blend_projection),
+        ("local_residual_replay_delta_cosine", local_cosine),
+        ("blend_residual_replay_delta_cosine", blend_cosine),
     ]
+    for name in _AXES:
+        oracle_ratio, oracle_kappa = axis_tensors[name]
+        named_tensors.extend(
+            (
+                (f"axis:{name}:oracle_ratio", oracle_ratio),
+                (f"axis:{name}:oracle_kappa", oracle_kappa),
+            )
+        )
     if causal_replay_cosine is not None:
-        tensors.append(causal_replay_cosine)
+        named_tensors.append(("causal_replay_delta_cosine", causal_replay_cosine))
     if replay_disagreement is not None:
-        tensors.append(replay_disagreement)
-    values = torch.stack(tensors).detach().to(device="cpu", dtype=torch.float32).tolist()
+        named_tensors.append(("replay_disagreement", replay_disagreement))
 
-    cursor = 0
-    ratios: dict[str, float] = {}
-    for name in _CANDIDATES:
-        ratios[name] = float(values[cursor])
-        cursor += 1
+    values = (
+        torch.stack([tensor for _, tensor in named_tensors])
+        .detach()
+        .to(device="cpu", dtype=torch.float32)
+        .tolist()
+    )
+    resolved = {
+        name: float(value)
+        for (name, _), value in zip(named_tensors, values, strict=True)
+    }
+    ratios = {
+        name: resolved[f"candidate:{name}"]
+        for name in _CANDIDATES
+    }
     result: dict[str, Any] = {
         "retained_anchor_ids": candidates.retained_anchor_ids,
         "candidate_ratios": ratios,
         "correction_gain": float(record.correction_gain),
-        "local_correction_advantage": float(values[cursor]),
-        "blend_correction_advantage": float(values[cursor + 1]),
-        "correction_blend_interaction_ratio_delta": float(values[cursor + 2]),
-        "local_residual_replay_delta_projection": float(values[cursor + 3]),
-        "blend_residual_replay_delta_projection": float(values[cursor + 4]),
-        "local_residual_replay_delta_cosine": float(values[cursor + 5]),
-        "blend_residual_replay_delta_cosine": float(values[cursor + 6]),
+        "local_correction_advantage": resolved["local_correction_advantage"],
+        "blend_correction_advantage": resolved["blend_correction_advantage"],
+        "correction_blend_interaction_ratio_delta": resolved[
+            "correction_blend_interaction_ratio_delta"
+        ],
+        "local_residual_replay_delta_projection": resolved[
+            "local_residual_replay_delta_projection"
+        ],
+        "blend_residual_replay_delta_projection": resolved[
+            "blend_residual_replay_delta_projection"
+        ],
+        "local_residual_replay_delta_cosine": resolved[
+            "local_residual_replay_delta_cosine"
+        ],
+        "blend_residual_replay_delta_cosine": resolved[
+            "blend_residual_replay_delta_cosine"
+        ],
     }
-    cursor += 7
     result["local_projection_minus_causal_gain"] = (
         result["local_residual_replay_delta_projection"] - float(record.correction_gain)
     )
     result["blend_projection_minus_causal_gain"] = (
         result["blend_residual_replay_delta_projection"] - float(record.correction_gain)
     )
-
-    axes: dict[str, dict[str, float]] = {}
-    for name in _AXES:
-        axes[name] = {
-            "oracle_ratio": float(values[cursor]),
-            "oracle_kappa": float(values[cursor + 1]),
+    result["axes"] = {
+        name: {
+            "oracle_ratio": resolved[f"axis:{name}:oracle_ratio"],
+            "oracle_kappa": resolved[f"axis:{name}:oracle_kappa"],
         }
-        cursor += 2
-    result["axes"] = axes
+        for name in _AXES
+    }
     result["causal_replay_delta_cosine"] = (
-        None if causal_replay_cosine is None else float(values[cursor])
+        None
+        if causal_replay_cosine is None
+        else resolved["causal_replay_delta_cosine"]
     )
-    if causal_replay_cosine is not None:
-        cursor += 1
     result["replay_disagreement"] = (
-        None if replay_disagreement is None else float(values[cursor])
+        None if replay_disagreement is None else resolved["replay_disagreement"]
     )
     return result
 
@@ -564,16 +582,6 @@ def _validate_replay_decomposition(
         aggregate.compute_seconds += time.perf_counter() - started
 
 
-def _validate_replay_native_shadow_with_decomposition(
-    smoother: OfflineSmoother,
-    aggregate: _trust._TrustAggregate,
-) -> None:
-    if _ORIGINAL_REPLAY_VALIDATOR is None:
-        raise RuntimeError("replay component shadow was not installed correctly")
-    _ORIGINAL_REPLAY_VALIDATOR(smoother, aggregate)
-    _validate_replay_decomposition(smoother, aggregate)
-
-
 def _stream_summary(name: str, stream: _ReplayComponentStream) -> str:
     prefix = f"model_aware_trust_replay_decomp_{name}"
     fields = [f"{prefix}_samples={stream.count}"]
@@ -633,7 +641,7 @@ def _debug_summary_with_replay_decomposition(self: SpectrumH3Runtime) -> str:
 
 
 def install_replay_component_decomposition() -> None:
-    """Install shadow-only decomposition of offline replay components."""
+    """Register decomposition state for the composed replay-shadow installer."""
     global _ORIGINAL_REPLAY_VALIDATOR
     global _ORIGINAL_RUNTIME_DEBUG_SUMMARY
     if getattr(SpectrumH3Runtime, "_replay_component_shadow_installed", False):
@@ -643,9 +651,6 @@ def install_replay_component_decomposition() -> None:
 
     _ORIGINAL_REPLAY_VALIDATOR = _replay._validate_replay_native_shadow
     _ORIGINAL_RUNTIME_DEBUG_SUMMARY = SpectrumH3Runtime.debug_summary
-    _replay._validate_replay_native_shadow = (
-        _validate_replay_native_shadow_with_decomposition
-    )
     SpectrumH3Runtime.debug_summary = _debug_summary_with_replay_decomposition
     SpectrumH3Runtime._replay_component_shadow_installed = True
 
