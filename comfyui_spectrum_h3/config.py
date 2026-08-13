@@ -27,7 +27,7 @@ class SpectrumH3Config:
     model_aware_mode: str = "off"
     model_aware_risk_threshold: float = 0.65
     model_aware_trust_shrinkage: bool = False
-    model_aware_replay_generic_correction: bool = True
+    model_aware_replay_generic_correction: bool = False
 
     def __post_init__(self) -> None:
         trajectory_modes = {
