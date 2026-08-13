@@ -2,8 +2,6 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-import pytest
-
 from comfyui_spectrum_h3 import replay_calibration as calibration
 from comfyui_spectrum_h3 import replay_calibration_provenance as provenance
 from comfyui_spectrum_h3 import sampling
