@@ -17,7 +17,6 @@ _ARCHIVE_SHADOW_ONLY_ATTR = "_model_aware_trust_replay_shadow_only"
 _ARCHIVE_NATIVE_SHADOW_ATTR = "_model_aware_trust_replay_native_shadow"
 
 _ORIGINAL_BEGIN_OFFLINE_CAPTURE: Callable[..., Any] | None = None
-_ORIGINAL_OFFLINE_BUILD_FORECAST_WEIGHTS: Callable[..., Any] | None = None
 _ORIGINAL_RUNTIME_DEBUG_SUMMARY: Callable[[SpectrumH3Runtime], str] | None = None
 
 
@@ -88,6 +87,7 @@ class _ReplayNativeStream:
         )
         if not all(math.isfinite(float(value)) for value in values):
             return
+
         baseline = max(float(baseline_ratio), 1e-12)
         oracle_shrink = 1.0 - float(oracle_kappa)
         self.count += 1
@@ -124,12 +124,14 @@ class _ReplayNativeStream:
         )
         self.causal_error_correlation.add(causal_disagreement, baseline_ratio)
         self.causal_shrink_correlation.add(causal_disagreement, oracle_shrink)
+
         for kappa in _REPLAY_KAPPAS:
             ratio = float(candidate_ratios[kappa])
             self.candidate_ratio_sums[kappa] += ratio
             self.candidate_advantage_sums[kappa] += (
                 float(baseline_ratio) - ratio
             ) / baseline
+
         if replay_disagreement is not None and math.isfinite(float(replay_disagreement)):
             value = float(replay_disagreement)
             self.replay_observer_count += 1
@@ -200,42 +202,48 @@ def _begin_offline_capture_with_replay_shadow(
         setattr(archive, _ARCHIVE_SHADOW_ONLY_ATTR, bool(_trust._trust_requested(self)))
 
 
-def _spectral_prediction_without_anchor(
+def _spectral_prediction(
     smoother: OfflineSmoother,
-    record: _trust._ReplayShadowRecord,
     samples: torch.Tensor,
     anchor_ids: list[int],
     retained: list[int],
     coordinate: float,
+    *,
+    degree: int,
+    ridge_lambda: float,
+    model_aware: bool,
 ) -> torch.Tensor:
-    validator = HistoryWeightForecaster(
-        degree=record.degree,
-        ridge_lambda=record.ridge_lambda,
-        max_history=max(len(retained), record.degree + 1, 2),
+    forecaster = HistoryWeightForecaster(
+        degree=degree,
+        ridge_lambda=ridge_lambda,
+        max_history=max(len(retained), degree + 1, 2),
         history_storage="system_ram",
     )
     for index in retained:
-        validator.update(
+        forecaster.update(
             smoother.archive.anchors[index].coordinate,
             samples[index],
             anchor_id=anchor_ids[index],
             take_ownership=True,
         )
-    spectral = smoother._affine_spectral_weights(
-        validator.model_aware_weights(
+    if model_aware:
+        weights = forecaster.model_aware_weights(
             coordinate,
             1.0,
-            degree=record.degree,
-            ridge_lambda=record.ridge_lambda,
+            degree=degree,
+            ridge_lambda=ridge_lambda,
             correction_gain=0.0,
         )
-    )
+    else:
+        # OfflineSmoother._build_validation_scores uses its configured spectral
+        # forecaster here, independent of any per-step model-aware degree/ridge.
+        weights = forecaster.spectral_weights(coordinate)
+    spectral = smoother._affine_spectral_weights(weights)
     return torch.einsum("k,kbs->bs", spectral, samples[retained])
 
 
 def _retained_validation_scores(
     smoother: OfflineSmoother,
-    record: _trust._ReplayShadowRecord,
     samples: torch.Tensor,
     anchor_ids: list[int],
     retained: list[int],
@@ -243,33 +251,39 @@ def _retained_validation_scores(
 ) -> list[float] | None:
     if retained_position <= 0 or retained_position >= len(retained) - 1:
         return None
+
     target_original_index = retained[retained_position]
     validation_retained = [
         index for position, index in enumerate(retained) if position != retained_position
     ]
-    if len(validation_retained) < max(2, record.degree + 1):
+    if len(validation_retained) < max(2, smoother.degree + 1):
         return None
-    spectral_prediction = _spectral_prediction_without_anchor(
+
+    target_anchor = smoother.archive.anchors[target_original_index]
+    spectral_prediction = _spectral_prediction(
         smoother,
-        record,
         samples,
         anchor_ids,
         validation_retained,
-        smoother.archive.anchors[target_original_index].coordinate,
+        target_anchor.coordinate,
+        degree=smoother.degree,
+        ridge_lambda=smoother.ridge_lambda,
+        model_aware=False,
     )
+
     left_original_index = retained[retained_position - 1]
     right_original_index = retained[retained_position + 1]
     left = smoother.archive.anchors[left_original_index]
-    target = smoother.archive.anchors[target_original_index]
     right = smoother.archive.anchors[right_original_index]
     spacing = right.coordinate - left.coordinate
     if abs(spacing) <= 1e-12:
         raise RuntimeError("replay-native validation anchors have duplicate coordinates")
-    ratio = (target.coordinate - left.coordinate) / spacing
+    ratio = (target_anchor.coordinate - left.coordinate) / spacing
     local_prediction = torch.lerp(
         samples[left_original_index], samples[right_original_index], ratio
     )
     actual = samples[target_original_index]
+
     scores: list[float] = []
     for branch in range(int(actual.shape[0])):
         spectral_rms = _trust._tensor_rms(spectral_prediction[branch] - actual[branch])
@@ -296,7 +310,6 @@ def _effective_blends_for_withheld_target(
 ) -> torch.Tensor:
     left_scores = _retained_validation_scores(
         smoother,
-        record,
         samples,
         anchor_ids,
         retained,
@@ -304,15 +317,14 @@ def _effective_blends_for_withheld_target(
     )
     right_scores = _retained_validation_scores(
         smoother,
-        record,
         samples,
         anchor_ids,
         retained,
         right_position,
     )
-    branch_count = int(samples.shape[1])
+
     effective = []
-    for branch in range(branch_count):
+    for branch in range(int(samples.shape[1])):
         nearby = []
         if left_scores is not None:
             nearby.append(left_scores[branch])
@@ -337,6 +349,7 @@ def _replay_shadow_case(
         or latest_index >= target_index
     ):
         return None
+
     retained = [index for index in range(len(anchor_ids)) if index != target_index]
     if len(retained) < max(2, record.degree + 1):
         return None
@@ -344,25 +357,28 @@ def _replay_shadow_case(
     if record.step_id in retained_ids:
         raise RuntimeError("replay-native LOO target leaked into retained anchors")
 
-    spectral_prediction = _spectral_prediction_without_anchor(
+    spectral_prediction = _spectral_prediction(
         smoother,
-        record,
         samples,
         anchor_ids,
         retained,
         record.coordinate,
+        degree=record.degree,
+        ridge_lambda=record.ridge_lambda,
+        model_aware=True,
     )
+
     left_id = anchor_ids[target_index - 1]
     right_id = anchor_ids[target_index + 1]
     left_position = retained_ids.index(left_id)
     right_position = retained_ids.index(right_id)
-    latest_position = retained_ids.index(record.latest_anchor_id)
     left = smoother.archive.anchors[target_index - 1]
     right = smoother.archive.anchors[target_index + 1]
     spacing = right.coordinate - left.coordinate
     if abs(spacing) <= 1e-12:
         raise RuntimeError("replay-native shadow bracket has duplicate coordinates")
     ratio = (record.coordinate - left.coordinate) / spacing
+
     retained_samples = samples[retained]
     local_weights = torch.zeros(len(retained), dtype=torch.float32)
     local_weights[left_position] = 1.0 - ratio
@@ -388,15 +404,16 @@ def _replay_shadow_case(
         )
         baseline = baseline + float(record.correction_gain) * correction_delta
 
-    hold = samples[latest_index]
+    latest_position = retained_ids.index(record.latest_anchor_id)
+    hold = retained_samples[latest_position]
     causal_transfer = hold + float(record.kappa) * (baseline - hold)
     fixed_predictions = {
         kappa: hold + float(kappa) * (baseline - hold)
         for kappa in _REPLAY_KAPPAS
     }
 
-    # The target is intentionally read only after every proposal has been built from
-    # the retained cache, so future ground truth cannot enter the candidate state.
+    # The target is read only after the complete candidate and validation state has
+    # been constructed from the retained cache.
     actual = samples[target_index]
     epsilon = _trust._tensor_rms(actual).mul(1e-6).clamp_min(_trust._EPS)
     hold_rms = _trust._tensor_rms(actual - hold).clamp_min(epsilon)
@@ -424,7 +441,7 @@ def _replay_shadow_case(
             spectral_prediction - local_prediction
         ) / _trust._tensor_rms(baseline).clamp_min(_trust._EPS)
 
-    scalars = torch.stack(
+    values = torch.stack(
         (
             baseline_ratio,
             local_ratio,
@@ -440,28 +457,29 @@ def _replay_shadow_case(
             *(() if replay_disagreement is None else (replay_disagreement,)),
         )
     ).detach().to(device="cpu", dtype=torch.float32).tolist()
+
     cursor = 0
     result: dict[str, Any] = {
         "retained_anchor_ids": tuple(retained_ids),
-        "baseline_ratio": float(scalars[cursor]),
-        "local_ratio": float(scalars[cursor + 1]),
-        "causal_transfer_ratio": float(scalars[cursor + 2]),
-        "oracle_ratio": float(scalars[cursor + 3]),
-        "oracle_kappa": float(scalars[cursor + 4]),
-        "local_oracle_ratio": float(scalars[cursor + 5]),
-        "local_oracle_kappa": float(scalars[cursor + 6]),
-        "effective_blend_mean": float(scalars[cursor + 7]),
-        "effective_blend_min": float(scalars[cursor + 8]),
-        "effective_blend_max": float(scalars[cursor + 9]),
+        "baseline_ratio": float(values[cursor]),
+        "local_ratio": float(values[cursor + 1]),
+        "causal_transfer_ratio": float(values[cursor + 2]),
+        "oracle_ratio": float(values[cursor + 3]),
+        "oracle_kappa": float(values[cursor + 4]),
+        "local_oracle_ratio": float(values[cursor + 5]),
+        "local_oracle_kappa": float(values[cursor + 6]),
+        "effective_blend_mean": float(values[cursor + 7]),
+        "effective_blend_min": float(values[cursor + 8]),
+        "effective_blend_max": float(values[cursor + 9]),
     }
     cursor += 10
     result["candidate_ratios"] = {
-        kappa: float(scalars[cursor + index])
+        kappa: float(values[cursor + index])
         for index, kappa in enumerate(_REPLAY_KAPPAS)
     }
     cursor += len(_REPLAY_KAPPAS)
     result["replay_disagreement"] = (
-        None if replay_disagreement is None else float(scalars[cursor])
+        None if replay_disagreement is None else float(values[cursor])
     )
     return result
 
@@ -477,6 +495,7 @@ def _validate_replay_native_shadow(
     )
     if not isinstance(records, list) or not records:
         return
+
     native = _native_aggregate(smoother.archive)
     started = time.perf_counter()
     try:
@@ -506,9 +525,7 @@ def _validate_replay_native_shadow(
                 case = _replay_shadow_case(smoother, record, samples, anchor_ids)
                 if case is None:
                     continue
-                stream = (
-                    native.audio if record.stream_name == "audio" else native.video
-                )
+                stream = native.audio if record.stream_name == "audio" else native.video
                 stream.record(
                     baseline_ratio=case["baseline_ratio"],
                     local_ratio=case["local_ratio"],
@@ -524,15 +541,15 @@ def _validate_replay_native_shadow(
                     candidate_ratios=case["candidate_ratios"],
                     replay_disagreement=case["replay_disagreement"],
                 )
+
+                # Keep the original replay-shadow fields as a counterfactual record
+                # of the now-rejected causal-kappa transfer, without applying it.
                 legacy = (
                     aggregate.replay_shadow_audio
                     if record.stream_name == "audio"
                     else aggregate.replay_shadow_video
                 )
-                legacy.record(
-                    case["baseline_ratio"],
-                    case["causal_transfer_ratio"],
-                )
+                legacy.record(case["baseline_ratio"], case["causal_transfer_ratio"])
             except torch.cuda.OutOfMemoryError:
                 raise
             except (RuntimeError, TypeError, ValueError, KeyError, IndexError):
@@ -544,15 +561,13 @@ def _validate_replay_native_shadow(
 def _offline_build_forecast_weights_shadow_only(
     self: OfflineSmoother,
 ):
-    if _ORIGINAL_OFFLINE_BUILD_FORECAST_WEIGHTS is None:
-        raise RuntimeError("replay-native trust shadow was not installed correctly")
     base_builder = _trust._ORIGINAL_OFFLINE_BUILD_FORECAST_WEIGHTS
     if base_builder is None:
         raise RuntimeError("causal trust base replay builder is unavailable")
 
-    # Always bypass the rejected causal-kappa replay wrapper. When trust is disabled
-    # this is baseline-identical because base_builder is the already-installed
-    # generic-correction replay builder.
+    # Bypass the rejected causal-kappa replay wrapper for every OfflineSmoother.
+    # With trust disabled this is baseline-identical because base_builder is the
+    # existing replay builder containing the PR #39 generic correction.
     weights_by_step = base_builder(self)
     aggregate = getattr(self.archive, "_model_aware_trust_aggregate", None)
     if isinstance(aggregate, _trust._TrustAggregate):
@@ -613,6 +628,7 @@ def _debug_summary_with_replay_shadow(self: SpectrumH3Runtime) -> str:
     archive = getattr(self, "_offline_archive", None)
     if archive is None or not _archive_shadow_only(archive):
         return summary
+
     summary = summary.replace(
         "model_aware_trust_path=offline_replay_causal_kappa_transfer",
         "model_aware_trust_path=offline_replay_shadow_only",
@@ -636,7 +652,6 @@ def _debug_summary_with_replay_shadow(self: SpectrumH3Runtime) -> str:
 def install_replay_native_trust_shadow() -> None:
     """Disable causal-kappa replay transfer and install replay-native shadow telemetry."""
     global _ORIGINAL_BEGIN_OFFLINE_CAPTURE
-    global _ORIGINAL_OFFLINE_BUILD_FORECAST_WEIGHTS
     global _ORIGINAL_RUNTIME_DEBUG_SUMMARY
     if getattr(SpectrumH3Runtime, "_replay_native_trust_shadow_installed", False):
         return
@@ -644,7 +659,6 @@ def install_replay_native_trust_shadow() -> None:
         raise RuntimeError("install forecast trust before replay-native trust shadow")
 
     _ORIGINAL_BEGIN_OFFLINE_CAPTURE = SpectrumH3Runtime.begin_offline_capture
-    _ORIGINAL_OFFLINE_BUILD_FORECAST_WEIGHTS = OfflineSmoother._build_forecast_weights
     _ORIGINAL_RUNTIME_DEBUG_SUMMARY = SpectrumH3Runtime.debug_summary
 
     SpectrumH3Runtime.begin_offline_capture = _begin_offline_capture_with_replay_shadow
@@ -653,6 +667,4 @@ def install_replay_native_trust_shadow() -> None:
     SpectrumH3Runtime._replay_native_trust_shadow_installed = True
 
 
-__all__ = [
-    "install_replay_native_trust_shadow",
-]
+__all__ = ["install_replay_native_trust_shadow"]
