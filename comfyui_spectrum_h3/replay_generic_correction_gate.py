@@ -128,7 +128,10 @@ def _build_forecast_weights_with_replay_generic_gate(
     if _ORIGINAL_OFFLINE_BUILD_FORECAST_WEIGHTS is None:
         raise RuntimeError("replay generic-correction gate was not installed correctly")
 
-    enabled = bool(getattr(self.archive, _ARCHIVE_GATE_ATTR, False))
+    # Every production archive is stamped by begin_offline_capture. Treat an
+    # unstamped hand-constructed archive as legacy-enabled so low-level archive
+    # consumers and historical tests retain their pre-gate semantics.
+    enabled = bool(getattr(self.archive, _ARCHIVE_GATE_ATTR, True))
     original_steps = self.archive.steps
     opportunities = _generic_application_opportunities(self, original_steps)
 
@@ -171,7 +174,7 @@ def _debug_summary_with_replay_generic_gate(self: SpectrumH3Runtime) -> str:
         return summary
     telemetry = getattr(archive, _ARCHIVE_TELEMETRY_ATTR, None)
     if not isinstance(telemetry, _ReplayGenericCorrectionTelemetry):
-        enabled = bool(getattr(archive, _ARCHIVE_GATE_ATTR, False))
+        enabled = bool(getattr(archive, _ARCHIVE_GATE_ATTR, True))
         telemetry = _ReplayGenericCorrectionTelemetry(
             enabled=enabled,
             path=(
