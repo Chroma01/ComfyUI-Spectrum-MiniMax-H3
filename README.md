@@ -16,9 +16,10 @@ Since v0.2.1, the standard audio-fidelity path is:
 offline_smoothing_replay = true
 blend_weight = 0.50
 audio_blend_weight = 0.00
+model_aware_replay_generic_correction = false
 ```
 
-The first pass captures a causal trajectory with local-only prediction for both modalities. A transformer-free second pass then applies the configured video blend using past and future actual anchors. No later joint H3 transformer call can feed the replayed video change back into audio, and the zero audio weight prevents direct spectral mixing of audio rows.
+The first pass captures a causal trajectory with local-only prediction for both modalities. A transformer-free second pass then applies the configured video blend using past and future actual anchors. No later joint H3 transformer call can feed the replayed video change back into audio, and the zero audio weight prevents direct spectral mixing of audio rows. When `model_aware_mode=full`, the supported replay default also leaves the causal PR #39 latest-delta correction in its causal geometry instead of transplanting that scalar onto the different future-bracket replay direction.
 
 This default was introduced after earlier single-pass Spectrum releases were found to reduce overall audio fidelity, clarity, naturalness, and stability. Reports included generated speech and reference-conditioned audio; speech tripping, doubled syllables, and stuttering were the clearest reproducible symptoms of the wider degradation. Matched runs on the affected seed isolated two paths: direct spectral audio blending and indirect video-to-audio feedback through later joint transformer evaluations. The current offline path produced clean audio on that seed while retaining the preferred image result. This validates the correction for the reproduced case; broader checkpoints, prompts, samplers, and reference inputs still need exact-seed validation.
 
@@ -135,7 +136,7 @@ The node adds no third-party Python dependency. It uses PyTorch and ComfyUI modu
 
 ### Updating
 
-Use v0.2.1 or newer for the corrected default audio path. Use v0.2.2 or newer for live two-pass progress reporting. Use v0.2.4 or newer for live KJNodes MiniMax H3 TAE previews during offline replay. Use v0.2.5 or newer for bounded default replay VRAM and MiniMax H3 Turbo sampler support. Update a Git clone with:
+Use v0.2.1 or newer for the corrected default audio path. Use v0.2.2 or newer for live two-pass progress reporting. Use v0.2.4 or newer for live KJNodes MiniMax H3 TAE previews during offline replay. Use v0.2.5 or newer for bounded default replay VRAM and MiniMax H3 Turbo sampler support. Use v0.2.8 or newer for native ER-SDE replay detection with reviewed upstream scaler closures and the narrowed terminal replay safeguard. Update a Git clone with:
 
 ```bash
 cd ComfyUI/custom_nodes/ComfyUI-Spectrum-MiniMax-H3
@@ -175,31 +176,45 @@ Other external sampler callbacks remain replay-only. Spectrum does not invoke ar
 | `window_size` | `2.0` | Initial adaptive interval. |
 | `flex_window` | `0.75` | Amount added to the interval after a scheduled post-warmup actual step. |
 | `warmup_steps` | `1` | Initial solver steps forced to native transformer evaluation. Values above `1` disable the one-point bootstrap. |
-| `tail_actual_steps` | `1` | Requested final native tail. Deterministic RES enforces a sampler-safe minimum of `3`. |
+| `tail_actual_steps` | `1` | Requested final native tail. Deterministic RES enforces a sampler-safe minimum of `3`. ER-SDE offline replay only promotes a penultimate step when the normal schedule would otherwise forecast it; this is not a blanket two-step ER-SDE tail. |
 | `max_history` | `8` | Maximum model-dtype actual feature snapshots retained. |
-| `debug` | `false` | Enables concise run, step, topology, fallback, sanitization, chunk, and teardown logs. |
+| `debug` | `false` | Enables concise run, step, topology, fallback, sanitization, chunk, teardown, and research calibration logs. |
 | `history_storage` | `system_ram` | Stores the causal history, capped by `max_history`, in `system_ram` or `vram`. |
 | `bootstrap_first_forecast` | `true` | Experimental one-point hold for `degree=1` and `warmup_steps<=1`. Incompatible node settings disable it with a console warning. |
 | `anchor_residual_feedback` | `false` | Experimental video-scored actual-refresh guard. It never injects a hidden residual. Disable offline replay before enabling it. |
 | `selective_rollback_correction` | `false` | Experimental thresholded, budgeted rollback for the exact deterministic Euler sampler contract. Disable offline replay before enabling it. |
-| `offline_smoothing_replay` | `true` | Standard v0.2.1+ audio-fidelity path: local-only causal capture followed by cross-validated, transformer-free bidirectional replay. |
+| `offline_smoothing_replay` | `true` | Compatibility-safe standard audio-fidelity path: local-only causal capture followed by cross-validated, transformer-free bidirectional replay. Current controlled native ER-SDE testing favored `full` single-pass for one recurring temporal facial artifact; replay remains supported. |
 | `audio_blend_weight` | `0.00` | Configured audio spectral share. Zero keeps replayed audio on local interpolation and prevents direct spectral mixing of audio rows. |
 | `offline_archive_storage` | `system_ram` | Stores every actual anchor retained until offline replay completes. This archive is not capped by `max_history`; `vram` is an explicit speed/memory tradeoff. |
-| `model_aware_mode` | `off` | Experimental model/patch prior. `schedule` adds risk-based actual anchors; `schedule_confidence` also adapts fitting/blend; `full` additionally applies only the bounded generic latest-delta residual correction. Tested model-specific Feature-3 correction families are retired. |
+| `model_aware_mode` | `off` | Experimental model/patch prior. `schedule` adds risk-based actual anchors; `schedule_confidence` also adapts fitting/blend; `full` additionally applies only the bounded generic latest-delta residual correction. In current native ER-SDE testing, `full` single-pass is the preferred tested model-aware quality mode among the compared configurations. |
 | `model_aware_risk_threshold` | `0.65` | A prospective legacy forecast becomes an actual evaluation when the combined live/model risk reaches this value. Existing hard sampler, warmup, history, and tail rules still take precedence. |
+| `model_aware_trust_shrinkage` | `false` | Experimental research/reproduction switch for `full`. The perceptual gate is complete and current native ER-SDE testing does not recommend promotion. It adds no transformer evaluation. Offline replay does not apply the rejected causal-kappa transfer. |
+| `model_aware_replay_generic_correction` | `false` | Replay-only legacy/ablation switch for `full`. `false` keeps the causal PR #39 scalar out of future-bracket replay; `true` explicitly restores the old replay transfer for regression/scientific reproduction. The causal PR #39 correction is unchanged. |
 
 ## Experimental model-aware forecasting
 
-`model_aware_mode` is opt-in and defaults to `off`, so old workflows retain the legacy schedule, fitting, blending, and replay behavior. The serialized values are intentionally unchanged for workflow compatibility:
+`model_aware_mode` is opt-in and defaults to `off`. Saved input values continue to be honored; workflows without the replay-correction input receive the supported `model_aware_replay_generic_correction=false` default.
 
-- `off`: legacy Spectrum behavior.
+- `off`: legacy Spectrum scheduling/fitting behavior.
 - `schedule`: Feature 1 model/patch-aware scheduling. A prospective risky forecast may be converted into an actual transformer evaluation, but a required actual step is never relaxed into a forecast.
 - `schedule_confidence`: Feature 1 plus Feature 2 confidence/adaptive fitting. It may adapt ridge regularization, usable degree, and modality-specific spectral share. It applies no forecast correction.
-- `full`: Feature 1 plus Feature 2 plus the bounded **generic latest-delta residual correction**. No successful model-specific Feature-3 correction is applied.
+- `full`: Feature 1 plus Feature 2 plus the bounded **generic latest-delta residual correction** on the causal forecast path. No successful model-specific Feature-3 correction is applied.
 
 The model-informed correction objective was investigated explicitly rather than assumed to work. Real base-H3 gates tested exact/Gram-diagonal scalar head metrics, K=2 causal trajectory rank, normalized `W^T W d`, normalized `J_t^T J_t d`, previous hidden residual persistence, `W^T e_previous`, and the complete current-FinalLayer adjoint `J_t^T e_previous`. None produced a material >=2% improvement over the appropriate generic baseline. The complete experiment record, including the radial-bound bug found during the transformed-direction screen and the corrected normalization rerun, is preserved in [MODEL_AWARE_BENCHMARK.md](MODEL_AWARE_BENCHMARK.md).
 
-The generic latest-delta correction remains independently useful: the final same-seed gate improved the aggregate raw forecast ratio by about 6.2% for audio and 5.5% for video. That benefit is **generic trajectory correction**, not evidence of successful model-informed Feature 3.
+The generic latest-delta correction remains independently useful in **causal latest-delta geometry**. In the final controlled same-seed 20-step native ER-SDE comparison, `schedule_confidence` and `full` both used 11 actual steps, 9 forecast steps, and 11 actual transformer calls, with zero extra transformer NFE from the correction. In `full`, audio hidden forecast error changed from `1.777636` to `1.670690` (about `6.02%` lower) and video from `1.313055` to `1.250087` (about `4.80%` lower). The recurring false eye-motion artifact that remained subtly visible with `schedule_confidence` was absent in `full`; an offline-replay comparison still showed the artifact. These percentages are hidden-feature-error reductions on this trace, not perceptual-quality percentages. This quality conclusion is established for the tested native ER-SDE configuration and is not generalized to Euler, RES/RES CFG++, Turbo/LightX2V, or other samplers.
+
+An earlier same-seed native ER-SDE isolation also found that `schedule_confidence` retained an incorrect pronunciation of German `weg` while `full` retained the intended pronunciation. This supports the surviving generic causal correction as a user-visible mechanism in the tested ER-SDE cases.
+
+For current native ER-SDE quality testing, the preferred tested configuration is:
+
+```text
+model_aware_mode = full
+model_aware_trust_shrinkage = false
+offline_smoothing_replay = false
+```
+
+The global runtime defaults remain compatibility-safe and unchanged by the ER-SDE-only quality comparison.
 
 ### Model and LoRA profile
 
@@ -227,11 +242,11 @@ The existing confidence chronology and rational correction trust region are reta
 g = g_raw_scaled / (1 + |g_raw_scaled| / 0.25)
 ```
 
-`full` applies that generic gain to the latest-delta correction exactly. The rejected exact-head trust mixture, Gram-diagonal correction ablation, K=2 coefficients, transformed-direction screens, and previous-error-adjoint screens no longer execute in normal runtime.
+`full` applies that generic gain to the latest-delta correction exactly on the causal path. The rejected exact-head trust mixture, Gram-diagonal correction ablation, K=2 coefficients, transformed-direction screens, and previous-error-adjoint screens no longer execute in normal runtime.
 
-Offline capture stores each forecast's selected degree, ridge value, audio/video blends, and the same generic scalar correction gain as scalar decision state. Replay uses those exact decisions after dynamically inserted anchors, preserving step alignment and the default `audio_blend_weight=0` fix. No model-profile tensor is archived. First-pass `full` and replay therefore use the same correction semantics.
+Offline capture stores each forecast's selected degree, ridge value, audio/video blends, and causal generic scalar correction gain as scalar decision state so historical/counterfactual diagnostics remain reproducible. With the supported `model_aware_replay_generic_correction=false` default, replay **does not apply** that causal scalar to the different future-bracket direction. Setting it to `true` explicitly restores the old replay transfer for regression/scientific reproduction. No model-profile tensor is archived, and the causal PR #39 correction remains unchanged.
 
-Euler, deterministic RES/CFG++, MiniMax-H3 Turbo, and native `er_sde` retain their existing hard one-forecast horizon and refresh rules. On `er_sde`, evidence is generation-local and tied to the current seeded trajectory; it is never reused across runs. Offline replay still requires the existing seeded native ER-SDE components and rejects custom noise samplers/scalers.
+Euler, deterministic RES/CFG++, MiniMax-H3 Turbo, and native `er_sde` retain their existing hard one-forecast horizon and refresh rules. On `er_sde`, evidence is generation-local and tied to the current seeded trajectory; it is never reused across runs.
 
 ### Overhead, debugging, and limitations
 
@@ -250,7 +265,15 @@ feature3_error_workspace_bytes=0
 feature3_extra_transformer_nfe=0
 ```
 
-The automated environment does not contain a full MiniMax-H3 checkpoint, so real-checkpoint timing and quality conclusions remain based on the recorded user gates rather than synthetic fixtures. The final gate requested by this PR is a single mechanical `full -> schedule_confidence -> full` rerun to verify the cleaned shipping architecture, not to search for another Feature-3 hypothesis.
+For `debug=true`, `model_aware_mode=full`, and offline replay, the runtime can also emit a bounded scalar-only VIDEO replay-calibration block with marker:
+
+```text
+SPECTRUM_REPLAY_CALIBRATION_JSON={...}
+```
+
+The block stores exact per-target quadratic moments, ratio normalization, deployable predictors, oracle labels, and provenance. It retains no hidden-feature tensor beyond the existing diagnostic call and adds no transformer evaluation. `tools/analyze_replay_calibration.py` can parse those blocks or complete logs on CPU without starting ComfyUI/model/GPU code, then compare fixed alpha controls, affine current-weight recalibration, and one-predictor residual models by whole trajectory. See [FORECAST_TRUST_BENCHMARK.md](FORECAST_TRUST_BENCHMARK.md) for the schema and model-selection rules.
+
+The trust-shrinkage user-facing gate is complete. Hidden-feature gains did not translate into a reliable perceptual improvement, so `model_aware_trust_shrinkage=false` remains the supported/default setting and trust is not an active production candidate. No further kappa tuning or rescue search is planned for this cycle. The replay calibration/evaluator remains research tooling; no new affine, disagreement, validation-penalty, coordinate, floor, tree, neural, or other applied replay controller is introduced.
 
 Every value is validated. `max_history` must be at least `degree + 1`.
 
@@ -268,7 +291,7 @@ When `enabled=True`, the three trajectory modes are mutually exclusive. Enabling
 
 ## Default trajectory correction and retained experiments
 
-Offline smoothing replay is the standard default-on H3 path because it removed the reproduced causal video-to-audio degradation in the matched test. The two repository-specific residual/rollback experiments remain default-off. Real-checkpoint tests at 0.65 MP, 8 seconds, 20-step Euler found degraded speech with the original audiovisual anchor-feedback injection and excessive rollback work under the original `score > 1` trigger. The safeguards below retain those modes for continued research outside the default execution path.
+Offline smoothing replay is the standard default-on H3 path because it removed the reproduced causal video-to-audio degradation in the matched test. Current native ER-SDE testing gives a separate, scoped recommendation for `full` single-pass when prioritizing the tested temporal facial behavior. The two repository-specific residual/rollback experiments remain default-off. Real-checkpoint tests at 0.65 MP, 8 seconds, 20-step Euler found degraded speech with the original audiovisual anchor-feedback injection and excessive rollback work under the original `score > 1` trigger. The safeguards below retain those modes for continued research outside the default execution path.
 
 | Setting | Status/default | Sampler support | Passes | Behavior when unsupported |
 |---|---|---|---:|---|
@@ -348,12 +371,15 @@ Replay adds a second sampler pass and output-head work while eliminating H3 tran
 
 Across three supplied 0.65 MP / 8-second runs of the earlier fixed-blend implementation, the transformer-free replay added 8.49%, 8.63%, and 8.95% to its corresponding first-pass sampler time while retaining 11 first-pass H3 calls. A later VRAM-resident local-only replay completed in `0.441 s`, while the matched single-pass Spectrum run used the same 11-call schedule. Global `blend_weight=0.5` degraded audio in both paths; global `blend_weight=0` produced clean audio in the two matched runs. Direct modality splitting removed direct audio mixing and left the indirect joint-trajectory defect in single-pass `video=0.5, audio=0`. Revised isolated capture/replay at `video=0.5, audio=0` restored the affected seed's audio fidelity and stability, including the speech-stutter symptom. The evidence establishes the mechanism for that case and leaves broader quality and stability unproven.
 
+In the final controlled 20-step native ER-SDE comparison, replay used 11 first-pass transformer evaluations, then 20 transformer-free replay steps with 11 anchors and 9 smoothed steps. The replay added about `13.25 s` in that trace, retained about `4315.5 MiB` of archive data, and used an effective video blend mean of about `0.346053` with audio local-only. The same false eye-motion artifact remained visibly present. This does not invalidate replay's historical audio/stutter benefits and does not establish the same ranking for other samplers.
+
 The default audio-fidelity configuration is:
 
 ```text
 offline_smoothing_replay = true
 blend_weight = 0.50
 audio_blend_weight = 0.00
+model_aware_replay_generic_correction = false
 ```
 
 ### Current default (performance-oriented)
@@ -374,6 +400,10 @@ bootstrap_first_forecast = true
 offline_smoothing_replay = true
 anchor_residual_feedback = false
 selective_rollback_correction = false
+model_aware_mode = off
+model_aware_risk_threshold = 0.65
+model_aware_trust_shrinkage = false
+model_aware_replay_generic_correction = false
 ```
 
 ### Conservative schedule for A/B testing
@@ -394,6 +424,10 @@ bootstrap_first_forecast = false
 offline_smoothing_replay = true
 anchor_residual_feedback = false
 selective_rollback_correction = false
+model_aware_mode = off
+model_aware_risk_threshold = 0.65
+model_aware_trust_shrinkage = false
+model_aware_replay_generic_correction = false
 ```
 
 The current defaults prioritize throughput and have not been established as universally quality-safe. Existing workflows retain their saved input values. The conservative schedule changes the forecast degree, warmup, and bootstrap behavior: it keeps the first five solver steps native, waits for the five actual history points required by degree 4, and does not use the one-point hold. It reduces the speed benefit and is not established as consistently higher quality. Disabling the bootstrap also changes the denoising trajectory and has produced a less preferred visual result in testing.
@@ -448,7 +482,7 @@ Forecasting is currently allowlisted for:
 - RES multistep (`sample_res_multistep`)
 - RES multistep CFG++ (`sample_res_multistep_cfg_pp`)
 
-The reviewed implementations make one `predict_noise` call per solver iteration. Euler feeds each approximate denoised result into the latent used by the next evaluation, so it requires one completed actual H3 evaluation after every forecast. ER-SDE also makes exactly one model call per outer iteration: `max_stage` reuses the current and previous denoised results for its higher-stage finite differences and does not add model evaluations. Its native default noise sampler is recreated from the same workflow seed for each offline pass, draws once after each nonterminal deterministic update when effective `s_noise > 0`, and does not draw on the final sigma-zero step. Custom `noise_sampler` or `noise_scaler` callables may carry mutable state across invocations, so offline replay fails closed to one native pass when either override is supplied. ER-SDE uses the same conservative limit of one consecutive forecast followed by one completed actual refresh and has no additional forced tail.
+The reviewed implementations make one `predict_noise` call per solver iteration. Euler feeds each approximate denoised result into the latent used by the next evaluation, so it requires one completed actual H3 evaluation after every forecast. ER-SDE also makes exactly one model call per outer iteration: `max_stage` reuses the current and previous denoised results for its higher-stage finite differences and does not add model evaluations. Its native default noise sampler is recreated from the same workflow seed for each offline pass, draws once after each nonterminal deterministic update when effective `s_noise > 0`, and does not draw on the final sigma-zero step. The reviewed native deterministic `noise_scaler` closures used by ComfyUI's `SamplerER_SDE` are replay-safe when their closure code and captured metadata match the audited native contract. An explicitly supplied custom `noise_sampler` remains replay-unsafe; arbitrary/custom/stateful scaler closures and unknown future upstream closure contracts also fail closed to one native pass. ER-SDE keeps the one-forecast/one-completed-actual-refresh rule. During offline capture only, a penultimate step is promoted when the normal runtime schedule would otherwise forecast it, preserving a future exact terminal anchor for replay. Normal 20-step and 32-step ER-SDE schedules already make the penultimate step actual and receive no extra NFE; the reproduced 25-step `22 actual / 23 forecast / 24 actual` terminal pattern becomes `22 / 23 / 24 actual`. Explicitly larger configured tails still win.
 
 Larryvrh's reviewed MiniMax H3 Turbo sampler follows the same deterministic single-call contract and refresh policy. RES multistep stores each current denoised result as `old_denoised` for the following second-order update. The actual evaluation immediately after a forecast still consumes forecast-derived history, then replaces `old_denoised` with its native result before another forecast is allowed. This prevents any RES update from combining two forecasted denoised results. RES also keeps its final three solver steps native; this tail floor applies even when a saved workflow supplies a smaller `tail_actual_steps` value. Other unreviewed ancestral samplers execute native MiniMax H3. Debug mode logs the exact fallback, tail, or post-forecast refresh reason. Multi-GPU parallel sampling also remains native because distributed forecast-row transactions are not yet validated.
 
@@ -520,7 +554,7 @@ Automated tests cover:
 - model detection and clone runtime isolation;
 - exact native versus wrapped forced-actual video/audio output on a deterministic tiny native H3 fixture;
 - proof that a forecast fixture invokes zero H3 transformer blocks;
-- exact MiniMax H3 Turbo and native ER-SDE recognition, prefix rejection, conservative refresh policies, seeded ER-SDE replay guards, and complete offline capture/replay coverage;
+- exact MiniMax H3 Turbo and native ER-SDE recognition, prefix rejection, conservative refresh policies, seeded ER-SDE replay guards, reviewed native scaler-closure detection, narrowed 20/25/32-step ER-SDE replay-tail behavior, and complete offline capture/replay coverage;
 - refresh-only anchor feedback with video-only policy scoring, a `1.5` threshold, a three-refresh budget, and no retained/injected hidden residual;
 - terminal feedback-probe elimination while preserving the final rollback validation probe;
 - rollback threshold and three-correction budget enforcement;
@@ -530,10 +564,13 @@ Automated tests cover:
 - downstream `predict_noise` passthroughs that never reach the native H3 wrapper, including one-warning disablement and retained-history release;
 - compact model/LoRA profile construction for base, single, stacked, differently weighted, zero-strength, and unknown patches; scalar audio/video output-head sensitivity, clone reuse, patch UUID invalidation, bounded cache lifetime, and no retained model or output-head tensor references;
 - model-aware risk calibration and bounded adaptive ridge/degree/blend;
-- exact `full` equality between the applied correction gain and the surviving generic scalar gain;
+- exact `full` equality between the applied **causal** correction gain and the surviving generic scalar gain;
+- default-off trust/replay correction paths, explicit legacy reproduction, and proof that the causal PR #39 path is unchanged;
 - zero exact-head materialization/projection/evidence after Feature-3 retirement;
 - K=2/transformed-direction/previous-error runtime retirement and zero Feature-3 workspace/evidence;
-- replay scalar-state continuity for the generic correction and no extra transformer NFE.
+- exact VIDEO replay-calibration quadratic-moment/ratio parity, scalar schema/provenance, leakage boundary, structural interior-target validation, and failure isolation;
+- CPU-only calibration parsing, run-level cross-validation, fixed/affine/one-predictor hierarchy, coordinate control, held-out leakage regressions, and deterministic reporting;
+- replay scalar-state continuity for historical/counterfactual diagnostics and no extra transformer NFE.
 
 GitHub Actions remains the authoritative multi-revision check after this branch is published. The historical Feature-3 mathematical/telemetry tests were removed with their rejected runtime; the real experimental record remains in `MODEL_AWARE_BENCHMARK.md` and Git history.
 
@@ -559,16 +596,9 @@ python -m pytest -q
 
 ## Validation boundaries
 
-The offline mode was promoted because the affected same-seed A/B isolated the remaining failure path: single-pass `video=0.5, audio=0` reproduced the broader loss of audio fidelity and stability, while offline capture/replay with the same weights restored clean audio and retained the preferred image result. Broader checkpoint, sampler, prompt, and conditioning coverage remains valuable. Before either retained experiment is considered for promotion, test 20-step Euler and RES multistep, plus RES CFG++ where applicable, at approximately 0.65 MP, 8 seconds, and 24 fps. Keep prompt, seed, checkpoint, resolution, duration, sampler, scheduler, images, and audio references identical across:
+The offline mode was promoted because the affected same-seed A/B isolated the remaining failure path: single-pass `video=0.5, audio=0` reproduced the broader loss of audio fidelity and stability, while offline capture/replay with the same weights restored clean audio and retained the preferred image result. Broader checkpoint, sampler, prompt, and conditioning coverage remains valuable. The final native ER-SDE trust gate is complete and is not awaiting another user generation. The remaining default-off residual/rollback experiments still require their own sampler-specific evidence before any promotion.
 
-- native Spectrum-off;
-- the default offline path;
-- explicit single-pass mode with all three settings false; and
-- each retained experimental setting enabled separately with offline replay disabled.
-
-Inspect video quality, generated audio, reference-audio distortion, audiovisual synchronization, total wall time, actual/discarded/replayed transformer calls, peak VRAM, and peak system RAM. Cancel during the first pass, residual evaluation, rollback replay, and offline replay. Run at least ten consecutive generations with Sol-Attn enabled and load old saved workflows to detect retained state, memory growth, deadlocks, callback duplication, WSL wedges, and compatibility regressions.
-
-For the modality split specifically, repeat affected exact seeds with `video/audio` weights `0/0`, `0.5/0`, and `0.5/0.5` in single-pass Spectrum and offline replay. Current evidence establishes that global `0.5/0.5` degraded audio and global `0/0` produced clean audio on one seed. On that same seed, revised offline replay at `0.5/0` restored clean, stable audio and retained the preferred image result, while single-pass `0.5/0` reproduced the degradation and speech-stutter symptom. Broader seeds, speech styles, ambient/transient audio, reference inputs, BF16/INT8 checkpoints, and RES variants remain required.
+For the modality split specifically, repeat affected exact seeds with `video/audio` weights `0/0`, `0.5/0`, and `0.5/0.5` in single-pass Spectrum and offline replay. Current evidence establishes that global `0.5/0.5` degraded audio and global `0/0` produced clean audio on one seed. On that same seed, revised offline replay at `0.5/0` restored clean, stable audio and retained the preferred image result, while single-pass `0.5/0` reproduced the degradation and speech-stutter symptom. Broader seeds, speech styles, ambient/transient audio, reference inputs, BF16/INT8 checkpoints, and RES variants remain unverified.
 
 ## Repository layout
 
@@ -579,20 +609,34 @@ ComfyUI-Spectrum-MiniMax-H3/
 |-- pyproject.toml
 |-- LICENSE
 |-- README.md
+|-- RELEASE_NOTES.md
 |-- IMPLEMENTATION_NOTES.md
 |-- MODEL_AWARE_BENCHMARK.md
+|-- FORECAST_TRUST_BENCHMARK.md
 |-- comfyui_spectrum_h3/
 |   |-- __init__.py
 |   |-- config.py
+|   |-- er_sde_policy.py
 |   |-- experiments.py
 |   |-- forecast.py
 |   |-- generic_correction.py
 |   |-- model_aware.py
-|   |-- nodes.py
+|   |-- replay_calibration.py
+|   |-- replay_calibration_provenance.py
+|   |-- replay_calibration_validation.py
+|   |-- replay_component_shadow.py
+|   |-- replay_generic_correction_gate.py
+|   |-- replay_shadow_composition.py
+|   |-- replay_spectral_alpha_shadow.py
+|   |-- replay_spectral_mixture_shadow.py
+|   |-- replay_trust_shadow.py
+|   |-- trust_probe.py
 |   |-- runtime.py
 |   |-- rollback.py
 |   |-- sampling.py
 |   `-- minimax_h3.py
+|-- tools/
+|   `-- analyze_replay_calibration.py
 `-- tests/
 ```
 
