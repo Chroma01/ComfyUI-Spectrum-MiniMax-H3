@@ -109,9 +109,9 @@ class _StreamProbe:
     disagreement_sum: float = 0.0
     disagreement_max: float = 0.0
     corrected_ratio_sum: float = 0.0
-    delta_oracle_gain_sum: float = 0.0
-    delta_oracle_ratio_sum: float = 0.0
-    delta_oracle_advantage_sum: float = 0.0
+    delta_bound_gain_sum: float = 0.0
+    delta_bound_ratio_sum: float = 0.0
+    delta_bound_advantage_sum: float = 0.0
     oracle_ratio_sum: float = 0.0
     oracle_kappa_sum: float = 0.0
     oracle_advantage_sum: float = 0.0
@@ -130,8 +130,8 @@ class _StreamProbe:
         horizon: float,
         disagreement: float,
         corrected_ratio: float,
-        delta_oracle_gain: float,
-        delta_oracle_ratio: float,
+        delta_bound_gain: float,
+        delta_bound_ratio: float,
         oracle_ratio: float,
         oracle_kappa: float,
         candidate_ratios: dict[float, float],
@@ -140,8 +140,8 @@ class _StreamProbe:
             float(horizon),
             float(disagreement),
             float(corrected_ratio),
-            float(delta_oracle_gain),
-            float(delta_oracle_ratio),
+            float(delta_bound_gain),
+            float(delta_bound_ratio),
             float(oracle_ratio),
             float(oracle_kappa),
             *[float(candidate_ratios[theta]) for theta in _TRUST_THETAS],
@@ -149,8 +149,8 @@ class _StreamProbe:
         if not all(math.isfinite(value) for value in values):
             return
         baseline = max(float(corrected_ratio), 1e-12)
-        delta_oracle_advantage = (
-            float(corrected_ratio) - float(delta_oracle_ratio)
+        delta_bound_advantage = (
+            float(corrected_ratio) - float(delta_bound_ratio)
         ) / baseline
         oracle_advantage = (float(corrected_ratio) - float(oracle_ratio)) / baseline
         self.count += 1
@@ -159,9 +159,9 @@ class _StreamProbe:
         self.disagreement_sum += float(disagreement)
         self.disagreement_max = max(self.disagreement_max, float(disagreement))
         self.corrected_ratio_sum += float(corrected_ratio)
-        self.delta_oracle_gain_sum += float(delta_oracle_gain)
-        self.delta_oracle_ratio_sum += float(delta_oracle_ratio)
-        self.delta_oracle_advantage_sum += delta_oracle_advantage
+        self.delta_bound_gain_sum += float(delta_bound_gain)
+        self.delta_bound_ratio_sum += float(delta_bound_ratio)
+        self.delta_bound_advantage_sum += delta_bound_advantage
         self.oracle_ratio_sum += float(oracle_ratio)
         self.oracle_kappa_sum += float(oracle_kappa)
         self.oracle_advantage_sum += oracle_advantage
@@ -292,17 +292,12 @@ def _record_shadow_probe(
         )
         corrected_ratio = _tensor_rms(actual - proposal) / hold_rms
 
-        residual = (actual - predicted).reshape(-1).to(torch.float32)
-        delta_flat = delta.reshape(-1).to(torch.float32)
-        delta_denominator = torch.dot(delta_flat, delta_flat).clamp_min(
-            epsilon.square() * max(1, int(delta_flat.numel()))
+        projection = float(stream_evidence.residual_projection)
+        delta_bound_gain = projection / (
+            1.0 + abs(projection) / _CORRECTION_GAIN_LIMIT
         )
-        delta_oracle_gain = torch.dot(residual, delta_flat) / delta_denominator
-        delta_oracle_gain = delta_oracle_gain / (
-            1.0 + delta_oracle_gain.abs() / _CORRECTION_GAIN_LIMIT
-        )
-        delta_oracle = predicted + delta_oracle_gain.to(dtype=predicted.dtype) * delta
-        delta_oracle_ratio = _tensor_rms(actual - delta_oracle) / hold_rms
+        delta_bound = predicted + float(delta_bound_gain) * delta
+        delta_bound_ratio = _tensor_rms(actual - delta_bound) / hold_rms
 
         oracle_kappa = oracle_segment_kappa(actual, latest, proposal)
         oracle = latest + oracle_kappa.to(dtype=proposal.dtype) * (proposal - latest)
@@ -321,8 +316,7 @@ def _record_shadow_probe(
             (
                 disagreement,
                 corrected_ratio,
-                delta_oracle_gain,
-                delta_oracle_ratio,
+                delta_bound_ratio,
                 oracle_ratio,
                 oracle_kappa,
                 *[candidate_ratios[theta] for theta in _TRUST_THETAS],
@@ -333,12 +327,12 @@ def _record_shadow_probe(
             horizon=horizon,
             disagreement=float(resolved[0]),
             corrected_ratio=float(resolved[1]),
-            delta_oracle_gain=float(resolved[2]),
-            delta_oracle_ratio=float(resolved[3]),
-            oracle_ratio=float(resolved[4]),
-            oracle_kappa=float(resolved[5]),
+            delta_bound_gain=delta_bound_gain,
+            delta_bound_ratio=float(resolved[2]),
+            oracle_ratio=float(resolved[3]),
+            oracle_kappa=float(resolved[4]),
             candidate_ratios={
-                theta: float(resolved[6 + index])
+                theta: float(resolved[5 + index])
                 for index, theta in enumerate(_TRUST_THETAS)
             },
         )
@@ -375,9 +369,9 @@ def _stream_summary(name: str, probe: _StreamProbe) -> str:
         f"trust_probe_{name}_disagreement_mean={probe.mean(probe.disagreement_sum):.6f}",
         f"trust_probe_{name}_disagreement_max={probe.disagreement_max:.6f}",
         f"trust_probe_{name}_corrected_ratio_mean={probe.mean(probe.corrected_ratio_sum):.6f}",
-        f"trust_probe_{name}_delta_oracle_gain_mean={probe.mean(probe.delta_oracle_gain_sum):.6f}",
-        f"trust_probe_{name}_delta_oracle_ratio_mean={probe.mean(probe.delta_oracle_ratio_sum):.6f}",
-        f"trust_probe_{name}_delta_oracle_advantage_mean={probe.mean(probe.delta_oracle_advantage_sum):.6f}",
+        f"trust_probe_{name}_delta_bound_gain_mean={probe.mean(probe.delta_bound_gain_sum):.6f}",
+        f"trust_probe_{name}_delta_bound_ratio_mean={probe.mean(probe.delta_bound_ratio_sum):.6f}",
+        f"trust_probe_{name}_delta_bound_advantage_mean={probe.mean(probe.delta_bound_advantage_sum):.6f}",
         f"trust_probe_{name}_oracle_ratio_mean={probe.mean(probe.oracle_ratio_sum):.6f}",
         f"trust_probe_{name}_oracle_kappa_mean={probe.mean(probe.oracle_kappa_sum):.6f}",
         f"trust_probe_{name}_oracle_advantage_mean={probe.mean(probe.oracle_advantage_sum):.6f}",
