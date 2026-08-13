@@ -42,14 +42,26 @@ def test_composed_replay_shadow_does_not_cascade_native_failure(monkeypatch):
     def recoverable_native_failure(_smoother, trust_aggregate):
         trust_aggregate.replay_shadow_failures += 1
 
+    component_calls = 0
+
+    def record_component_call(_smoother, _aggregate):
+        nonlocal component_calls
+        component_calls += 1
+
     monkeypatch.setattr(
         composition_module,
         "_NATIVE_REPLAY_VALIDATOR",
         recoverable_native_failure,
     )
+    monkeypatch.setattr(
+        component_module,
+        "_validate_replay_decomposition",
+        record_component_call,
+    )
     composition_module._validate_composed_replay_shadows(smoother, aggregate)
 
     component = component_module._component_aggregate(archive)
     assert aggregate.replay_shadow_failures == 1
+    assert component_calls == 0
     assert component.audio.count == 0
     assert component.video.count == 0
