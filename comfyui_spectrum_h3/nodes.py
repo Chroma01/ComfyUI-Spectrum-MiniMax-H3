@@ -71,7 +71,19 @@ class SpectrumApplyMiniMaxH3:
                         "tooltip": "Initial native solver steps. Values above 1 disable bootstrap_first_forecast.",
                     },
                 ),
-                "tail_actual_steps": ("INT", {"default": 1, "min": 0, "max": 64, "step": 1}),
+                "tail_actual_steps": (
+                    "INT",
+                    {
+                        "default": 1,
+                        "min": 0,
+                        "max": 64,
+                        "step": 1,
+                        "tooltip": (
+                            "Requested final native tail. RES enforces its three-step solver tail. "
+                            "ER-SDE offline replay promotes only a penultimate step that the normal schedule would forecast, preserving a future exact terminal anchor without a blanket two-step tail."
+                        ),
+                    },
+                ),
                 "max_history": ("INT", {"default": 8, "min": 2, "max": 64, "step": 1}),
                 "debug": ("BOOLEAN", {"default": False}),
             },
@@ -121,10 +133,10 @@ class SpectrumApplyMiniMaxH3:
                     {
                         "default": True,
                         "tooltip": (
-                            "Default audio-quality path: capture a local-only trajectory, then apply the "
-                            "configured video/audio blends using past and future anchors without causal "
-                            "video-to-audio feedback. Uses a second sampler pass and retains every actual anchor. "
-                            "Disable only for single-pass comparisons or either research mode."
+                            "Compatibility-safe default and historically validated H3 audio/stutter path: capture a local-only trajectory, "
+                            "then apply configured blends using past and future anchors without causal video-to-audio feedback. "
+                            "It uses a second sampler pass and retains every actual anchor. Current controlled native ER-SDE testing "
+                            "favored full single-pass for one recurring temporal facial artifact; replay remains supported."
                         ),
                     },
                 ),
@@ -160,10 +172,10 @@ class SpectrumApplyMiniMaxH3:
                             "Experimental model/patch-aware scheduling and confidence. 'schedule' may replace "
                             "risky forecasts with actual evaluations. 'schedule_confidence' also adapts ridge "
                             "regularization, usable degree, and spectral share without applying a correction. "
-                            "'full' additionally applies the bounded generic latest-delta residual correction; "
-                            "the investigated model-specific Feature-3 correction families did not meet the "
-                            "materiality gate and are not applied. No extra denoiser forward is performed. "
-                            "Existing workflows remain unchanged when off."
+                            "'full' additionally applies the bounded generic latest-delta residual correction. "
+                            "Current controlled native ER-SDE testing prefers full single-pass among the compared "
+                            "model-aware quality modes. No equivalent conclusion is established for other samplers. "
+                            "The correction itself adds no denoiser forward."
                         ),
                     },
                 ),
@@ -185,10 +197,10 @@ class SpectrumApplyMiniMaxH3:
                     {
                         "default": False,
                         "tooltip": (
-                            "Experimental opt-in for model_aware_mode='full'. Uses bounded spectral-vs-linear "
-                            "disagreement to shrink each audio/video forecast toward the latest causal exact "
-                            "anchor in single-pass mode. Offline replay keeps the rejected causal-kappa transfer "
-                            "disabled and uses shadow-only replay diagnostics. No transformer evaluation is added."
+                            "Experimental research/reproduction switch for model_aware_mode='full'. The supported "
+                            "default is false and current native ER-SDE perceptual A/B testing does not recommend "
+                            "promotion. Offline replay keeps the rejected causal-kappa transfer disabled and uses "
+                            "shadow-only diagnostics. No transformer evaluation is added."
                         ),
                     },
                 ),

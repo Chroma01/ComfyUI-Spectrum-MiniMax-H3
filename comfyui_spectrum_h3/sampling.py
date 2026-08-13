@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -41,6 +42,12 @@ RES_MULTISTEP_SAMPLERS = frozenset(
 )
 
 ER_SDE_SAMPLERS = frozenset({"sample_er_sde"})
+ER_SDE_NATIVE_SCALER_MODULE = "comfy_extras.nodes_custom_sampler"
+ER_SDE_NATIVE_SCALER_FREEVARS = {
+    "SamplerER_SDE.execute.<locals>.er_sde_noise_scaler": ("eta",),
+    "SamplerER_SDE.execute.<locals>.reverse_time_sde_noise_scaler": ("eta",),
+    "SamplerER_SDE.execute.<locals>.ode_noise_scaler": (),
+}
 
 
 @dataclass(slots=True)
@@ -57,6 +64,45 @@ def sampler_is_supported(sampler: Any) -> bool:
     return sampler_name(sampler) in SUPPORTED_SINGLE_CALL_SAMPLERS
 
 
+def _er_sde_noise_scaler_supports_replay(noise_scaler: Any) -> bool:
+    """Accept only the reviewed native SamplerER_SDE scaler closures."""
+    if noise_scaler is None:
+        return True
+    if getattr(noise_scaler, "__module__", None) != ER_SDE_NATIVE_SCALER_MODULE:
+        return False
+
+    qualname = getattr(noise_scaler, "__qualname__", None)
+    expected_freevars = ER_SDE_NATIVE_SCALER_FREEVARS.get(qualname)
+    if expected_freevars is None:
+        return False
+
+    code = getattr(noise_scaler, "__code__", None)
+    if code is None or tuple(code.co_freevars) != expected_freevars:
+        return False
+
+    native_module = sys.modules.get(ER_SDE_NATIVE_SCALER_MODULE)
+    if native_module is None or getattr(noise_scaler, "__globals__", None) is not vars(native_module):
+        return False
+    sampler_class = getattr(native_module, "SamplerER_SDE", None)
+    execute = getattr(sampler_class, "execute", None)
+    execute_function = getattr(execute, "__func__", execute)
+    execute_code = getattr(execute_function, "__code__", None)
+    if execute_code is None or not any(item is code for item in execute_code.co_consts):
+        return False
+
+    closure = getattr(noise_scaler, "__closure__", None) or ()
+    if len(closure) != len(expected_freevars):
+        return False
+    for cell in closure:
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            return False
+        if type(value) not in (int, float):
+            return False
+    return True
+
+
 def sampler_supports_seeded_replay(sampler: Any) -> bool:
     """Return whether a fresh invocation can reconstruct the sampler's random stream."""
     if not sampler_is_supported(sampler):
@@ -67,7 +113,9 @@ def sampler_supports_seeded_replay(sampler: Any) -> bool:
     options = getattr(sampler, "extra_options", {}) or {}
     if not isinstance(options, dict):
         return False
-    return options.get("noise_sampler") is None and options.get("noise_scaler") is None
+    if options.get("noise_sampler") is not None:
+        return False
+    return _er_sde_noise_scaler_supports_replay(options.get("noise_scaler"))
 
 
 def max_consecutive_forecasts(sampler: Any) -> int | None:

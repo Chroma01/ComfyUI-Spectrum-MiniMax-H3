@@ -1,18 +1,207 @@
-# Forecast trust-region benchmark record
+# Forecast trust and replay calibration benchmark record
 
-This document records the forecast-quality investigation following PR #39. Hidden-feature ratios and advantages are feature-space error measurements, **not perceptual-quality percentages**.
+This document records the forecast-quality investigation following PR #39 and the finalization work in PR #45. Hidden-feature ratios and advantages are feature-space error measurements. They are not perceptual-quality percentages.
 
-## Main finding: forecast geometry is part of the calibration problem
+## Final research state
 
-> **Parameters or directions calibrated for one forecast geometry cannot be assumed to transfer to a different endpoint geometry.**
+### Supported
+
+- The causal PR #39 generic latest-delta correction remains part of `model_aware_mode=full`.
+- In current controlled native ER-SDE testing, `model_aware_mode=full` in single-pass mode is the preferred tested model-aware quality configuration among the compared modes.
+- The correction itself adds zero transformer evaluations.
+
+### Supported alternative
+
+- Offline smoothing replay remains supported. It has historical same-seed evidence for fixing important MiniMax H3 audio/stutter/distortion behavior and remains the compatibility-safe global default.
+- Current native ER-SDE testing found a temporal facial case where `full` single-pass performed better than the tested replay path. This result is scoped to native ER-SDE.
+
+### Default off / not recommended for promotion
+
+```text
+model_aware_trust_shrinkage = false
+```
+
+Causal trust shrinkage produced large hidden-feature observer improvements. Repeated real perceptual A/B testing did not produce a reliable user-facing gain and sometimes slightly favored trust disabled. The user-facing gate is complete. No further kappa tuning or denser trust search is planned for this cycle. The setting remains available for research/reproduction and saved-workflow compatibility.
+
+### Rejected transfers
+
+```text
+causal trust kappa -> future-bracket replay
+causal PR #39 latest-delta scalar -> future-bracket replay direction
+```
+
+The supported replay-generic-correction default is:
+
+```text
+model_aware_replay_generic_correction = false
+```
+
+`true` remains a legacy/scientific-ablation path only.
+
+### Research infrastructure only
+
+- exact VIDEO replay calibration export;
+- per-target quadratic moments and exact ratio normalization;
+- provenance/config/schedule/topology/trace fingerprints;
+- standard-library CPU evaluator;
+- whole-run cross-validation;
+- Level 0 fixed controls, Level 1 affine current-weight baseline, and one-predictor Level 2 residual tests.
+
+No applied replay controller is introduced by this research.
+
+### Closed hypotheses
+
+- pure global alpha as a complete replay solution;
+- K=2 correction;
+- FinalLayer-transformed correction;
+- previous-error direction families;
+- hold-anchor replay shrinkage;
+- causal kappa transfer to replay;
+- causal generic scalar transfer to replay.
+
+## Final controlled native ER-SDE quality gate
+
+All three runs below used the same seed, prompt, starting image, resolution, duration/frame count, native ER-SDE sampler/scheduler setup, model, precision, workflow, and remaining generation settings. Telemetry paths that omit the seed do not change the controlled paired nature of the runs.
+
+These conclusions apply to native ER-SDE under the tested H3 configuration. Euler, RES/RES CFG++, Turbo/LightX2V, and other samplers remain outside this perceptual conclusion.
+
+### `schedule_confidence`, single pass
+
+```text
+sampler = sample_er_sde
+steps = 20
+model_aware_mode = schedule_confidence
+offline_smoothing_replay = false
+model_aware_trust_shrinkage = false
+
+actual_steps = 11
+forecast_steps = 9
+actual_transformer_calls = 11
+fallbacks = 0
+model_aware_extra_nfes = 0
+
+model_aware_correction_max = 0
+model_aware_causal_correction_s = 0
+
+audio hidden forecast ratio = 1.789477
+video hidden forecast ratio = 1.309651
+```
+
+Perceptual observation: a subtle abnormal/false eye movement remained shortly before the intended eye closure. The defect was much smaller than older Spectrum artifacts and still visible in direct comparison.
+
+### `full`, single pass
+
+The expensive schedule was identical:
+
+```text
+actual_steps = 11
+forecast_steps = 9
+actual_transformer_calls = 11
+fallbacks = 0
+model_aware_extra_nfes = 0
+```
+
+The meaningful additional mechanism over `schedule_confidence` is the retained generic latest-delta causal correction.
+
+```text
+audio raw       = 1.777636
+audio corrected = 1.670690
+hidden-error reduction ~= 6.02%
+
+video raw       = 1.313055
+video corrected = 1.250087
+hidden-error reduction ~= 4.80%
+
+model_aware_correction_max = 0.148827
+model_aware_causal_correction_s = 0.000381
+model_aware_extra_nfes = 0
+```
+
+Representative later video anchors moved consistently in the improving direction:
+
+```text
+1.233778 -> 1.166099
+1.278252 -> 1.200908
+1.391828 -> 1.307558
+1.392824 -> 1.316612
+1.153456 -> 1.103306
+```
+
+Audio showed the same consistent correction direction.
+
+Perceptual result: the recurring false eye-motion artifact was absent. Eye motion remained synchronized with the intended actual eye-closing motion instead of visibly moving incorrectly immediately before the closure.
+
+This gives aligned evidence from three independent dimensions of the same controlled run pair:
+
+```text
+lower hidden forecast error
+same transformer NFE
+removal of a concrete temporal facial artifact
+```
+
+The 6.02% and 4.80% figures describe hidden-feature error on this trace only. They are not perceptual improvement percentages.
+
+### Offline smoothing replay
+
+Comparison configuration:
+
+```text
+model_aware_mode = off
+offline_smoothing_replay = true
+```
+
+First pass:
+
+```text
+actual_steps = 11
+forecast_steps = 9
+actual_transformer_calls = 11
+```
+
+Replay:
+
+```text
+offline_replay_steps = 20
+anchor_steps = 11
+smoothed_steps = 9
+replay transformer calls = 0
+replay wall time ~= 13.25 s
+archive ~= 4315.5 MiB
+effective video blend mean ~= 0.346053
+audio = local-only
+```
+
+Perceptual result: clearly visible abnormal eye motion remained before the intended closure. It was more visible than in `schedule_confidence` and clearly more visible than in `full` for this artifact.
+
+This is a scoped ER-SDE result. Offline replay retains its historical audio rationale and supported status.
+
+### Plain/base Spectrum was not part of this triplet
+
+No result for plain/base Spectrum is recorded for this exact three-run eye-motion comparison. Suspected behavior from older runs is not treated as measured evidence here.
+
+## Supporting native ER-SDE pronunciation evidence
+
+An earlier same-seed ER-SDE comparison contained the German sentence:
+
+```text
+meine Freunde sind noch 2 Stunden weg
+```
+
+The base/schedule-confidence-like path pronounced `weg` incorrectly, closer to the noun pronunciation sometimes rendered informally as "Wehg". Both `full` and offline replay produced the intended pronunciation, approximately "weck" in this context. A direct follow-up isolation found `schedule_confidence` sounding like base Spectrum and `full` retaining the corrected pronunciation.
+
+This supports attribution to the generic causal correction rather than Feature-2 confidence scheduling alone. It remains native-ER-SDE perceptual evidence, not a universal speech-quality claim.
+
+## Main geometry finding
+
+> Parameters or directions calibrated for one forecast geometry cannot be assumed to transfer to a different endpoint geometry.
 
 PR #45 produced two independent examples.
 
 ### Causal trust kappa -> future-bracket replay
 
-Causal trust is calibrated between the latest exact causal anchor and a causal forecast. The rejected replay transfer instead interpolated between a stale causal hold and a future-bracketed replay proposal. The replay-native leave-one-out oracle selected `kappa=1.0` throughout the scored audio/video replay targets. Full replay retention was optimal; movement toward the stale causal hold was rejected.
+Causal trust is calibrated between the latest exact causal anchor and a causal forecast. The rejected replay transfer interpolated between a stale causal hold and a future-bracketed replay proposal. Replay-native leave-one-out evaluation selected `kappa=1.0` throughout the scored audio/video replay targets. Full replay retention was optimal in those traces; movement toward the stale causal hold increased hidden error.
 
-RACER Proposition 2 establishes that the MSE-optimal interpolation coefficient depends on the endpoint error statistics/correlation. That supports endpoint-geometry dependence in principle. RACER does **not** analyze Spectrum H3's future-bracket replay construction and does **not** directly predict the observed `kappa=1` replay oracle. The replay result here is empirical.
+RACER Proposition 2 establishes that the MSE-optimal interpolation coefficient depends on endpoint error statistics and correlation. That supports endpoint-geometry dependence in principle. RACER does not analyze Spectrum H3's future-bracket replay construction; the replay result here is empirical.
 
 ### Causal PR #39 latest-delta scalar -> future replay bracket direction
 
@@ -22,20 +211,22 @@ PR #39 remains supported in the geometry in which its scalar was learned:
 d_causal = latest_exact - previous_exact
 ```
 
-Offline replay had transplanted the same scalar onto:
+Offline replay had historically transplanted the same scalar onto:
 
 ```text
 d_replay = right_future_bracket_anchor - left_future_bracket_anchor
 ```
 
-Across independent 25-step trace geometries, the persisted causal scalar was negative while replay-native useful projections were positive. The causal/replay direction cosine was approximately zero or negative, and applying the causal scalar in replay worsened hidden-feature reconstruction. This rejects the **transfer**, not the causal PR #39 mechanism.
+Across independent 25-step trace geometries, the persisted causal scalar was negative, useful replay-native projections were positive, the causal/replay direction cosine was approximately zero or negative, and applying the causal scalar in replay increased hidden reconstruction error.
+
+The causal mechanism remains supported. The future-bracket transfer is rejected.
 
 ## Replay generic correction: closed, default disabled
 
-The predeclared decision criterion is satisfied:
+The predeclared closure criterion is satisfied:
 
 - hidden-feature rejection of causal-scalar -> future-bracket replay transfer replicated across independent trace geometries;
-- two same-pair D/B perceptual comparisons judged correction-disabled B **non-worse / indistinguishable**.
+- two same-pair perceptual comparisons judged correction-disabled replay non-worse/indistinguishable.
 
 Therefore:
 
@@ -44,19 +235,11 @@ model_aware_replay_generic_correction = false   # supported default
 model_aware_replay_generic_correction = true    # explicit legacy/reproduction ablation
 ```
 
-`false` suppresses only the transplanted replay scalar. It does **not** remove or weaken the causal PR #39 latest-delta correction. Validation attenuation, local/spectral blending, scheduling, exact anchors, transformer NFE, and ER-SDE tail policy are unchanged.
-
-`true` remains supported for regression tests, scientific reproduction, and legacy ablation.
-
-No perceptual improvement is claimed. The perceptual result is limited to the tested comparisons being non-worse/indistinguishable after disabling the replay transfer.
-
-This replay-generic-correction question is closed unless concrete regression evidence gives a reason to reopen it.
+`false` suppresses only the transplanted replay scalar. The causal PR #39 latest-delta correction remains unchanged. Validation attenuation, local/spectral blending, scheduling, exact anchors, transformer NFE, and sampler refresh rules remain unchanged.
 
 ## Trace identity and provenance discipline
 
-Historical runs must not be casually renamed as "seed 2" or "seed 3" when seed/config provenance was not actually logged.
-
-Two known distinct trace geometries are:
+Historical traces keep geometry-based identities when seed/config provenance was not logged. Known distinct geometries include:
 
 ```text
 trace_37905_57x70x38_t927
@@ -70,31 +253,11 @@ trace_37620_57x60x44_t922
   text_length       = 922
 ```
 
-They are not the same trace rescored by a later shadow. New calibration exports capture the ComfyUI `OUTER_SAMPLE` seed when it is cleanly observable as an integral value. If no seed is cleanly visible, the runtime block records `seed=null` and the offline evaluator accepts an explicit external `--seed` and `--label` annotation instead of inventing provenance.
-
-## Absolute video spectral evidence
-
-Audio replay remains local-dominated with zero direct spectral blend. The local/spectral calibration work below is therefore **video-only**.
-
-The earlier absolute-spectral trace `trace_37905_57x70x38_t927` reported:
-
-```text
-local ratio                         0.728943
-current attenuated blend ratio      0.734564
-full spectral ratio                 1.039023
-oracle ratio                        0.719751
-oracle advantage vs local          +1.2498%
-oracle advantage vs current        +2.0028%
-
-oracle absolute spectral weight mean  0.127587
-current projected weight mean         0.257248
-```
-
-A fixed absolute-weight sweep selected local among the fixed controls. Useful video spectral contribution remained small and target-dependent.
+New calibration exports capture the ComfyUI `OUTER_SAMPLE` seed when it is cleanly observable as an integral value. Missing seed provenance remains `null`. The offline evaluator accepts explicit external `--seed` and `--label` annotations.
 
 ## Pure multiplicative alpha: useful baseline, rejected complete solution
 
-The latest alpha-capable trace is `trace_37620_57x60x44_t922`.
+The alpha-capable development trace `trace_37620_57x60x44_t922` reported:
 
 ```text
 local ratio       0.730744
@@ -112,28 +275,17 @@ alpha 0.75    ratio 0.728315    headroom capture  25.294%
 alpha 1.00    ratio 0.734151    headroom capture -35.476%
 ```
 
-Best predeclared alpha:
+Best predeclared alpha was `0.50`. Its oracle-weight error was:
 
 ```text
-alpha = 0.50
+MAE   0.090482
+RMSE  0.100304
+bias -0.000126
 ```
 
-Weight prediction:
+The predeclared complete-solution requirement was at least 60% oracle-vs-local headroom capture. The best alpha reached 51.553% on its development trace.
 
-```text
-                         alpha=1/current     alpha=.5
-MAE                         0.131288          0.090482
-RMSE                        0.149899          0.100304
-bias                       +0.131288         -0.000126
-```
-
-The approximate factor-of-two over-scaling hypothesis was real. However, the predeclared complete-solution requirement was at least 60% oracle-vs-local headroom capture. The best predeclared alpha reaches only `51.553%` on its development trace.
-
-Conclusion:
-
-> **Pure global multiplicative alpha is retained as a useful calibration baseline and rejected as a complete replay solution.**
-
-Do not densify the alpha sweep, add an applied alpha setting, or spend another generation trying to rescue the alpha-only hypothesis. `alpha=0.5` remains the residual-analysis baseline.
+Pure global alpha remains a calibration baseline and is closed as a complete replay solution. No denser alpha search or applied alpha control is planned.
 
 ## Residual structure after alpha=.5
 
@@ -147,7 +299,7 @@ residual vs coordinate               +0.816378
 residual vs current weight           +0.835505
 ```
 
-The same trace's floor diagnostic showed:
+The floor diagnostic was partial:
 
 ```text
 oracle-near-zero targets               2 / 11 = 18.18%
@@ -157,29 +309,17 @@ share of alpha=.5 MAE                  22.825%
 share of alpha=.5 squared error        23.685%
 ```
 
-Global scaling fixes much of the bias; inability to express a target-specific zero is a real residual; the floor explains only part of the remaining error.
+These `n=11` sequential trajectory correlations are exploratory diagnostics. No disagreement, coordinate, validation-penalty, floor, interaction, tree, neural, or AutoML runtime controller is authorized from them.
 
-There are only `n=11` sequential trajectory targets. Residual correlations are exploratory diagnostics, not formal IID statistical inference:
+## Exact per-target VIDEO replay calibration dataset
 
-```text
-|r| < 0.5          weak
-0.5 <= |r| < 0.6  indeterminate / noise-floor region
-|r| >= 0.6         candidate residual structure on that trace
-```
-
-A reusable residual relationship requires the **same predictor**, **same sign**, and `|r|>=0.6` on independent traces. No zero gate, disagreement controller, coordinate controller, validation-penalty controller, or learned controller is authorized from this one trace.
-
-## Exact per-target replay calibration dataset
-
-PR #45 now exports a compact machine-readable VIDEO replay calibration block in existing `debug=true` research logging. Detailed export is active only for `model_aware_mode=full` with offline replay; normal non-debug production execution does not collect the extra research rows.
-
-Log marker:
+PR #45 exports a compact machine-readable VIDEO replay calibration block under existing `debug=true` research logging for `model_aware_mode=full` with offline replay.
 
 ```text
 SPECTRUM_REPLAY_CALIBRATION_JSON={...}
 ```
 
-The block contains scalar provenance/metadata and `target_rows[]`. No hidden-feature tensors or raw feature arrays are serialized. Payload size is bounded.
+The block contains bounded scalar metadata and `target_rows[]`. No hidden-feature tensor or raw feature array is serialized.
 
 ### Authoritative quadratic representation
 
@@ -188,11 +328,7 @@ Sign convention:
 ```text
 e = local - withheld_target
 d = spectral - local
-```
 
-Serialized moments use exactly the replay-shadow sampled VIDEO scoring subset:
-
-```text
 A = local_error_sq_mean
   = mean(e^2)
 
@@ -201,23 +337,14 @@ B = local_error_dot_spectral_delta_mean
 
 C = spectral_delta_sq_mean
   = mean(d^2)
-```
 
-Any absolute local->spectral mixture weight `w`, clipped to `[0,1]`, has:
-
-```text
 candidate_mse(w) = A + 2*w*B + w^2*C
-```
-
-The analytic unconstrained optimum is `-B/C`. Runtime parity preserves the existing denominator guard by using:
-
-```text
 w_oracle = clamp(-B / max(C, ratio_epsilon^2), 0, 1)
 ```
 
 ### Exact ratio normalization
 
-The runtime replay metric is a per-target RMS error normalized by the stale-hold error RMS, with the existing epsilon floor:
+Runtime parity is preserved as:
 
 ```text
 actual_rms = sqrt(mean(actual^2))
@@ -229,9 +356,9 @@ ratio_denominator_rms = max(sqrt(hold_error_sq_mean), ratio_epsilon)
 ratio(w) = sqrt(candidate_mse(w)) / ratio_denominator_rms
 ```
 
-Aggregate reporting is the **mean of per-target ratios**, not a globally pooled RMS.
+Aggregate reporting is the mean of per-target ratios. It is not a pooled global RMS.
 
-The serialized moments must reconstruct runtime local/current/full-spectral/fixed-control/oracle values within the declared tight parity tolerance (`2e-5`). A block that fails parity is marked/rejected as incompatible rather than fitted.
+Serialized moments reconstruct runtime local/current/full-spectral/fixed-control/oracle values within the declared parity tolerance (`2e-5`). Structurally invalid or non-interior withheld targets are rejected before bracket indexing.
 
 ### Calibration row schema
 
@@ -296,7 +423,7 @@ max_parity_abs_error
 row_compatible
 ```
 
-Predictor construction is completed before the withheld target is read. The withheld target is then used only to compute moments, errors, oracle labels, and evaluation values. No production replay path consumes oracle fields.
+Predictor construction completes before the withheld target is read. The withheld target is then used only for moments, errors, oracle labels, and evaluation values. Production replay consumes no oracle field.
 
 ### Provenance and fingerprints
 
@@ -316,24 +443,9 @@ topology_fingerprint
 trace_fingerprint
 ```
 
-`config_hash` is SHA-256 of canonical JSON for:
+`config_hash` is SHA-256 over canonical JSON for the complete Spectrum configuration plus sampler, step count, and available scheduler metadata. `schedule_fingerprint` covers the complete archive sequence of `(step_id, coordinate, actual)`. `topology_fingerprint` covers the available native H3 topology/configuration identity. `trace_fingerprint` combines source/schema identity, seed when available, config, schedule, topology, and pre-target signatures. Oracle/post-target values are excluded.
 
-```text
-{
-  spectrum_config: <complete SpectrumH3Config snapshot>,
-  sampler: <native sampler name>,
-  steps: <solver step count>,
-  scheduler: <scheduler metadata when genuinely available, otherwise null>
-}
-```
-
-`topology_fingerprint` covers the available native H3 topology/configuration identity, including feature/video/audio shapes, text length, hidden width, target row counts, patch size, sigma shifts, AdaLN mode, segments, refs, and keyframes.
-
-`schedule_fingerprint` covers the complete archive sequence of `(step_id, coordinate, actual)`.
-
-`trace_fingerprint` combines schema/source revision information, package/source revision when available, the cleanly observed seed when available, config hash, sampler/step count, schedule fingerprint, topology fingerprint, and the pre-target per-row target signature. Oracle/post-target values are deliberately excluded.
-
-No hot-path Git subprocess or `.git` dependency exists. A source revision is recorded only when safely provided through `SPECTRUM_H3_SOURCE_REVISION`; otherwise it is null. The ComfyUI `OUTER_SAMPLE` seed is captured only for the active run and removed from runtime state afterward. If it cannot be cleanly interpreted as an integral seed, it remains null. The analysis tool accepts external annotations in either case.
+No hot-path Git subprocess or `.git` dependency exists.
 
 ## Offline multi-run evaluator
 
@@ -343,21 +455,7 @@ Tool:
 tools/analyze_replay_calibration.py
 ```
 
-It is standard-library/CPU-only and starts neither ComfyUI nor a model/GPU runtime.
-
-Examples:
-
-```bash
-python tools/analyze_replay_calibration.py run1.log
-python tools/analyze_replay_calibration.py run1.log run2.log
-python tools/analyze_replay_calibration.py run1.log --label development --seed 123
-python tools/analyze_replay_calibration.py run1.log run2.log \
-  --label run1.log=trace_A --seed run1.log=123 \
-  --label run2.log=trace_B --seed run2.log=456
-python tools/analyze_replay_calibration.py run1.log run2.log --json
-```
-
-It accepts direct calibration JSON or full ComfyUI logs containing the calibration marker. Each calibration block is a run; it never treats the 11 rows as independent train/test samples.
+It is standard-library/CPU-only and starts neither ComfyUI nor a model/GPU runtime. It accepts direct calibration JSON or full ComfyUI logs containing the marker. Each calibration block is one run; target rows are never randomized across train/test folds.
 
 ### Level 0: fixed/known baselines
 
@@ -368,15 +466,13 @@ alpha:    w=alpha*current_weight
           alpha in {0,.25,.50,.75,1}
 ```
 
-No dense alpha optimization is performed.
-
 ### Level 1: affine current-weight recalibration
 
 ```text
 w_hat = clamp(a + b*current_weight, 0, 1)
 ```
 
-This is the mandatory baseline before attributing residual structure to a new predictor.
+This is the mandatory baseline for any residual-predictor claim.
 
 ### Level 2: current weight + one residual predictor
 
@@ -395,29 +491,23 @@ spectral_gap
 coordinate
 ```
 
-Coordinate is the explicit confound/control. There is no combined multi-predictor model, interaction, polynomial, threshold search, tree, neural network, or AutoML path.
+Coordinate is the explicit confound/control. No combined multi-predictor model, interaction, polynomial, threshold search, tree, neural network, or AutoML path is implemented.
 
 ### Fitting objective
 
-Level 1/2 use the exact training-run quadratic moments and minimize the unweighted mean of per-target **squared normalized hidden-feature error before clipping**:
+Level 1/2 minimize the unweighted mean of per-target squared normalized hidden-feature error from exact training-run moments before final `[0,1]` clipping:
 
 ```text
 q_i = 1 / ratio_denominator_rms_i^2
 L = mean_i q_i * (A_i + 2*B_i*w_i + C_i*w_i^2)
 w_i = x_i^T beta
-```
 
-This gives an auditable closed-form linear system:
-
-```text
 sum(q*C*x*x^T) beta = -sum(q*B*x)
 ```
 
-A single fixed numerical ridge of `1e-8` stabilizes the solve. There is no hyperparameter sweep and no predictor normalization; final weights are clipped to `[0,1]` and evaluated from the exact moments.
+A fixed `1e-8` numerical ridge stabilizes the solve. There is no hyperparameter sweep and no predictor normalization.
 
-### Whole-run validation and evidence labels
-
-The trajectory/run is the unit of generalization:
+### Whole-run validation labels
 
 ```text
 1 run  -> in-sample exploratory only
@@ -430,133 +520,28 @@ The trajectory/run is the unit of generalization:
           MULTI-RUN / GENERALIZATION TEST
 ```
 
-No row-randomized split exists. Held-out runs cannot influence coefficients, normalization, regularization, or model selection.
+Held-out runs cannot influence coefficients, normalization, regularization, or model selection. A Level 2 predictor must improve held-out results over Level 1 affine current-weight calibration. Non-coordinate Level 2 candidates also require comparison with coordinate control.
 
-For each fold/model the evaluator reports mean hidden-feature ratio, advantage vs local/current, oracle-vs-local headroom capture, oracle-weight MAE/RMSE/bias, and coefficients. Level 2 reports deltas and incremental headroom versus Level 1. Non-coordinate Level 2 candidates are also compared directly with the coordinate-control Level 2 family.
-
-A Level 2 predictor does not survive because it beats alpha=.5 or correlates with an oracle residual. It must improve held-out results over Level 1 affine current-weight calibration. Disagreement/penalty/spectral-gap claims additionally require comparison with coordinate control.
+The evaluator remains research tooling. No runtime affine or residual controller is shipped from these results.
 
 ## Historical exact-calibration compatibility
 
 ```text
 trace_37905_57x70x38_t927: NO
-```
-
-It predates the exact alpha/moment export. The available record contains aggregate endpoint/oracle diagnostics, not the serialized per-target quadratic moments and exact denominator state required for arbitrary offline `w` scoring.
-
-```text
 trace_37620_57x60x44_t922: NO
 ```
 
-It contains the alpha aggregate evidence that closed the pure-alpha hypothesis, but it also predates the quadratic-moment schema. Missing per-target moments are not synthesized from aggregate/oracle/endpoint summaries.
+Both traces predate the exact per-target quadratic-moment schema. Their aggregate historical evidence remains valid; missing moments are not synthesized for fitted offline evaluation.
 
-Both traces remain valid historical evidence and development context; neither is admitted into fitted exact offline-controller evaluation.
+## Implementation boundaries
 
-## C1: next expensive user-facing gate
-
-The next user generation is **C1 causal single-pass trust**, not another replay-controller experiment.
-
-Both runs:
-
-```text
-sampler = sample_er_sde
-steps = 25
-model_aware_mode = full
-model_aware_risk_threshold = 0.65
-offline_smoothing_replay = false
-```
-
-Baseline:
-
-```text
-model_aware_trust_shrinkage = false
-```
-
-Candidate:
-
-```text
-model_aware_trust_shrinkage = true
-```
-
-Keep seed, prompt, references, resolution, duration/frame count, scheduler, CFG, model/checkpoint, precision, and all remaining workflow settings identical.
-
-Expected baseline telemetry:
-
-```text
-model_aware_trust_enabled=0
-model_aware_trust_applied=0
-model_aware_trust_path=disabled
-model_aware_trust_applications=0
-model_aware_trust_extra_transformer_nfe=0
-```
-
-Expected candidate telemetry:
-
-```text
-model_aware_trust_enabled=1
-model_aware_trust_applied=1
-model_aware_trust_path=causal_single_pass
-model_aware_trust_applications>0
-model_aware_trust_extra_transformer_nfe=0
-model_aware_trust_failures=0
-```
-
-Both must retain the same 14-actual / 11-forecast schedule, 14 actual transformer calls, zero fallbacks, exact ER-SDE tail steps 23/24, and no offline replay. Existing counted C1 regressions cover the isolation mechanically; the trust formula is unchanged.
-
-Prior causal shadow evidence is much larger than the residual replay spectral headroom:
-
-```text
-AUDIO generic-corrected ~1.54 -> trust candidate ~0.99
-      oracle headroom ~35%
-VIDEO generic-corrected ~1.24 -> trust candidate ~1.00
-      oracle headroom ~19%
-```
-
-C1 asks whether that large hidden-feature gain produces an obvious user-facing visual/audio gain.
-
-- **C1 positive:** causal single-pass trust becomes the primary confirmation/promotion candidate; replay datasets can be collected in parallel.
-- **C1 neutral:** strongly deprioritize engineering work aimed at another ~1-2% replay hidden-feature gain while retaining the measurement infrastructure.
-- **C1 negative:** stop trust promotion and investigate feature/perceptual mismatch.
-
-Regardless of C1, do not transfer causal trust into future-bracket replay.
-
-## Current research state
-
-### Supported
-
-- causal PR #39 generic latest-delta correction in causal geometry.
-
-### Supported for testing / active
-
-- causal single-pass trust; next gate is C1.
-
-### Rejected / closed
-
-- causal trust kappa -> replay transfer;
-- hold-anchor replay shrinkage;
-- causal scalar -> replay correction transfer;
-- pure global multiplicative alpha as a complete replay solution;
-- K=2 correction;
-- FinalLayer-transformed correction;
-- previous-error direction families.
-
-### Active research
-
-- VIDEO replay local/spectral residual calibration using exact per-target quadratic moments and whole-run offline evaluation.
-
-Audio remains local-dominated in replay and is not part of the video mixture-controller research.
-
-## Safety / implementation boundaries
-
-- no applied affine replay calibration;
-- no applied residual replay controller;
-- no zero/floor gate;
-- no change to causal trust formula/default;
+- trust shrinkage default remains false;
+- replay generic correction default remains false;
 - no causal-kappa replay transfer;
-- no extra transformer NFE;
-- no model-weight scan for calibration export;
+- no new affine/trust/replay controller;
+- no zero/floor gate;
+- no extra transformer NFE from generic correction or research telemetry;
 - no retained calibration feature tensors;
-- no broad runtime refactor;
-- replay calibration export is debug/research-only and scalar;
+- calibration export remains debug/research-only and scalar;
 - ordinary calibration-diagnostic failures are isolated; CUDA OOM propagates;
-- PR #45 remains draft and must not be merged solely because CI is green.
+- exact anchors, sampler refresh rules, and replay ownership/teardown remain authoritative.

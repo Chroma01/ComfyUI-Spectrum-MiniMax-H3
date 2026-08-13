@@ -6,6 +6,7 @@ from .minimax_h3 import locate_minimax_h3_inner, require_native_minimax_h3
 from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from .replay_calibration import install_replay_calibration
 from .replay_calibration_provenance import install_replay_calibration_provenance
+from .replay_calibration_validation import install_replay_calibration_validation
 from .replay_component_shadow import install_replay_component_decomposition
 from .replay_generic_correction_gate import install_replay_generic_correction_gate
 from .replay_shadow_composition import install_replay_shadow_composition
@@ -24,6 +25,7 @@ install_replay_spectral_mixture_shadow()
 install_replay_spectral_alpha_shadow()
 install_replay_generic_correction_gate()
 install_replay_calibration()
+install_replay_calibration_validation()
 install_replay_calibration_provenance()
 install_er_sde_tail_policy()
 
