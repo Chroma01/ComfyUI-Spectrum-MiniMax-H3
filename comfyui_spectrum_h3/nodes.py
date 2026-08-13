@@ -187,8 +187,21 @@ class SpectrumApplyMiniMaxH3:
                         "tooltip": (
                             "Experimental opt-in for model_aware_mode='full'. Uses bounded spectral-vs-linear "
                             "disagreement to shrink each audio/video forecast toward the latest causal exact "
-                            "anchor. In the default offline replay path the causal kappa is persisted and applied "
-                            "to the replay proposal; it never adds a transformer evaluation."
+                            "anchor in single-pass mode. Offline replay keeps the rejected causal-kappa transfer "
+                            "disabled and uses shadow-only replay diagnostics. No transformer evaluation is added."
+                        ),
+                    },
+                ),
+                "model_aware_replay_generic_correction": (
+                    "BOOLEAN",
+                    {
+                        "default": True,
+                        "tooltip": (
+                            "Offline replay-only gate for model_aware_mode='full'. True preserves the current "
+                            "replay behavior that transfers the causal PR #39 generic scalar onto the future "
+                            "bracket. False is the narrow D-to-B experiment: suppress only that replay correction "
+                            "while keeping causal correction, validation attenuation, local/spectral blending, "
+                            "scheduling, and transformer NFE unchanged."
                         ),
                     },
                 ),
@@ -223,6 +236,7 @@ class SpectrumApplyMiniMaxH3:
         model_aware_mode="off",
         model_aware_risk_threshold=0.65,
         model_aware_trust_shrinkage=False,
+        model_aware_replay_generic_correction=True,
     ):
         if not enabled:
             return (model,)
@@ -236,6 +250,10 @@ class SpectrumApplyMiniMaxH3:
             ("selective_rollback_correction", selective_rollback_correction),
             ("offline_smoothing_replay", offline_smoothing_replay),
             ("model_aware_trust_shrinkage", model_aware_trust_shrinkage),
+            (
+                "model_aware_replay_generic_correction",
+                model_aware_replay_generic_correction,
+            ),
         ):
             if not isinstance(value, bool):
                 raise TypeError(f"{name} must be a boolean")
@@ -264,6 +282,9 @@ class SpectrumApplyMiniMaxH3:
             model_aware_mode=str(model_aware_mode),
             model_aware_risk_threshold=float(model_aware_risk_threshold),
             model_aware_trust_shrinkage=model_aware_trust_shrinkage,
+            model_aware_replay_generic_correction=(
+                model_aware_replay_generic_correction
+            ),
             debug=bool(debug),
         ).validate()
         patched = model.clone()
