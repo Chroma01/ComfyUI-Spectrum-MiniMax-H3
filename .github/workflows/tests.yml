@@ -63,9 +63,11 @@ jobs:
             comfyui_spectrum_h3/replay_spectral_mixture_shadow.py \
             comfyui_spectrum_h3/replay_spectral_alpha_shadow.py \
             comfyui_spectrum_h3/replay_generic_correction_gate.py \
+            comfyui_spectrum_h3/replay_calibration.py \
             comfyui_spectrum_h3/nodes.py \
             comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
+            tools/analyze_replay_calibration.py \
             tests/test_generic_correction.py \
             tests/test_trust_probe.py \
             tests/test_c1_single_pass_gate.py \
@@ -74,10 +76,12 @@ jobs:
             tests/test_replay_spectral_mixture_shadow.py \
             tests/test_replay_spectral_alpha_shadow.py \
             tests/test_replay_generic_correction_gate.py \
+            tests/test_replay_calibration.py \
+            tests/test_replay_calibration_evaluator.py \
             tests/test_model_aware.py \
             tests/conftest.py \
             --ignore N999,I001,C408,UP035
-          python -m compileall -q comfyui_spectrum_h3 tests
+          python -m compileall -q comfyui_spectrum_h3 tools tests
 
       - name: Run tests against native MiniMax H3
         env:
