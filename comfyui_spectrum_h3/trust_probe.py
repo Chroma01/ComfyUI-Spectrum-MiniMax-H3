@@ -317,6 +317,8 @@ class _ReplayShadowRecord:
     blend_weight: float
     correction_gain: float
     disagreement: float
+    # Shadow-only anchor-step coefficient; it is not the applied forecast-step kappa.
+    # model_aware_trust_replay_shadow_* must not be read as applied-path evidence.
     kappa: float
 
 
@@ -422,17 +424,17 @@ def _compute_forecast_trust(
         return None
 
     started = time.perf_counter()
+    spectral_weights = forecaster._spectral_weights_configured(
+        coordinate,
+        degree=decision.degree,
+        ridge_lambda=decision.ridge_lambda,
+    )
+    linear_weights = forecaster._linear_weights(coordinate)
     disagreement_tensors: dict[str, torch.Tensor] = {}
     for name, _start, _end in ranges:
         history_samples = [entry[name] for entry in forecaster._evidence_history]
         if len(history_samples) != forecaster.history_length:
             return None
-        spectral_weights = forecaster._spectral_weights_configured(
-            coordinate,
-            degree=decision.degree,
-            ridge_lambda=decision.ridge_lambda,
-        )
-        linear_weights = forecaster._linear_weights(coordinate)
         spectral = _combine_samples(spectral_weights, history_samples)
         linear = _combine_samples(linear_weights, history_samples)
         spectral_rms = _tensor_rms(spectral)
@@ -852,13 +854,19 @@ def _validate_replay_transfer(
     )
     if not isinstance(records, list) or not records:
         return
-    ranges = {name: (start, end) for name, start, end in smoother._stream_ranges}
-    samples_by_stream = {
-        name: _sample_archive_stream(smoother, start, end)
-        for name, (start, end) in ranges.items()
-        if name in {"audio", "video"}
-    }
-    anchor_ids = list(smoother._anchor_ids)
+    try:
+        ranges = {name: (start, end) for name, start, end in smoother._stream_ranges}
+        samples_by_stream = {
+            name: _sample_archive_stream(smoother, start, end)
+            for name, (start, end) in ranges.items()
+            if name in {"audio", "video"}
+        }
+        anchor_ids = list(smoother._anchor_ids)
+    except torch.cuda.OutOfMemoryError:
+        raise
+    except (AttributeError, RuntimeError, TypeError, ValueError, KeyError, IndexError):
+        aggregate.replay_shadow_failures += 1
+        return
     for record in records:
         if not isinstance(record, _ReplayShadowRecord):
             continue
