@@ -65,7 +65,7 @@ def _outer_sample_with_provenance(
             delattr(runtime, _RUNTIME_SEED_ATTR)
 
 
-def _target_signature(block: dict[str, Any]) -> list[dict[str, Any]]:
+def _deployable_target_signature(block: dict[str, Any]) -> list[dict[str, Any]]:
     return [
         {
             "target_step_id": int(row["target_step_id"]),
@@ -76,6 +76,22 @@ def _target_signature(block: dict[str, Any]) -> list[dict[str, Any]]:
             "causal_disagreement": float(row["causal_disagreement"]),
             "validation_penalty": float(row["validation_penalty"]),
             "spectral_gap": float(row["spectral_gap"]),
+        }
+        for row in block["target_rows"]
+    ]
+
+
+def _calibration_content_signature(block: dict[str, Any]) -> list[dict[str, Any]]:
+    # Prompt/reference strings are intentionally not plumbed through the runtime.
+    # Hash the exact scalar calibration content instead, excluding only run-local
+    # and self-referential identifiers. This prevents two genuinely different
+    # calibration trajectories with identical sampler/config/topology/seed from
+    # collapsing to one trace identity while exact copied logs still deduplicate.
+    return [
+        {
+            key: value
+            for key, value in sorted(row.items())
+            if key not in {"run_id", "trace_fingerprint"}
         }
         for row in block["target_rows"]
     ]
@@ -107,6 +123,11 @@ def _build_block_with_provenance(
     metadata["seed_source"] = (
         "ComfyUI OUTER_SAMPLE seed" if seed is not None else "unavailable"
     )
+    metadata["trace_fingerprint_definition"] = (
+        "sha256(canonical_json(schema/source/package revision, seed, run config hash, "
+        "sampler/steps, schedule/topology fingerprints, deployable target signature, "
+        "exact scalar calibration-content signature excluding run_id/self fingerprint))"
+    )
 
     trace_fingerprint = _calibration._sha256_json(
         {
@@ -120,7 +141,8 @@ def _build_block_with_provenance(
             "steps": metadata.get("steps"),
             "schedule_fingerprint": provenance.get("schedule_fingerprint"),
             "topology_fingerprint": provenance.get("topology_fingerprint"),
-            "target_signature": _target_signature(block),
+            "deployable_target_signature": _deployable_target_signature(block),
+            "calibration_content_signature": _calibration_content_signature(block),
         }
     )
     provenance["trace_fingerprint"] = trace_fingerprint
