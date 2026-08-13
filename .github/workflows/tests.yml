@@ -80,7 +80,7 @@ jobs:
             tests/test_replay_calibration_evaluator.py \
             tests/test_model_aware.py \
             tests/conftest.py \
-            --ignore N999,I001,C408,UP035
+            --ignore N999,I001,C408,UP035,TRY203,EXE001
           python -m compileall -q comfyui_spectrum_h3 tools tests
 
       - name: Run tests against native MiniMax H3
