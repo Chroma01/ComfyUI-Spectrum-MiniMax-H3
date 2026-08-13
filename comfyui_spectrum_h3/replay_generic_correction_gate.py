@@ -145,6 +145,9 @@ def _build_forecast_weights_with_replay_generic_gate(
         finally:
             self.archive.steps = original_steps
 
+    observed_applications = int(
+        getattr(self, "model_aware_offline_correction_applications", opportunities)
+    )
     telemetry = _ReplayGenericCorrectionTelemetry(
         enabled=enabled,
         path=(
@@ -152,7 +155,7 @@ def _build_forecast_weights_with_replay_generic_gate(
             if enabled
             else "disabled_replay_geometry_experiment"
         ),
-        applications=(opportunities if enabled else 0),
+        applications=(observed_applications if enabled else 0),
         skips=(0 if enabled else opportunities),
     )
     setattr(self.archive, _ARCHIVE_TELEMETRY_ATTR, telemetry)
