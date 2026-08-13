@@ -60,6 +60,7 @@ jobs:
             comfyui_spectrum_h3/replay_trust_shadow.py \
             comfyui_spectrum_h3/replay_component_shadow.py \
             comfyui_spectrum_h3/replay_shadow_composition.py \
+            comfyui_spectrum_h3/replay_spectral_mixture_shadow.py \
             comfyui_spectrum_h3/replay_generic_correction_gate.py \
             comfyui_spectrum_h3/nodes.py \
             comfyui_spectrum_h3/sampling.py \
@@ -68,6 +69,7 @@ jobs:
             tests/test_trust_probe.py \
             tests/test_replay_component_shadow.py \
             tests/test_replay_shadow_composition.py \
+            tests/test_replay_spectral_mixture_shadow.py \
             tests/test_replay_generic_correction_gate.py \
             tests/test_model_aware.py \
             tests/conftest.py \
