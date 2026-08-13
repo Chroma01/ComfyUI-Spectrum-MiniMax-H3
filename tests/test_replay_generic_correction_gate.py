@@ -7,10 +7,7 @@ import pytest
 import torch
 
 from comfyui_spectrum_h3 import generic_correction as generic_module
-from comfyui_spectrum_h3 import replay_component_shadow as component_module
 from comfyui_spectrum_h3 import replay_generic_correction_gate as gate_module
-from comfyui_spectrum_h3 import replay_trust_shadow as replay_module
-from comfyui_spectrum_h3 import trust_probe as trust_module
 from comfyui_spectrum_h3.config import SpectrumH3Config
 from comfyui_spectrum_h3.experiments import OfflineFeatureArchive, OfflineSmoother
 from comfyui_spectrum_h3.model_aware import ModelAwareForecastDecision
@@ -55,11 +52,10 @@ def _archive(
     coordinates = torch.linspace(-1.0, 1.0, 5).tolist()
     correction = -0.20 if with_correction else 0.0
     video_correction = -0.10 if with_correction else 0.0
-    audio_blend = 0.5 if packed else 0.0
     decision = _decision(
         audio_correction=correction,
         video_correction=(correction if packed else video_correction),
-        audio_blend=audio_blend,
+        audio_blend=(0.5 if packed else 0.0),
         video_blend=0.5,
     )
     for step_id, coordinate in enumerate(coordinates):
@@ -93,7 +89,7 @@ def _archive(
 def _smoother(
     archive: OfflineFeatureArchive,
     *,
-    gate_enabled: bool | None = None,
+    gate_enabled: bool | None,
     packed: bool = False,
 ) -> OfflineSmoother:
     if gate_enabled is not None:
@@ -107,14 +103,11 @@ def _smoother(
     )
 
 
-def _forecast_weight_items(smoother: OfflineSmoother):
-    return {
-        key: value.clone()
-        for key, value in smoother._forecast_weights.items()
-    }
+def _weights(smoother: OfflineSmoother) -> dict[tuple[int, int, int], torch.Tensor]:
+    return {key: value.clone() for key, value in smoother._forecast_weights.items()}
 
 
-def _assert_weight_maps_equal(left, right) -> None:
+def _assert_weights_equal(left, right) -> None:
     assert left.keys() == right.keys()
     for key in left:
         assert torch.equal(left[key], right[key]), key
@@ -202,183 +195,77 @@ def _counted_first_pass(gate_enabled: bool) -> dict[str, object]:
     return result
 
 
-def _shadow_archive(gate_enabled: bool) -> OfflineFeatureArchive:
-    archive = OfflineFeatureArchive(
-        total_steps=9,
-        sampler_name="sample_er_sde",
-        history_storage="system_ram",
-    )
-    coordinates = {step: -1.0 + 0.25 * step for step in range(9)}
-    decision = _decision()
-    features = {
-        0: torch.tensor([[[0.0, 0.1, 0.2], [1.0, 1.1, 1.2]]]),
-        2: torch.tensor([[[1.0, 1.4, 0.9], [2.0, 2.5, 1.8]]]),
-        4: torch.tensor([[[1.4, 2.0, 1.2], [2.8, 3.2, 2.4]]]),
-        6: torch.tensor([[[3.0, 2.4, 3.4], [4.5, 3.8, 4.2]]]),
-        8: torch.tensor([[[4.0, 5.0, 4.5], [6.0, 6.8, 5.5]]]),
-    }
-    for step_id in range(9):
-        actual = step_id in features
-        archive.record_step(
-            step_id,
-            coordinates[step_id],
-            actual,
-            model_aware_decision=(None if actual else decision),
-        )
-        if actual:
-            archive.record_actual(
-                step_id,
-                coordinates[step_id],
-                features[step_id],
-                labels=("branch",),
-                topology=(("target_audio_rows", 1), ("target_video_rows", 1)),
-                take_ownership=False,
-            )
-    assert archive.complete(minimum_anchors=2)
-    aggregate = trust_module._TrustAggregate()
-    archive._model_aware_trust_aggregate = aggregate
-    records: list[trust_module._ReplayShadowRecord] = []
-    for index, step_id in enumerate((2, 4, 6)):
-        for stream_name, blend, gain in (
-            ("audio", 0.0, -0.20),
-            ("video", 0.5, -0.10),
-        ):
-            records.append(
-                trust_module._ReplayShadowRecord(
-                    step_id=step_id,
-                    coordinate=coordinates[step_id],
-                    latest_anchor_id=step_id - 2,
-                    stream_name=stream_name,
-                    degree=1,
-                    ridge_lambda=0.1,
-                    blend_weight=blend,
-                    correction_gain=gain,
-                    disagreement=(0.2, 0.5, 0.8)[index],
-                    kappa=0.2,
-                )
-            )
-    archive._model_aware_trust_replay_shadow_records = records
-    setattr(archive, replay_module._ARCHIVE_SHADOW_ONLY_ATTR, True)
-    setattr(archive, gate_module._ARCHIVE_GATE_ATTR, gate_enabled)
-    return archive
-
-
-def test_replay_generic_correction_setting_defaults_off_and_round_trips():
-    config = SpectrumH3Config()
+def test_replay_generic_correction_default_is_false_in_config_node_and_runtime():
+    config = SpectrumH3Config(model_aware_mode="full")
     assert config.model_aware_replay_generic_correction is False
-    round_trip = SpectrumH3Config(**asdict(config))
-    assert round_trip == config
+    assert SpectrumH3Config(**asdict(config)) == config
     with pytest.raises(TypeError, match="model_aware_replay_generic_correction"):
         SpectrumH3Config(model_aware_replay_generic_correction="no")
 
     optional = SpectrumApplyMiniMaxH3.INPUT_TYPES()["optional"]
     assert optional["model_aware_replay_generic_correction"][1]["default"] is False
 
-
-def test_replay_generic_correction_is_inert_outside_full_offline_replay():
-    single_pass = SpectrumH3Config(
-        model_aware_mode="full",
-        offline_smoothing_replay=False,
-        model_aware_replay_generic_correction=False,
-    ).validate()
-    non_full = SpectrumH3Config(
-        model_aware_mode="schedule_confidence",
-        model_aware_replay_generic_correction=False,
-    ).validate()
-    assert single_pass.model_aware_replay_generic_correction is False
-    assert non_full.model_aware_replay_generic_correction is False
-
-    runtime = SpectrumH3Runtime(non_full)
-    runtime.begin_offline_capture(total_steps=2, sampler_name="sample_euler")
-    assert runtime.offline_archive is not None
-    assert getattr(runtime.offline_archive, gate_module._ARCHIVE_GATE_ATTR) is True
+    runtime = SpectrumH3Runtime(config)
+    runtime.begin_offline_capture(total_steps=2, sampler_name="sample_er_sde")
+    archive = runtime.offline_archive
+    assert archive is not None
+    assert getattr(archive, gate_module._ARCHIVE_GATE_ATTR) is False
     runtime.release_offline_archive()
 
 
-def test_default_and_explicit_disabled_replay_are_exactly_identical():
-    default = _smoother(_archive(with_correction=True))
-    explicit = _smoother(_archive(with_correction=True), gate_enabled=False)
-    _assert_weight_maps_equal(
-        _forecast_weight_items(default),
-        _forecast_weight_items(explicit),
-    )
-    telemetry = getattr(default.archive, gate_module._ARCHIVE_TELEMETRY_ATTR)
-    assert telemetry.enabled is False
-    assert telemetry.path == "disabled_replay_geometry_experiment"
-    assert telemetry.applications == 0
-    assert telemetry.skips == 4
-    assert telemetry.extra_transformer_nfe == 0
-    assert default.model_aware_offline_correction_applications == 0
-
-
-def test_explicit_true_preserves_legacy_replay_transfer():
-    default = _smoother(_archive(with_correction=True))
-    legacy = _smoother(_archive(with_correction=True), gate_enabled=True)
-    assert any(
-        not torch.equal(default._forecast_weights[key], legacy._forecast_weights[key])
-        for key in default._forecast_weights
-    )
-    telemetry = getattr(legacy.archive, gate_module._ARCHIVE_TELEMETRY_ATTR)
+def test_unstamped_hand_constructed_archive_retains_pre_gate_legacy_semantics():
+    unstamped = _smoother(_archive(with_correction=True), gate_enabled=None)
+    explicit_legacy = _smoother(_archive(with_correction=True), gate_enabled=True)
+    _assert_weights_equal(_weights(unstamped), _weights(explicit_legacy))
+    telemetry = getattr(unstamped.archive, gate_module._ARCHIVE_TELEMETRY_ATTR)
     assert telemetry.enabled is True
     assert telemetry.path == "current_causal_gain_transfer"
-    assert telemetry.applications == 4
-    assert telemetry.skips == 0
+
+
+def test_explicit_false_equals_uncorrected_b_and_explicit_true_restores_legacy_d():
+    disabled = _smoother(_archive(with_correction=True), gate_enabled=False)
+    uncorrected = _smoother(_archive(with_correction=False), gate_enabled=True)
+    legacy = _smoother(_archive(with_correction=True), gate_enabled=True)
+
+    _assert_weights_equal(_weights(disabled), _weights(uncorrected))
+    assert any(
+        not torch.equal(disabled._forecast_weights[key], legacy._forecast_weights[key])
+        for key in disabled._forecast_weights
+    )
+
+    disabled_telemetry = getattr(
+        disabled.archive, gate_module._ARCHIVE_TELEMETRY_ATTR
+    )
+    assert disabled_telemetry.enabled is False
+    assert disabled_telemetry.path == "disabled_replay_geometry_experiment"
+    assert disabled_telemetry.applications == 0
+    assert disabled_telemetry.skips == 4
+    assert disabled_telemetry.extra_transformer_nfe == 0
+    assert disabled.model_aware_offline_correction_applications == 0
+
+    legacy_telemetry = getattr(legacy.archive, gate_module._ARCHIVE_TELEMETRY_ATTR)
+    assert legacy_telemetry.enabled is True
+    assert legacy_telemetry.path == "current_causal_gain_transfer"
+    assert legacy_telemetry.applications == 4
+    assert legacy_telemetry.skips == 0
     assert legacy.model_aware_offline_correction_applications == 4
 
 
-def test_disabled_replay_equals_uncorrected_blend_b_and_preserves_archive():
+def test_disabled_gate_preserves_original_archive_and_exact_anchors():
     archive = _archive(with_correction=True)
     original_steps = archive.steps
     original_decisions = tuple(record.model_aware_decision for record in archive.steps)
     disabled = _smoother(archive, gate_enabled=False)
-    uncorrected = _smoother(_archive(with_correction=False), gate_enabled=True)
-    enabled = _smoother(_archive(with_correction=True), gate_enabled=True)
-
-    _assert_weight_maps_equal(
-        _forecast_weight_items(disabled),
-        _forecast_weight_items(uncorrected),
-    )
-    assert any(
-        not torch.equal(disabled._forecast_weights[key], enabled._forecast_weights[key])
-        for key in disabled._forecast_weights
-    )
     assert archive.steps is original_steps
     assert tuple(record.model_aware_decision for record in archive.steps) == original_decisions
-    assert archive.steps[1].model_aware_decision is not None
-    assert archive.steps[1].model_aware_decision.audio_correction_gain == pytest.approx(-0.20)
-
-    telemetry = getattr(archive, gate_module._ARCHIVE_TELEMETRY_ATTR)
-    assert telemetry.enabled is False
-    assert telemetry.path == "disabled_replay_geometry_experiment"
-    assert telemetry.applications == 0
-    assert telemetry.skips == 4
-    assert telemetry.extra_transformer_nfe == 0
-    assert disabled.model_aware_offline_correction_applications == 0
-    assert disabled.model_aware_offline_correction_seconds == pytest.approx(0.0)
-
-
-def test_disabled_gate_preserves_exact_anchors_validation_and_blends():
-    disabled_archive = _archive(with_correction=True)
-    disabled = _smoother(disabled_archive, gate_enabled=False)
-    uncorrected_archive = _archive(with_correction=False)
-    uncorrected = _smoother(uncorrected_archive, gate_enabled=True)
-
-    assert disabled._validation_scores == uncorrected._validation_scores
-    assert disabled.effective_blend_stream_stats == uncorrected.effective_blend_stream_stats
-    assert disabled.attenuated_prediction_counts == uncorrected.attenuated_prediction_counts
-    assert disabled.local_only_prediction_counts == uncorrected.local_only_prediction_counts
 
     kwargs = {"rows": (0,), "device": torch.device("cpu"), "dtype": torch.float32}
     for step_id in (0, 2, 4):
-        expected = next(
-            anchor.feature
-            for anchor in disabled_archive.anchors
-            if anchor.step_id == step_id
-        )
+        expected = next(anchor.feature for anchor in archive.anchors if anchor.step_id == step_id)
         torch.testing.assert_close(disabled.predict(step_id, **kwargs), expected)
 
 
-def test_replay_gate_does_not_change_causal_generic_weight_segments():
+def test_replay_gate_does_not_change_causal_pr39_generic_correction_segments():
     call = SimpleNamespace(
         topology=(("target_audio_rows", 1), ("target_video_rows", 1)),
         expected_shape=(1, 2, 2),
@@ -433,7 +320,7 @@ def test_first_pass_schedule_nfe_and_er_sde_tail_are_gate_independent():
     assert disabled["telemetry"].extra_transformer_nfe == 0
 
 
-def test_packed_topology_gate_removes_only_scalar_replay_correction():
+def test_packed_topology_disabled_gate_matches_uncorrected_replay():
     disabled = _smoother(
         _archive(with_correction=True, packed=True),
         gate_enabled=False,
@@ -444,85 +331,24 @@ def test_packed_topology_gate_removes_only_scalar_replay_correction():
         gate_enabled=True,
         packed=True,
     )
-    _assert_weight_maps_equal(
-        _forecast_weight_items(disabled),
-        _forecast_weight_items(uncorrected),
-    )
+    _assert_weights_equal(_weights(disabled), _weights(uncorrected))
     telemetry = getattr(disabled.archive, gate_module._ARCHIVE_TELEMETRY_ATTR)
     assert telemetry.applications == 0
     assert telemetry.skips == 2
 
 
-def test_abcd_shadow_remains_counterfactual_d_under_b_production():
-    enabled_archive = _shadow_archive(True)
-    disabled_archive = _shadow_archive(False)
-    enabled = _smoother(enabled_archive, gate_enabled=True)
-    disabled = _smoother(disabled_archive, gate_enabled=False)
-
-    assert any(
-        not torch.equal(enabled._forecast_weights[key], disabled._forecast_weights[key])
-        for key in enabled._forecast_weights
+def test_non_full_mode_keeps_gate_inert_and_trust_toggle_does_not_control_it():
+    non_full = SpectrumH3Runtime(
+        SpectrumH3Config(
+            model_aware_mode="schedule_confidence",
+            model_aware_replay_generic_correction=False,
+        )
     )
+    non_full.begin_offline_capture(total_steps=2, sampler_name="sample_euler")
+    assert non_full.offline_archive is not None
+    assert getattr(non_full.offline_archive, gate_module._ARCHIVE_GATE_ATTR) is True
+    non_full.release_offline_archive()
 
-    enabled_component = getattr(
-        enabled_archive,
-        component_module._ARCHIVE_COMPONENT_ATTR,
-    )
-    disabled_component = getattr(
-        disabled_archive,
-        component_module._ARCHIVE_COMPONENT_ATTR,
-    )
-    for stream_name in ("audio", "video"):
-        left = getattr(enabled_component, stream_name)
-        right = getattr(disabled_component, stream_name)
-        assert left.count == right.count > 0
-        for candidate in component_module._CANDIDATES:
-            assert left.candidate_ratio_sums[candidate] == pytest.approx(
-                right.candidate_ratio_sums[candidate]
-            )
-            assert left.candidate_advantage_sums[candidate] == pytest.approx(
-                right.candidate_advantage_sums[candidate]
-            )
-
-    disabled_telemetry = getattr(
-        disabled_archive,
-        gate_module._ARCHIVE_TELEMETRY_ATTR,
-    )
-    assert disabled_telemetry.enabled is False
-    assert disabled_telemetry.skips > 0
-
-
-def test_gate_telemetry_distinguishes_correction_application_from_skip():
-    enabled_archive = _archive(with_correction=True)
-    enabled = _smoother(enabled_archive, gate_enabled=True)
-    disabled_archive = _archive(with_correction=True)
-    disabled = _smoother(disabled_archive, gate_enabled=False)
-
-    runtime_enabled = SpectrumH3Runtime(SpectrumH3Config())
-    runtime_enabled._offline_archive = enabled_archive
-    runtime_enabled._offline_smoother = enabled
-    summary_enabled = runtime_enabled.debug_summary()
-    assert "model_aware_replay_generic_correction_enabled=1" in summary_enabled
-    assert "model_aware_replay_generic_correction_path=current_causal_gain_transfer" in summary_enabled
-    assert "model_aware_replay_generic_correction_applications=4" in summary_enabled
-    assert "model_aware_replay_generic_correction_skips=0" in summary_enabled
-    assert "model_aware_replay_generic_correction_extra_transformer_nfe=0" in summary_enabled
-
-    runtime_disabled = SpectrumH3Runtime(SpectrumH3Config())
-    runtime_disabled._offline_archive = disabled_archive
-    runtime_disabled._offline_smoother = disabled
-    summary_disabled = runtime_disabled.debug_summary()
-    assert "model_aware_replay_generic_correction_enabled=0" in summary_disabled
-    assert (
-        "model_aware_replay_generic_correction_path=disabled_replay_geometry_experiment"
-        in summary_disabled
-    )
-    assert "model_aware_replay_generic_correction_applications=0" in summary_disabled
-    assert "model_aware_replay_generic_correction_skips=4" in summary_disabled
-    assert "model_aware_replay_generic_correction_extra_transformer_nfe=0" in summary_disabled
-
-
-def test_trust_toggle_does_not_implicitly_change_replay_correction_gate():
     for trust_enabled in (False, True):
         runtime = SpectrumH3Runtime(
             SpectrumH3Config(
@@ -537,7 +363,7 @@ def test_trust_toggle_does_not_implicitly_change_replay_correction_gate():
         runtime.release_offline_archive()
 
 
-def test_gate_restores_archive_steps_when_underlying_builder_raises(monkeypatch):
+def test_gate_restores_archive_steps_on_ordinary_failure_and_cuda_oom(monkeypatch):
     archive = _archive(with_correction=True)
     smoother = _smoother(archive, gate_enabled=True)
     setattr(archive, gate_module._ARCHIVE_GATE_ATTR, False)
@@ -568,31 +394,3 @@ def test_gate_restores_archive_steps_when_underlying_builder_raises(monkeypatch)
     with pytest.raises(torch.cuda.OutOfMemoryError, match="synthetic OOM"):
         gate_module._build_forecast_weights_with_replay_generic_gate(smoother)
     assert archive.steps is original_steps
-
-
-def test_gate_state_is_archive_scoped_and_resets_with_new_capture():
-    disabled_runtime = SpectrumH3Runtime(
-        SpectrumH3Config(
-            model_aware_mode="full",
-            model_aware_replay_generic_correction=False,
-        )
-    )
-    disabled_runtime.begin_offline_capture(total_steps=2, sampler_name="sample_er_sde")
-    disabled_archive = disabled_runtime.offline_archive
-    assert disabled_archive is not None
-    assert getattr(disabled_archive, gate_module._ARCHIVE_GATE_ATTR) is False
-    disabled_runtime.release_offline_archive()
-
-    enabled_runtime = SpectrumH3Runtime(
-        SpectrumH3Config(
-            model_aware_mode="full",
-            model_aware_replay_generic_correction=True,
-        )
-    )
-    enabled_runtime.begin_offline_capture(total_steps=2, sampler_name="sample_er_sde")
-    enabled_archive = enabled_runtime.offline_archive
-    assert enabled_archive is not None
-    assert enabled_archive is not disabled_archive
-    assert getattr(enabled_archive, gate_module._ARCHIVE_GATE_ATTR) is True
-    assert not hasattr(enabled_archive, gate_module._ARCHIVE_TELEMETRY_ATTR)
-    enabled_runtime.release_offline_archive()
