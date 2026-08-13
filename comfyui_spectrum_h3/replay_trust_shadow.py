@@ -552,7 +552,14 @@ def _validate_replay_native_shadow(
                 legacy.record(case["baseline_ratio"], case["causal_transfer_ratio"])
             except torch.cuda.OutOfMemoryError:
                 raise
-            except (RuntimeError, TypeError, ValueError, KeyError, IndexError):
+            except (
+                AttributeError,
+                RuntimeError,
+                TypeError,
+                ValueError,
+                KeyError,
+                IndexError,
+            ):
                 aggregate.replay_shadow_failures += 1
     finally:
         native.compute_seconds += time.perf_counter() - started
@@ -584,6 +591,8 @@ def _native_stream_summary(name: str, stream: _ReplayNativeStream) -> str:
     observer_mode = (
         "spectral_vs_local" if stream.replay_observer_count else "inactive_no_spectral_blend"
     )
+    # baseline_ratio_mean is emitted once by the wrapped trust summary. The native
+    # validator populates that legacy accumulator with this same replay baseline.
     fields = [
         f"model_aware_trust_replay_shadow_{name}_oracle_ratio_mean={stream.mean(stream.oracle_ratio_sum):.6f}",
         f"model_aware_trust_replay_shadow_{name}_oracle_advantage_mean={stream.mean(stream.oracle_advantage_sum):.6f}",
