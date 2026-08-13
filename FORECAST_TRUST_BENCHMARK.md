@@ -1,96 +1,46 @@
 # Forecast trust-region benchmark record
 
-This document starts the next forecasting-quality investigation after PR #39.
+This document records the forecasting-quality investigation that follows PR #39.
 
-## Starting point
+## Starting point: the PR #39 breach
 
-PR #39 established one useful generic mechanism on real MiniMax-H3: a bounded scalar correction in the latest causal trajectory direction.
-
-```text
-d = h[-1] - h[-2]
-r = h_actual - h_pred_uncorrected
-g_raw = <r,d> / <d,d>
-h_corrected = h_pred + g*d
-```
-
-On the final same-seed 20-step gate, that mechanism reduced the measured hidden-feature forecast ratio by approximately **6.2% for audio** and **5.5% for video** relative to the uncorrected forecast. This is a forecast-error result. It is not, by itself, a measured 5-6% perceptual video-quality result.
-
-The same PR also established several useful negative results. Increasing the temporal correction rank, transforming the latest delta through FinalLayer geometry, and persisting the previous forecast residual all lost to the scalar latest-delta baseline. The next experiment therefore keeps the successful correction direction intact and attacks a different part of the same error: **how far the forecast should be trusted away from the latest exact anchor**.
-
-## Hypothesis: cache-only predictor disagreement can control forecast trust
-
-A recent closed-loop Spectrum extension, RACER (Li et al., arXiv:2608.01740), reports that disagreement between the global Chebyshev forecast and a local Taylor forecast is informative about forecast error. Its continuous controller shrinks an uncertain forecast toward the latest computed feature, and its separate refresh controller can relocate exact evaluations under a fixed NFE budget. The reported video experiments include Wan2.1-14B and HunyuanVideo.
-
-This repository already has the ingredients needed for a lower-risk MiniMax-H3 test:
-
-- the global Chebyshev predictor;
-- the local linear/secant predictor used by Spectrum's existing blend;
-- device-local sampled evidence for audio and video in `full` mode;
-- the validated generic latest-delta correction from PR #39.
-
-The first H3 experiment uses **unblended spectral-vs-linear disagreement** as the observer. It deliberately does not copy RACER's calibrated thresholds as MiniMax-H3 constants because those thresholds were fitted for other models and schedules.
-
-## Shadow-only experiment
-
-The first implementation changes no generated feature and no schedule decision. At each eligible exact anchor in `model_aware_mode=full`, it reconstructs the two cache-only sampled proposals:
+PR #39 established one useful generic correction mechanism on real MiniMax-H3:
 
 ```text
-p_spectral = Chebyshev(history, target)
-p_linear   = local_linear(history, target)
-
-risk = RMS(p_spectral - p_linear) / max(RMS(p_spectral), eps)
+d = latest_exact - previous_exact
+r = actual - forecast_uncorrected
+g = projection of r onto d
+corrected = forecast + g * d
 ```
 
-The live PR-39 proposal remains:
+The scalar gain is confidence-scaled and bounded. On the final same-seed PR #39 gate, this reduced the measured hidden-feature forecast ratio by approximately **6.2% for audio** and **5.5% for video** relative to the uncorrected forecast. These are hidden-feature forecast-error improvements, not literal perceptual-quality percentages.
+
+PR #39 also retired K=2 causal trajectory correction, FinalLayer-transformed correction directions, previous-error directions, and related model-specific correction geometry after real H3 tests failed to materially beat the scalar latest-delta baseline. PR #45 keeps that successful local breach and asks how far an already-corrected forecast should be trusted away from the latest exact feature.
+
+## Shadow observer
+
+The shadow probe compares the global Chebyshev forecast with the local linear/secant forecast on the existing bounded per-stream evidence samples:
 
 ```text
-p = current blended Spectrum forecast + generic_latest_delta_correction
+p_spectral = global Chebyshev forecast
+p_linear   = local linear/secant forecast
+
+disagreement =
+    RMS(p_spectral - p_linear)
+    / max(RMS(p_spectral), epsilon)
 ```
 
-The probe then measures three questions against the exact anchor that is already being computed.
-
-### 1. Is there still headroom in the successful latest-delta direction itself?
-
-The existing anchor evidence already measures the instantaneous exact residual projection onto `d = latest - previous`. The probe passes that instantaneous coefficient through the same rational `0.25` magnitude bound used by the shipping generic correction and shadow-scores it:
+The investigated trust segment is:
 
 ```text
-g_anchor = <actual - p_uncorrected, d> / <d,d>
-g_bound = g_anchor / (1 + abs(g_anchor) / 0.25)
-p_delta_bound = p_uncorrected + g_bound*d
+p_trust = latest_exact + kappa * (p_corrected - latest_exact)
+
+kappa =
+    exp(-0.3 * max(horizon - 1, 0))
+    * sigmoid(4.0 * (theta - disagreement))
 ```
 
-`delta_bound_advantage_mean` compares this non-causal, same-anchor bounded candidate with the currently applied causal correction. A material gap means the PR-39 direction still has useful headroom and the next gain may come from estimating its scalar coefficient better rather than changing direction.
-
-### 2. Does the trust segment contain additional error-reduction headroom?
-
-Let `a` be the latest exact cached feature. The best diagnostic interpolation on the segment from `a` to the current corrected proposal `p` is:
-
-```text
-u = p - a
-kappa_oracle = clamp(<h_actual-a,u> / <u,u>, 0, 1)
-p_oracle = a + kappa_oracle*u
-```
-
-`oracle_advantage_mean` measures how much lower the sampled forecast ratio could become if a perfect trust coefficient were known. This does not leak into generation; it only answers whether trust shrinkage is worth pursuing after the existing scalar correction.
-
-### 3. Does a cache-only disagreement signal point in the useful direction?
-
-The probe records Pearson correlation between disagreement and:
-
-- the current generic-corrected forecast ratio;
-- the amount of oracle shrink required, `1 - kappa_oracle`.
-
-It also shadow-scores three fixed transfer candidates using the recent closed-loop form:
-
-```text
-kappa = exp(-0.3 * max(horizon - 1, 0)) * sigmoid(4 * (theta - risk))
-```
-
-with `theta` values `0.15`, `0.25`, and `0.40`. These values are a diagnostic sweep only. None is applied to generated output.
-
-## Mechanical invariants
-
-This stage must preserve all behavior outside telemetry:
+The shadow sweep evaluates `theta = 0.15`, `0.25`, and `0.40`. The probe remains explicitly diagnostic:
 
 ```text
 trust_probe=shadow_only
@@ -98,42 +48,9 @@ trust_probe_applied=0
 trust_probe_extra_transformer_nfe=0
 ```
 
-Required invariants:
+The applied experiment has separate `model_aware_trust_*` telemetry. `trust_probe_applied` is not overloaded.
 
-- identical actual/forecast logical step IDs to the same configuration on `main`;
-- identical transformer NFE count;
-- identical model-aware risk/confidence/ridge/degree/blend decisions;
-- identical PR-39 generic correction gains;
-- identical ER-SDE two-logical-step actual tail policy;
-- identical offline replay decisions and generated output;
-- no full hidden-feature duplicate forecast solely for disagreement;
-- no FinalLayer operator materialization;
-- no persistent large tensor state added by the probe.
-
-The observer operates only on the existing bounded per-stream evidence samples. The three candidate scores are computed on those samples and cannot affect the live forecast.
-
-## Real MiniMax-H3 gates
-
-### Gate A: ordinary same-seed parity run
-
-Use the same saved base-H3 workflow used for the PR-39 final gate:
-
-```text
-sampler: native sample_er_sde
-steps: 20
-model_aware_mode: full
-same seed/checkpoint/precision/scheduler/prompt/references/resolution/frame count/CFG
-same Spectrum settings and storage mode
-debug: enabled
-```
-
-First verify the mechanical invariants above. The summary must report nonzero trust-probe samples and `trust_probe_failures=0` while the actual/forecast schedule and NFE remain identical to `main`.
-
-### Exploratory result: supplied 25-step ordinary run
-
-The first real trace was accidentally run at **25 steps**, so it is not the exact 20-step parity gate above. It is still valid mechanism evidence for the 25-step regime and contains more shadow samples.
-
-First-pass schedule and probe integrity:
+## Real trace 1: normal accelerated 25-step ER-SDE run
 
 ```text
 sampler                         sample_er_sde
@@ -143,13 +60,12 @@ forecast_steps                  11
 actual_transformer_calls        14
 model_aware_extra_nfes          0
 trust_probe_failures            0
-trust_probe_extra_transformer_nfe 0
 trust_probe_samples             12 audio / 12 video
 trust_probe_horizon_mean        1.833333 audio / 1.833333 video
 trust_probe_horizon_max         2.0 audio / 2.0 video
 ```
 
-The generic PR-39 correction still helps, and the same-direction oracle shows a further modest gain:
+Current PR #39 correction and remaining same-direction scalar headroom:
 
 ```text
                               audio       video
@@ -158,7 +74,7 @@ bounded-delta ratio          1.484296    1.194263
 bounded-delta advantage      3.6977%     3.7016%
 ```
 
-The trust segment exposes substantially larger headroom:
+Trust-segment oracle:
 
 ```text
                               audio       video
@@ -167,7 +83,7 @@ oracle kappa                 0.089179    0.035404
 oracle relative advantage    34.9660%    19.3114%
 ```
 
-The cache-only disagreement is also informative in this trace:
+Disagreement observer:
 
 ```text
                               audio       video
@@ -176,86 +92,317 @@ error correlation            0.859295    0.559713
 required-shrink correlation  0.907817    0.751129
 ```
 
-All three fixed trust candidates improve the sampled ratio at these evaluated anchors. `theta=0.15` is the strongest of the fixed sweep on both streams:
+Fixed `theta=0.15`:
 
 ```text
                               audio       video
-theta=0.15 ratio             0.990551    1.005021
-theta=0.15 advantage         34.7545%    18.7989%
-theta=0.25 advantage         34.4788%    18.4254%
-theta=0.40 advantage         33.4501%    17.5175%
+ratio                         0.990551    1.005021
+relative advantage            34.7545%    18.7989%
 ```
 
-Two conclusions are justified from this trace:
+The first trace showed much more trust-segment headroom than remaining scalar-gain headroom. Its probe targets were mostly horizon 2, while the live ER-SDE forecasts were horizon 1, so a direct horizon-1 calibration was required.
 
-1. The trust branch dominates the remaining same-direction scalar-gain headroom in this 25-step regime. The measured oracle advantage is roughly 9.5x the bounded-delta advantage for audio and 5.2x for video.
-2. The current corrected sampled forecast ratio is above the hold baseline (`ratio=1`) on average at these evaluated exact anchors, while oracle shrinkage moves both streams back to approximately the hold-error level. This is strong evidence that forecast distance from the latest exact anchor is a real failure axis in this regime.
+## Real trace 2: completed direct horizon-1 calibration
 
-One limitation is decisive before applying a controller: these ordinary-run probe samples are mostly **horizon 2** (`horizon_mean=1.8333`), because the probe scores the next exact anchor from the preceding actual history. The live ER-SDE forecast decisions in this run are horizon 1. Therefore the excellent `theta=0.15` result is not yet a direct same-horizon validation of the coefficient that would be applied at the live forecast steps.
-
-The 25-step run is therefore accepted as strong Branch-B evidence, not as the final applied-controller calibration and not as the exact 20-step parity gate.
-
-### Gate B: direct horizon-1 calibration trace
-
-The next run should keep the supplied **25-step configuration** fixed and turn would-be forecasts into exact evaluations so the probe sees ground truth at the same short horizon where an applied controller would act:
+The second trace used the same 25-step configuration with:
 
 ```text
 model_aware_risk_threshold = 0.0
 ```
 
-The existing force-actual rule then converts prospective model-aware forecasts into exact steps once the model-aware path is active. This run is intentionally slower and is for calibration evidence only; it is not a shipping configuration.
-
-Required checks:
-
-- `trust_probe_failures=0`;
-- no probe-added transformer NFE beyond the exact evaluations intentionally caused by the threshold;
-- `trust_probe_horizon_mean` should move close to `1.0` for the direct forecast locations;
-- the fixed theta sweep must be evaluated again at that horizon;
-- do not promote `theta=0.15` merely because it was best at the horizon-2-heavy ordinary trace.
-
-If a fixed candidate remains materially positive for both streams at horizon 1, the next patch may add an **opt-in applied trust controller** for same-seed output A/B. The first applied experiment should change the causal first-pass forecast weights only and leave offline smoother weight construction unchanged until separate evidence justifies modifying that path. This isolates whether better causal anchors improve the final replay trajectory without conflating the result with a second change to offline interpolation.
-
-After an applied 25-step A/B, repeat the good 20-step regime as a regression check before considering any default change.
-
-## Promotion gate for the next applied mechanism
-
-Do not alter the default `full` path from this probe alone. Promote an applied mechanism only after real H3 evidence resolves which branch has actual headroom at the horizon where the controller acts.
-
-### Branch A: improve the existing residual gain
-
-Prefer this branch when `delta_bound_advantage_mean` is materially positive and larger than the trust-segment advantage. That means the successful direction from PR #39 remains useful and the limiting factor is the causal estimate of `g`, not the geometry of the direction.
-
-Candidate follow-up work should stay scalar first: forecast the projection coefficient itself, improve its time/horizon calibration, or replace the fixed EWMA with a causal estimator validated against the anchor trace. Keep the `0.25` safety bound unless real evidence justifies changing it.
-
-### Branch B: add disagreement-controlled trust shrinkage
-
-Prefer this branch when all of the following hold:
-
-1. **Headroom exists:** oracle segment shrinkage materially improves the generic-corrected sampled forecast ratio. A mean relative improvement around or above 2% is enough to justify a real applied experiment.
-2. **The observer is informative:** disagreement has a stable positive relationship with current forecast error and/or required shrink. Small-sample correlation from one prompt is supporting evidence, not a universal calibration claim.
-3. **The mapping is validated at the live horizon:** at least one fixed theta candidate improves the sampled ratio at the same horizon where it will be applied, without a meaningful regression in the other stream.
-4. **A causal mapping survives another seed/prompt:** the selected fixed mapping should remain useful outside the calibration trace.
-5. **Applied A/B quality is real:** once an opt-in causal mapping is implemented, compare same-seed generated outputs and forecast telemetry against the current generic-correction baseline. Do not call a feature-space percentage a perceptual-quality percentage.
-
-When the trust branch materially dominates Branch A, as it does in the supplied 25-step horizon-2-heavy trace, it should be tested first after direct-horizon calibration rather than mechanically preferring the smaller scalar-gain change.
-
-If this branch passes, the smallest applied causal patch keeps the PR-39 correction and adds one scalar trust coefficient after it:
+This intentionally converted every prospective model-aware forecast into an exact transformer evaluation:
 
 ```text
-w_corrected = existing Spectrum weights + generic latest-delta correction
-w_final = kappa * w_corrected + (1 - kappa) * one_hot(latest_causal_anchor)
+actual_steps                    25
+forecast_steps                  0
+actual_transformer_calls        25
+model_aware_extra_nfes          22
+first-pass sampler wall time    352.156 s
 ```
 
-The first applied experiment should operate on the causal first-pass weights only. Offline replay intentionally uses a different, future-bracketed smoother; copying the causal trust coefficient into that smoother would combine two mechanisms and is not justified by the current probe. If better first-pass trust improves the retained exact anchors, that improvement will already propagate into the replay archive.
+The long runtime was expected. This was not a cold-start or profile-cache failure:
 
-Hard refresh/re-pay scheduling is intentionally deferred. It changes exact-step placement and interacts with native sampler history, offline replay, ER-SDE tail protection, rollback, and schedule accounting. Continuous trust shrinkage is the lower-regression-risk mechanism to validate first.
+```text
+model_aware_profile_cache_hit=True
+model_aware_profile_lookup_s=0.000137
+```
 
-## Interpretation map
+The calibration deliberately paid for exact targets at all 25 logical steps. Do not repeat this dense run unless a concrete validity problem is found.
 
-The shadow telemetry is designed to make the next decision explicit:
+Direct horizon-1 coverage:
 
-- **Large bounded-delta advantage:** improve causal gain estimation around the already-successful PR-39 correction.
-- **Large trust oracle advantage + useful disagreement correlation:** calibrate and then test causal disagreement-controlled shrinkage.
-- **Large trust oracle advantage + weak disagreement signal:** retain the trust-segment idea and search for a better cache-only observer.
-- **Both branches show material headroom:** follow the materially dominant branch after matching the calibration horizon; use implementation size only as a tie-breaker.
-- **Small headroom in both:** the PR-39 breach is close to saturated under this local geometry; move to a different forecast representation or coordinate rather than reviving rejected K=2/FinalLayer-adjoint families.
+```text
+trust_probe_audio_samples       23
+trust_probe_video_samples       23
+trust_probe_audio_horizon_mean  1.000000
+trust_probe_video_horizon_mean  1.000000
+trust_probe_audio_horizon_max   1.000000
+trust_probe_video_horizon_max   1.000000
+```
+
+Current correction and remaining scalar-gain headroom:
+
+```text
+                              audio       video
+current corrected ratio      1.456770    1.204774
+bounded-delta gain mean     -0.206311   -0.187437
+bounded-delta ratio          1.405965    1.166521
+bounded-delta advantage      3.3762%     3.1744%
+```
+
+Trust-segment oracle:
+
+```text
+                              audio       video
+oracle trust ratio           0.987952    0.999173
+oracle kappa mean            0.075656    0.015570
+oracle relative advantage    31.3663%    17.0017%
+```
+
+Fixed transfer candidates at the live horizon:
+
+```text
+                              audio       video
+theta=0.15 ratio             1.006423    1.021728
+theta=0.15 advantage         30.1357%    15.1502%
+theta=0.25 advantage         29.0662%    14.2591%
+theta=0.40 advantage         26.2317%    12.3941%
+```
+
+Disagreement signal:
+
+```text
+                              audio       video
+disagreement mean            0.541178    0.517512
+disagreement max             0.903309    0.927804
+error correlation           +0.768393   -0.118432
+required-shrink correlation +0.766415   +0.347676
+```
+
+`theta=0.15` is the strongest fixed tested candidate on both real traces and remains strongly positive at direct horizon 1. Audio disagreement is a strong observer in this calibration. Video error correlation is weak/negative, while video required-shrink correlation remains positive and `theta=0.15` is beneficial in aggregate. The video observer is not treated as universally calibrated, and separate audio/video thresholds are not fitted from only 23 samples.
+
+## Mandatory applied-data-flow audit
+
+The default workflow uses `offline_smoothing_replay=true`. The audit found two distinct forecasting geometries.
+
+### Offline first pass is deliberately local-only
+
+During `offline_first_pass`, `_causal_prediction_blends()` returns zero audio and video spectral blend. The normal model-aware weighted-segment path is bypassed while `_offline_phase` is active. The first pass therefore uses the local causal forecast for skipped features:
+
+```text
+causal_video_blend_weight=0.0
+causal_audio_blend_weight=0.0
+model_aware_causal_correction_s=0.0
+```
+
+A naive patch to the ordinary model-aware weighted-segment function would be a no-op for the default offline first pass.
+
+### PR #39 correction is applied in offline replay construction
+
+The first pass still computes and archives each model-aware decision. `OfflineSmoother` later rebuilds forecast weights from all retained exact anchors, combines global spectral weights with future-bracketed local interpolation, and applies the persisted PR #39 scalar correction. The replay correction is applied to replay weights, not to the local-only first-pass skipped feature.
+
+For the generic scalar correction, the current replay fallback applies the gain across the bracketing replay anchors. That geometry differs from the causal latest-two-exact-anchor correction used by the live single-pass forecaster and by the shadow calibration.
+
+### First-pass forecasts still matter to final replay
+
+The local-only first-pass skipped features drive the sampler state. Subsequent exact transformer evaluations are exact features on that first-pass trajectory and become the retained offline anchors. Replay restarts from the same original inputs and random stream, then substitutes archived exact anchors or future-bracketed smoothed features. A first-pass change can therefore alter later anchors and the final replay output, while also changing the established local-only capture architecture.
+
+### Existing shadow `p_corrected` is counterfactual in default offline mode
+
+The shadow probe reconstructs the configured/adaptive causal spectral-linear proposal plus the PR #39 causal latest-delta correction. It is not the actual local-only first-pass skipped feature, the stored model-aware decision itself, or the future-bracketed corrected replay proposal. The shadow result is valid evidence for the causal trust mechanism; it is not a direct measurement of the current replay proposal.
+
+## Applied integration decision
+
+The earlier benchmark plan said to change causal first-pass weights only. The audit invalidated that plan as a clean A/B. Activating the counterfactual model-aware corrected causal proposal in the first pass would simultaneously change the local-only capture forecast, PR #39 correction placement, and the new trust coefficient. That would confound the trust experiment.
+
+The smallest baseline-preserving applied experiment is therefore:
+
+### Single-pass mode
+
+When offline replay is disabled, apply the calibrated causal mechanism directly:
+
+```text
+w_corrected =
+    existing model-aware history weights
+    + existing PR #39 latest-delta correction
+
+w_final =
+    kappa * w_corrected
+    + (1 - kappa) * one_hot(latest_causal_anchor)
+```
+
+### Default offline replay mode
+
+During the local-only first pass:
+
+1. compute audio/video disagreement from existing bounded causal evidence;
+2. compute fixed `theta=0.15` `kappa` independently for each stream;
+3. persist the scalar `kappa` and exact causal anchor ID for that forecast step;
+4. leave the first-pass skipped feature unchanged.
+
+During `OfflineSmoother` weight construction:
+
+```text
+w_replay_corrected =
+    existing future-bracketed replay weights
+    + existing PR #39 replay correction
+
+w_final =
+    kappa_causal * w_replay_corrected
+    + (1 - kappa_causal) * one_hot(persisted_latest_causal_anchor)
+```
+
+The replay proposal may contain future information. The trust coefficient and shrink target do not: they are computed causally during the first pass and persisted deterministically.
+
+This path is reported as:
+
+```text
+model_aware_trust_path=offline_replay_causal_kappa_transfer
+```
+
+It is intentionally labeled a **transfer** because the replay proposal geometry is not identical to the causal proposal that produced the 30.1% / 15.2% horizon-1 shadow gains.
+
+## Replay-transfer shadow validation
+
+Because the default replay integration uses a different proposal geometry, the implementation adds a separate bounded leave-one-out replay-transfer diagnostic. At eligible exact anchors it records causal disagreement, fixed `theta=0.15` kappa, latest causal anchor ID, model-aware blend, and PR #39 scalar gain. Once the full exact-anchor archive exists, it withholds that target and constructs a future-bracketed replay-style proposal from bounded sampled features.
+
+It reports:
+
+```text
+model_aware_trust_replay_shadow=loo_unattenuated_future_bracket
+model_aware_trust_replay_shadow_audio_*
+model_aware_trust_replay_shadow_video_*
+```
+
+The diagnostic intentionally omits the live smoother's branch-specific validation attenuation. It is a replay-geometry sanity check, not proof that the applied replay transfer is perceptually better. The same-seed generated-output A/B remains authoritative.
+
+## Applied controller
+
+Public option:
+
+```text
+model_aware_trust_shrinkage
+```
+
+Properties:
+
+- boolean;
+- default `false`;
+- effective only with `model_aware_mode="full"`;
+- no default behavior change;
+- no scheduling change or hard refresh/re-pay;
+- no additional transformer NFE;
+- no full hidden-feature duplicate prediction;
+- no persistent large tensor state.
+
+Fixed first experimental mapping:
+
+```text
+kappa =
+    exp(-0.3 * max(horizon - 1, 0))
+    * sigmoid(4.0 * (0.15 - disagreement))
+```
+
+Audio and video are computed and applied separately. Packed topology without a proven target audio/video boundary remains baseline-identical. If causal evidence is insufficient, bootstrap-only, malformed, or otherwise cannot prove the observer, trust is not applied (`kappa=1` behavior). Non-OOM trust failures fall back to baseline for that stream/step and increment the failure counter. CUDA OOM propagates.
+
+## Applied telemetry
+
+```text
+model_aware_trust_enabled
+model_aware_trust_applied
+model_aware_trust_path
+model_aware_trust_applications
+
+model_aware_trust_audio_disagreement_mean
+model_aware_trust_audio_disagreement_max
+model_aware_trust_video_disagreement_mean
+model_aware_trust_video_disagreement_max
+
+model_aware_trust_audio_kappa_mean
+model_aware_trust_audio_kappa_min
+model_aware_trust_audio_kappa_max
+model_aware_trust_video_kappa_mean
+model_aware_trust_video_kappa_min
+model_aware_trust_video_kappa_max
+
+model_aware_trust_failures
+model_aware_trust_compute_s
+model_aware_trust_scalar_transfer_s
+model_aware_trust_weight_apply_s
+model_aware_trust_total_s
+model_aware_trust_extra_transformer_nfe=0
+```
+
+Audio/video disagreement scalars are reduced together before the GPU-to-CPU transfer. History weights are already bounded CPU coefficients, so shrinkage does not copy full hidden history to the host. `model_aware_trust_scalar_transfer_s` is the synchronization boundary; pending bounded GPU observer work may be charged there because GPU execution is asynchronous.
+
+## Mechanical invariants
+
+With `model_aware_trust_shrinkage=false`, behavior must remain baseline-identical. With it enabled:
+
+- model-aware scheduling remains unchanged;
+- ER-SDE's final two logical steps remain actual;
+- no trust-added actual evaluation is allowed;
+- the normal 25-step schedule should remain 14 actual / 11 forecast;
+- `model_aware_trust_extra_transformer_nfe=0`;
+- offline first-pass local-only capture remains unchanged;
+- replay chronology and seeded replay remain unchanged;
+- exact replay anchors remain exact one-hot anchors;
+- output shape, dtype, and device remain unchanged;
+- audio/video trust decisions remain independent;
+- packed topology never fabricates a modality split.
+
+## Real applied gate
+
+Unit tests and CI are necessary and are not the promotion gate.
+
+### Gate C1: 25-step same-seed applied A/B
+
+Use the same normal accelerated 25-step workflow that produced the calibration traces.
+
+Baseline:
+
+```text
+model_aware_mode = full
+model_aware_trust_shrinkage = false
+normal model_aware_risk_threshold
+sampler = sample_er_sde
+offline_smoothing_replay = unchanged
+```
+
+Applied: identical except `model_aware_trust_shrinkage=true`.
+
+Keep seed, prompt, checkpoint, precision, references, resolution, frame count, scheduler, CFG, and all other Spectrum settings identical.
+
+Mechanical checks:
+
+- 14 actual / 11 forecast remains intact unless the baseline itself differs;
+- no extra transformer NFE;
+- no trust failures;
+- ER-SDE exact tail preserved;
+- offline replay completes with no fallback;
+- trust applications are nonzero;
+- audio/video kappa and disagreement are sensible;
+- replay-transfer shadow telemetry is present where eligible;
+- controller overhead is acceptable.
+
+Then compare generated video and audio quality. This is the first gate that can establish whether the hidden-feature error mechanism improves actual output.
+
+### Gate C2: known-good 20-step regression
+
+If C1 is positive, repeat the known-good 20-step regime used around PR #39. The controller must not improve the problematic 25-step case by degrading the already-good 20-step case.
+
+### Gate C3: another seed / prompt / reference case
+
+Before any default promotion, test another independent content case. Only one direct horizon-1 calibration trace exists. Do not fit separate audio/video thresholds or repeatedly tune `theta` to one seed.
+
+## Promotion rules
+
+For now:
+
+```text
+model_aware_trust_shrinkage = false
+```
+
+Do not promote it to the default from sampled feature metrics alone. Do not merge PR #45 solely because unit tests and CI pass. Keep it draft until the generated-output applied gate is evaluated unless explicitly instructed otherwise.
+
+If the applied A/B fails, distinguish observer quality, mapping calibration, audio/video asymmetry, replay-transfer geometry, incorrect integration, and hidden-feature error not mapping to final perceptual quality. Do not revive retired K=2 / FinalLayer / previous-error families without genuinely new evidence, and do not tune `theta` until one calibration seed happens to look good.

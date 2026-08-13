@@ -26,6 +26,7 @@ class SpectrumH3Config:
     offline_archive_storage: str = "system_ram"
     model_aware_mode: str = "off"
     model_aware_risk_threshold: float = 0.65
+    model_aware_trust_shrinkage: bool = False
 
     def __post_init__(self) -> None:
         trajectory_modes = {
@@ -36,6 +37,8 @@ class SpectrumH3Config:
         for name, value in trajectory_modes.items():
             if not isinstance(value, bool):
                 raise TypeError(f"{name} must be a boolean")
+        if not isinstance(self.model_aware_trust_shrinkage, bool):
+            raise TypeError("model_aware_trust_shrinkage must be a boolean")
         conflicts = [name for name, value in trajectory_modes.items() if value]
         if self.enabled and len(conflicts) > 1:
             raise ValueError(
@@ -56,6 +59,8 @@ class SpectrumH3Config:
             raise TypeError("force_actual must be a boolean")
         if not isinstance(self.bootstrap_first_forecast, bool):
             raise TypeError("bootstrap_first_forecast must be a boolean")
+        if not isinstance(self.model_aware_trust_shrinkage, bool):
+            raise TypeError("model_aware_trust_shrinkage must be a boolean")
         for name in (
             "anchor_residual_feedback",
             "selective_rollback_correction",

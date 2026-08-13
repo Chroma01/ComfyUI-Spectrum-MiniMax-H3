@@ -54,6 +54,7 @@ jobs:
       - name: Run Ruff and compileall
         run: |
           python -m ruff check \
+            comfyui_spectrum_h3/config.py \
             comfyui_spectrum_h3/generic_correction.py \
             comfyui_spectrum_h3/trust_probe.py \
             comfyui_spectrum_h3/nodes.py \
