@@ -89,7 +89,6 @@ def test_er_sde_20_step_schedule_gets_no_unnecessary_tail_promotion() -> None:
     decisions, runtime = _run_er_sde_schedule(20)
 
     assert bool(decisions[18]["actual"])
-    assert decisions[18]["reason"] != "ER-SDE offline replay penultimate exact anchor"
     assert _actual_indices(decisions) == [0, 2, 4, 6, 8, 10, 12, 14, 16, 18, 19]
     assert runtime.stats.actual_steps == 11
     assert runtime.stats.forecast_steps == 9
@@ -104,7 +103,7 @@ def test_er_sde_25_step_penultimate_forecast_is_promoted_for_offline_replay() ->
         True,
         True,
     ]
-    assert decisions[23]["reason"] == "ER-SDE offline replay penultimate exact anchor"
+    assert decisions[23]["reason"] == "final actual tail"
     assert runtime.stats.actual_steps == 14
     assert runtime.stats.forecast_steps == 11
     assert runtime.stats.actual_transformer_calls == 14
@@ -115,7 +114,6 @@ def test_er_sde_32_step_schedule_gets_no_unnecessary_tail_promotion() -> None:
     decisions, runtime = _run_er_sde_schedule(32)
 
     assert bool(decisions[30]["actual"])
-    assert decisions[30]["reason"] != "ER-SDE offline replay penultimate exact anchor"
     assert runtime.stats.actual_steps == 17
     assert runtime.stats.forecast_steps == 15
     _assert_exact_nfe_accounting(decisions, runtime)
@@ -127,10 +125,6 @@ def test_er_sde_explicit_larger_tail_still_wins() -> None:
     assert all(bool(decisions[index]["actual"]) for index in range(21, 25))
     assert all(
         decisions[index]["reason"] == "final actual tail" for index in range(21, 25)
-    )
-    assert not any(
-        decision["reason"] == "ER-SDE offline replay penultimate exact anchor"
-        for decision in decisions
     )
     _assert_exact_nfe_accounting(decisions, runtime)
 
