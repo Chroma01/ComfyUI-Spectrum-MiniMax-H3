@@ -263,16 +263,16 @@ def _shadow_archive(gate_enabled: bool) -> OfflineFeatureArchive:
     return archive
 
 
-def test_replay_generic_correction_setting_defaults_to_current_behavior_and_round_trips():
+def test_replay_generic_correction_setting_defaults_off_and_round_trips():
     config = SpectrumH3Config()
-    assert config.model_aware_replay_generic_correction is True
+    assert config.model_aware_replay_generic_correction is False
     round_trip = SpectrumH3Config(**asdict(config))
     assert round_trip == config
     with pytest.raises(TypeError, match="model_aware_replay_generic_correction"):
         SpectrumH3Config(model_aware_replay_generic_correction="no")
 
     optional = SpectrumApplyMiniMaxH3.INPUT_TYPES()["optional"]
-    assert optional["model_aware_replay_generic_correction"][1]["default"] is True
+    assert optional["model_aware_replay_generic_correction"][1]["default"] is False
 
 
 def test_replay_generic_correction_is_inert_outside_full_offline_replay():
@@ -295,20 +295,35 @@ def test_replay_generic_correction_is_inert_outside_full_offline_replay():
     runtime.release_offline_archive()
 
 
-def test_default_and_explicit_enabled_replay_are_exactly_identical():
+def test_default_and_explicit_disabled_replay_are_exactly_identical():
     default = _smoother(_archive(with_correction=True))
-    explicit = _smoother(_archive(with_correction=True), gate_enabled=True)
+    explicit = _smoother(_archive(with_correction=True), gate_enabled=False)
     _assert_weight_maps_equal(
         _forecast_weight_items(default),
         _forecast_weight_items(explicit),
     )
     telemetry = getattr(default.archive, gate_module._ARCHIVE_TELEMETRY_ATTR)
+    assert telemetry.enabled is False
+    assert telemetry.path == "disabled_replay_geometry_experiment"
+    assert telemetry.applications == 0
+    assert telemetry.skips == 4
+    assert telemetry.extra_transformer_nfe == 0
+    assert default.model_aware_offline_correction_applications == 0
+
+
+def test_explicit_true_preserves_legacy_replay_transfer():
+    default = _smoother(_archive(with_correction=True))
+    legacy = _smoother(_archive(with_correction=True), gate_enabled=True)
+    assert any(
+        not torch.equal(default._forecast_weights[key], legacy._forecast_weights[key])
+        for key in default._forecast_weights
+    )
+    telemetry = getattr(legacy.archive, gate_module._ARCHIVE_TELEMETRY_ATTR)
     assert telemetry.enabled is True
     assert telemetry.path == "current_causal_gain_transfer"
     assert telemetry.applications == 4
     assert telemetry.skips == 0
-    assert telemetry.extra_transformer_nfe == 0
-    assert default.model_aware_offline_correction_applications == 4
+    assert legacy.model_aware_offline_correction_applications == 4
 
 
 def test_disabled_replay_equals_uncorrected_blend_b_and_preserves_archive():
