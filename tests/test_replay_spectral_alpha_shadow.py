@@ -7,7 +7,6 @@ import torch
 
 from comfyui_spectrum_h3 import replay_component_shadow as component_module
 from comfyui_spectrum_h3 import replay_spectral_alpha_shadow as alpha_module
-from comfyui_spectrum_h3 import replay_spectral_mixture_shadow as spectral_module
 from comfyui_spectrum_h3 import replay_trust_shadow as replay_module
 from comfyui_spectrum_h3 import trust_probe as trust_module
 
