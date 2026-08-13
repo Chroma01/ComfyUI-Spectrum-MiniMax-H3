@@ -34,6 +34,78 @@ For quality-critical work, compare the same prompt and seed with Spectrum enable
 
 Use Spectrum when the speed benefit is worth possible output differences. Disable it when maximum fidelity to the native MiniMax H3 trajectory is required.
 
+### Speed-up / few-step LoRAs
+
+For quality-critical use, **speed-up/few-step LoRAs are currently not recommended with Spectrum**, including Turbo/LightX2V-style acceleration weights.
+
+The newer LightX2V LoRAs are substantially better than the earlier generation of Turbo acceleration LoRAs. Maintainer testing still found significant visual degradation relative to the normal 20-step Spectrum path. Observed differences included changes in composition, action and motion, reduced natural detail, and a recurring smooth/plasticky Turbo-like appearance.
+
+This recommendation is based on output fidelity. **The additional speed gain can be very large.**
+
+One measured maintainer test used the LightX2V 8-step LoRA at 8 steps and roughly 0.9 MP with Spectrum:
+
+```text
+Duration: 8 s
+Resolution: ~0.9 MP
+Sampler: ER-SDE
+Total steps: 8
+Actual transformer evaluations: 5
+Forecast steps: 3
+Spectrum first-pass wall time: 91.256 s
+```
+
+A representative candidate from the earlier roughly 0.7 MP / 20-step plain-Spectrum test family was:
+
+```text
+Duration: 8 s
+Resolution: ~0.7 MP
+Total steps: 20
+Actual transformer evaluations: 11
+Forecast steps: 9
+Spectrum first-pass wall time: 157.793 s
+```
+
+The LightX2V + Spectrum run therefore required approximately **42% less first-pass wall time**, equivalent to roughly **1.73x the speed**, for the same **8-second video duration** despite using the higher resolution.
+
+Several very similar 0.7 MP / 20-step Spectrum reruns were performed in that baseline test cluster. The 157.793 s run cannot be proven to be the exact sample originally paired mentally with the later LightX2V test. It is representative of that plain-Spectrum family rather than a controlled benchmark pair. The timings above also measure Spectrum's first-pass sampling wall time rather than complete end-to-end generation time.
+
+The corresponding visual result from the roughly 0.9 MP LightX2V 8-step test was still judged worse than the roughly 0.7 MP / 20-step Spectrum baseline. The LightX2V 4-step variant showed the same visual tendencies more strongly.
+
+Similar visual degradation was also observed when running the acceleration LoRA without Spectrum, so these visual observations do not indicate a Spectrum-specific interaction.
+
+#### Audio with very short acceleration trajectories
+
+Audio behavior with few-step acceleration LoRAs is less conclusively characterized.
+
+A controlled audio-focused four-way comparison of:
+
+1. native H3
+2. native H3 + Spectrum
+3. acceleration LoRA
+4. acceleration LoRA + Spectrum
+
+has not yet been completed.
+
+`audio_blend_weight=0` prevents direct spectral blending of audio rows. It does **not** make a forecast step equivalent to an actual H3 transformer evaluation. Spectrum still substitutes predicted hidden features on forecasted steps, and the offline replay audio path remains local.
+
+This becomes relevant with extremely short trajectories. In the measured 8-step LightX2V + Spectrum run above, Spectrum had only **5 actual transformer evaluations** available across the complete trajectory, with the remaining 3 steps forecasted.
+
+The representative 20-step Spectrum run had **11 actual transformer evaluations and 9 forecasts**. The shorter LightX2V trajectory therefore provides considerably fewer actual trajectory anchors in absolute terms.
+
+This does not establish that few-step LoRAs cause audio degradation. It makes trajectory length and the number of actual transformer anchors important variables to isolate when investigating audio-quality reports.
+
+For an audio-quality report involving an acceleration LoRA, first test the current release with:
+
+```text
+offline_smoothing_replay = true
+audio_blend_weight = 0
+model_aware_mode = off
+```
+
+Please provide the exact acceleration LoRA/version and strength, total steps, prompt and seed, reference inputs, resolution and duration, sampler/scheduler/shift, complete Spectrum settings, and the debug run summary showing actual and forecast step counts.
+
+When possible, also compare native H3 with Spectrum disabled and enabled at a normal step count. A full four-way matched comparison provides the clearest isolation of whether an observed audio problem follows Spectrum generally, the acceleration LoRA, or the combined short-trajectory configuration.
+
 ## Supported native path
 
 The integration targets `comfy.ldm.minimax.model.MiniMaxH3Model` in native ComfyUI. It supports native text-to-video/audio (`t2va`), first/last-frame-to-video/audio (`fl2va`), and reference-to-video/audio (`ref2va`) workflows. It requires the MiniMax H3 and packed-latent sampler APIs introduced by ComfyUI commit `e377e263049f9338b4d12a3dd417b36ae62948ff`, including the `latent_shapes` argument on `outer_sample`. Older ComfyUI revisions are unsupported. Native-equivalence coverage includes that original integration and ComfyUI commit `00d02f2854892ee5b9808bc2f6348b972017886a`, used for the v0.2.2 test run, including the `ModelSamplingAV` audio-schedule contract introduced in `bdcb886a4705a03cf40f4a7226de9fc7c059fc90` and reference-conditioned target forecasting. Required H3 attributes are checked when the node is applied, and replacement output shape is checked on actual steps so incompatible native changes fail with an explicit contract error.
