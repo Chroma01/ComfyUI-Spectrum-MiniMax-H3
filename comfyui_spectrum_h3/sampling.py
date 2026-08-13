@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -76,6 +77,16 @@ def _er_sde_noise_scaler_supports_replay(noise_scaler: Any) -> bool:
 
     code = getattr(noise_scaler, "__code__", None)
     if code is None or tuple(code.co_freevars) != expected_freevars:
+        return False
+
+    native_module = sys.modules.get(ER_SDE_NATIVE_SCALER_MODULE)
+    if native_module is None or getattr(noise_scaler, "__globals__", None) is not vars(native_module):
+        return False
+    sampler_class = getattr(native_module, "SamplerER_SDE", None)
+    execute = getattr(sampler_class, "execute", None)
+    execute_function = getattr(execute, "__func__", execute)
+    execute_code = getattr(execute_function, "__code__", None)
+    if execute_code is None or not any(item is code for item in execute_code.co_consts):
         return False
 
     closure = getattr(noise_scaler, "__closure__", None) or ()
