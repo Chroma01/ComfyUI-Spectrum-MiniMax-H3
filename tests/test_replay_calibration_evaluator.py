@@ -51,9 +51,9 @@ def _row(
     row["current_ratio"] = evaluator.ratio_from_row(row, current_weight)
     row["full_spectral_ratio"] = evaluator.ratio_from_row(row, 1.0)
     row["oracle_ratio"] = evaluator.ratio_from_row(row, oracle_weight)
-    for alpha in evaluator.FIXED_ALPHAS:
-        row[f"fixed_{evaluator._fixed_suffix(alpha)}_ratio"] = evaluator.ratio_from_row(
-            row, alpha
+    for weight in evaluator.FIXED_ABSOLUTE_WEIGHTS:
+        row[f"fixed_{evaluator._fixed_suffix(weight)}_ratio"] = evaluator.ratio_from_row(
+            row, weight
         )
     return row
 
@@ -141,12 +141,58 @@ def test_cli_annotation_loading(tmp_path):
     assert len(runs) == 1
     assert runs[0].label == "external-label"
     assert runs[0].seed == 123456789
+    assert runs[0].runtime_seed is None
+
+
+def test_runtime_seed_conflict_is_rejected(tmp_path):
+    path = tmp_path / "run.log"
+    block = _block("runtime-label")
+    block["provenance"]["seed"] = 123
+    path.write_text(json.dumps(block), encoding="utf-8")
+    with pytest.raises(evaluator.CalibrationError, match="conflicts with runtime seed"):
+        evaluator.load_runs([str(path)], seed_specs=["456"])
+
+
+def test_duplicate_trace_cannot_be_counted_twice_as_independent_evidence():
+    first = _run("a")
+    duplicate = evaluator.RunBlock(
+        source="copy.log",
+        block_index=0,
+        label="copy",
+        seed=None,
+        block=json.loads(json.dumps(first.block)),
+    )
+    with pytest.raises(evaluator.CalibrationError, match="duplicate calibration run identity"):
+        evaluator.analyze_runs([first, duplicate])
+
+
+def test_external_seed_can_disambiguate_unknown_runtime_trace_identity():
+    block = _block("a")
+    first = evaluator.RunBlock("a.log", 0, "a", 1, block)
+    second = evaluator.RunBlock(
+        "b.log",
+        0,
+        "b",
+        2,
+        json.loads(json.dumps(block)),
+    )
+    evaluator._validate_run_collection([first, second])
+    assert first.analysis_identity != second.analysis_identity
+
+
+def test_duplicate_labels_are_rejected_before_fold_caches_are_built():
+    first = _run("a")
+    second_block = _block("b")
+    second = evaluator.RunBlock("b", 0, "a", None, second_block)
+    with pytest.raises(evaluator.CalibrationError, match="duplicate run label"):
+        evaluator.analyze_runs([first, second])
 
 
 def test_level0_affine_level1_and_level2_hierarchy():
     runs = [_run("a", 0.00), _run("b", 0.03), _run("c", -0.02)]
     report = evaluator.analyze_runs(runs)
     assert report["evidence_level"].startswith("MULTI-RUN")
+    assert report["aggregate_weighting"] == "per-target across held-out complete runs"
     assert set(report["level0"]) >= {
         "local",
         "current",
