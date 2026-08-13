@@ -245,13 +245,19 @@ def _parse_annotation_specs(
     *,
     kind: str,
 ) -> dict[str, str]:
+    known = {str(pathlib.Path(item)) for item in inputs}
     resolved: dict[str, str] = {}
     for spec in specs:
         if "=" in spec:
             key, value = spec.split("=", 1)
             if not key or not value:
                 raise CalibrationError(f"invalid --{kind} annotation {spec!r}")
-            resolved[str(pathlib.Path(key))] = value
+            normalized = str(pathlib.Path(key))
+            if normalized not in known:
+                raise CalibrationError(
+                    f"--{kind} annotation {key!r} matches no input"
+                )
+            resolved[normalized] = value
         else:
             if len(inputs) != 1:
                 raise CalibrationError(
