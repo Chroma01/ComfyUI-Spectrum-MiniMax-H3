@@ -7,6 +7,7 @@ from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
 from .replay_component_shadow import install_replay_component_decomposition
 from .replay_generic_correction_gate import install_replay_generic_correction_gate
 from .replay_shadow_composition import install_replay_shadow_composition
+from .replay_spectral_alpha_shadow import install_replay_spectral_alpha_shadow
 from .replay_spectral_mixture_shadow import install_replay_spectral_mixture_shadow
 from .replay_trust_shadow import install_replay_native_trust_shadow
 from .runtime import SpectrumH3Runtime
@@ -18,6 +19,7 @@ install_replay_native_trust_shadow()
 install_replay_component_decomposition()
 install_replay_shadow_composition()
 install_replay_spectral_mixture_shadow()
+install_replay_spectral_alpha_shadow()
 install_replay_generic_correction_gate()
 install_er_sde_tail_policy()
 
