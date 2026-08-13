@@ -59,6 +59,7 @@ jobs:
             comfyui_spectrum_h3/trust_probe.py \
             comfyui_spectrum_h3/replay_trust_shadow.py \
             comfyui_spectrum_h3/replay_component_shadow.py \
+            comfyui_spectrum_h3/replay_shadow_composition.py \
             comfyui_spectrum_h3/nodes.py \
             comfyui_spectrum_h3/sampling.py \
             comfyui_spectrum_h3/__init__.py \
