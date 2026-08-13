@@ -11,6 +11,7 @@ from typing import Any, Iterable
 SCHEMA_VERSION = 1
 LOG_PREFIX = "SPECTRUM_REPLAY_CALIBRATION_JSON="
 DEFAULT_PARITY_TOLERANCE = 2e-5
+FIXED_ABSOLUTE_WEIGHTS = (0.0, 0.25, 0.50, 0.75, 1.0)
 FIXED_ALPHAS = (0.0, 0.25, 0.50, 0.75, 1.0)
 LEVEL2_PREDICTORS = (
     "causal_disagreement",
@@ -36,6 +37,33 @@ class RunBlock:
     @property
     def rows(self) -> list[dict[str, Any]]:
         return self.block["target_rows"]
+
+    @property
+    def trace_fingerprint(self) -> str:
+        value = (self.block.get("provenance") or {}).get("trace_fingerprint")
+        if not isinstance(value, str) or not value:
+            raise CalibrationError(f"run {self.label!r} has no trace_fingerprint")
+        return value
+
+    @property
+    def runtime_seed(self) -> int | None:
+        value = (self.block.get("provenance") or {}).get("seed")
+        if value is None:
+            return None
+        if isinstance(value, bool):
+            raise CalibrationError(f"run {self.label!r} has invalid runtime seed")
+        try:
+            converted = int(value)
+        except (TypeError, ValueError, OverflowError) as exc:
+            raise CalibrationError(f"run {self.label!r} has invalid runtime seed") from exc
+        if converted != value:
+            raise CalibrationError(f"run {self.label!r} has non-integral runtime seed")
+        return converted
+
+    @property
+    def analysis_identity(self) -> str:
+        seed_text = "unknown" if self.seed is None else str(self.seed)
+        return f"{self.trace_fingerprint}:seed={seed_text}"
 
 
 @dataclass(frozen=True)
@@ -111,7 +139,7 @@ def validate_row_parity(
             ),
         )
     )
-    for value in FIXED_ALPHAS:
+    for value in FIXED_ABSOLUTE_WEIGHTS:
         key = f"fixed_{_fixed_suffix(value)}_ratio"
         if key in row:
             checks.append((key, ratio_from_row(row, value), float(row[key])))
@@ -147,12 +175,14 @@ def validate_block(block: dict[str, Any]) -> dict[str, Any]:
         raise CalibrationError("invalid parity tolerance")
     max_error = 0.0
     trace = (block.get("provenance") or {}).get("trace_fingerprint")
+    if not isinstance(trace, str) or not trace:
+        raise CalibrationError("calibration block has no trace_fingerprint")
     for row in rows:
         if not isinstance(row, dict):
             raise CalibrationError("target_rows must contain JSON objects")
         if int(row.get("schema_version", -1)) != SCHEMA_VERSION:
             raise CalibrationError("row schema version does not match block schema")
-        if trace is not None and row.get("trace_fingerprint") != trace:
+        if row.get("trace_fingerprint") != trace:
             raise CalibrationError("row trace_fingerprint does not match block provenance")
         max_error = max(
             max_error,
@@ -231,6 +261,41 @@ def _parse_annotation_specs(
     return resolved
 
 
+def _annotation_seed(value: Any) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        raise CalibrationError(f"invalid seed annotation {value!r}")
+    try:
+        converted = int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise CalibrationError(f"invalid seed annotation {value!r}") from exc
+    try:
+        if converted != value and str(converted) != str(value):
+            raise CalibrationError(f"invalid seed annotation {value!r}")
+    except (TypeError, ValueError) as exc:
+        raise CalibrationError(f"invalid seed annotation {value!r}") from exc
+    return converted
+
+
+def _validate_run_collection(runs: list[RunBlock]) -> None:
+    labels: set[str] = set()
+    identities: set[str] = set()
+    for run in runs:
+        if run.label in labels:
+            raise CalibrationError(
+                f"duplicate run label {run.label!r}; use --label to make folds unambiguous"
+            )
+        labels.add(run.label)
+        identity = run.analysis_identity
+        if identity in identities:
+            raise CalibrationError(
+                "duplicate calibration run identity; refusing to count the same trace "
+                f"twice as independent evidence: {identity}"
+            )
+        identities.add(identity)
+
+
 def load_runs(
     inputs: list[str],
     *,
@@ -255,25 +320,36 @@ def load_runs(
             provenance = block.get("provenance") or {}
             runtime_label = provenance.get("label")
             runtime_seed = provenance.get("seed")
-            label = labels.get(key) or runtime_label or f"{path.name}#{block_index + 1}"
-            seed_value: int | None
-            raw_seed = seeds.get(key, runtime_seed)
-            if raw_seed is None:
-                seed_value = None
-            else:
-                try:
-                    seed_value = int(raw_seed)
-                except (TypeError, ValueError) as exc:
-                    raise CalibrationError(f"invalid seed annotation {raw_seed!r}") from exc
+            requested_label = labels.get(key) or runtime_label or path.name
+            label = (
+                str(requested_label)
+                if len(blocks) == 1
+                else f"{requested_label}#{block_index + 1}"
+            )
+            annotated_seed = _annotation_seed(seeds.get(key))
+            runtime_seed_value = _annotation_seed(runtime_seed)
+            if (
+                annotated_seed is not None
+                and runtime_seed_value is not None
+                and annotated_seed != runtime_seed_value
+            ):
+                raise CalibrationError(
+                    f"seed annotation {annotated_seed} conflicts with runtime seed "
+                    f"{runtime_seed_value} for {path}"
+                )
+            seed_value = (
+                annotated_seed if annotated_seed is not None else runtime_seed_value
+            )
             runs.append(
                 RunBlock(
                     source=key,
                     block_index=block_index,
-                    label=str(label),
+                    label=label,
                     seed=seed_value,
                     block=block,
                 )
             )
+    _validate_run_collection(runs)
     return runs
 
 
@@ -515,6 +591,7 @@ def _residual_report(runs: list[RunBlock]) -> dict[str, Any]:
 def analyze_runs(runs: list[RunBlock]) -> dict[str, Any]:
     if not runs:
         raise CalibrationError("at least one calibration run is required")
+    _validate_run_collection(runs)
     evidence = _evidence_level(len(runs))
     report: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -525,13 +602,16 @@ def analyze_runs(runs: list[RunBlock]) -> dict[str, Any]:
             "using exact quadratic moments before clipping; no feature normalization; "
             f"fixed ridge={FIT_RIDGE:g}; final weights clipped to [0,1]"
         ),
+        "aggregate_weighting": "per-target across held-out complete runs",
         "runs": [
             {
                 "label": run.label,
                 "source": run.source,
                 "block_index": run.block_index,
                 "seed": run.seed,
-                "trace_fingerprint": (run.block.get("provenance") or {}).get("trace_fingerprint"),
+                "runtime_seed": run.runtime_seed,
+                "trace_fingerprint": run.trace_fingerprint,
+                "analysis_identity": run.analysis_identity,
                 "rows": len(run.rows),
             }
             for run in runs
@@ -650,6 +730,7 @@ def render_text(report: dict[str, Any]) -> str:
         f"Evidence: {report['evidence_level']}",
         f"Runs: {report['run_count']}",
         f"Fit: {report['fit_objective']}",
+        f"Aggregate weighting: {report['aggregate_weighting']}",
         "",
         "Level 0 baselines",
     ]
@@ -716,7 +797,10 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="[INPUT=]SEED",
-        help="Annotate an otherwise unavailable seed; INPUT=VALUE is required with multiple inputs",
+        help=(
+            "Annotate a seed only when runtime provenance is unavailable; a conflicting "
+            "runtime seed is rejected. INPUT=VALUE is required with multiple inputs"
+        ),
     )
     parser.add_argument("--json", action="store_true", help="Emit deterministic JSON report")
     return parser
