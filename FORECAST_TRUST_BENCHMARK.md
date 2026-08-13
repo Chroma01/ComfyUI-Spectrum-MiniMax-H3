@@ -47,11 +47,23 @@ The live PR-39 proposal remains:
 p = current blended Spectrum forecast + generic_latest_delta_correction
 ```
 
-The probe then measures two questions against the exact anchor that is already being computed.
+The probe then measures three questions against the exact anchor that is already being computed.
 
-### 1. Does the trust segment contain additional error-reduction headroom?
+### 1. Is there still headroom in the successful latest-delta direction itself?
 
-Let `a` be the latest exact cached feature. The best diagnostic interpolation on the segment from `a` to `p` is:
+The existing anchor evidence already measures the instantaneous exact residual projection onto `d = latest - previous`. The probe passes that instantaneous coefficient through the same rational `0.25` magnitude bound used by the shipping generic correction and shadow-scores it:
+
+```text
+g_anchor = <actual - p_uncorrected, d> / <d,d>
+g_bound = g_anchor / (1 + abs(g_anchor) / 0.25)
+p_delta_bound = p_uncorrected + g_bound*d
+```
+
+`delta_bound_advantage_mean` compares this non-causal, same-anchor bounded candidate with the currently applied causal correction. A material gap means the PR-39 direction still has useful headroom and the next gain may come from estimating its scalar coefficient better rather than changing direction.
+
+### 2. Does the trust segment contain additional error-reduction headroom?
+
+Let `a` be the latest exact cached feature. The best diagnostic interpolation on the segment from `a` to the current corrected proposal `p` is:
 
 ```text
 u = p - a
@@ -61,7 +73,7 @@ p_oracle = a + kappa_oracle*u
 
 `oracle_advantage_mean` measures how much lower the sampled forecast ratio could become if a perfect trust coefficient were known. This does not leak into generation; it only answers whether trust shrinkage is worth pursuing after the existing scalar correction.
 
-### 2. Does a cache-only disagreement signal point in the useful direction?
+### 3. Does a cache-only disagreement signal point in the useful direction?
 
 The probe records Pearson correlation between disagreement and:
 
@@ -129,18 +141,26 @@ The existing force-actual rule then converts forecast candidates into exact step
 
 Verify that the probe's reported `horizon_mean` is near the short forecast horizon being calibrated and that sample count is materially larger than in the normal accelerated gate.
 
-## Promotion gate for an applied trust controller
+## Promotion gate for the next applied mechanism
 
-Do not alter `full` from this probe alone. Promote a trust controller only if real H3 evidence establishes all of the following:
+Do not alter `full` from this probe alone. Promote an applied mechanism only after real H3 evidence resolves which branch has actual headroom.
+
+### Branch A: improve the existing residual gain
+
+Prefer this branch when `delta_bound_advantage_mean` is materially positive and larger than the trust-segment advantage. That means the successful direction from PR #39 remains useful and the limiting factor is the causal estimate of `g`, not the geometry of the direction.
+
+Candidate follow-up work should stay scalar first: forecast the projection coefficient itself, improve its time/horizon calibration, or replace the fixed EWMA with a causal estimator validated against the anchor trace. Keep the `0.25` safety bound unless real evidence justifies changing it.
+
+### Branch B: add disagreement-controlled trust shrinkage
+
+Prefer this branch when all of the following hold:
 
 1. **Headroom exists:** oracle segment shrinkage materially improves the generic-corrected sampled forecast ratio. A mean relative improvement around or above 2% is enough to justify a real applied experiment.
 2. **The observer is informative:** disagreement has a stable positive relationship with current forecast error and/or required shrink. Small-sample correlation from one prompt is supporting evidence, not a universal calibration claim.
 3. **A causal mapping survives another seed/prompt:** at least one fixed theta candidate improves the sampled ratio without a meaningful regression in the other stream.
 4. **Applied A/B quality is real:** once a causal mapping is implemented, compare same-seed generated outputs and forecast telemetry against the current generic-correction baseline. Do not call a feature-space percentage a perceptual-quality percentage.
 
-## Intended Phase 2 if the gate passes
-
-The smallest applied patch keeps the successful PR-39 correction and adds one scalar trust coefficient after it:
+If this branch passes, the smallest applied patch keeps the PR-39 correction and adds one scalar trust coefficient after it:
 
 ```text
 w_corrected = existing Spectrum weights + generic latest-delta correction
@@ -153,9 +173,10 @@ Hard refresh/re-pay scheduling is intentionally deferred. It changes exact-step 
 
 ## Interpretation map
 
-The shadow telemetry is designed to make the next decision unambiguous:
+The shadow telemetry is designed to make the next decision explicit:
 
-- **Large oracle advantage + useful disagreement correlation:** implement causal disagreement-controlled shrinkage.
-- **Large oracle advantage + weak disagreement signal:** retain the trust-segment idea and search for a better cache-only observer.
-- **Small trust-segment headroom + remaining scalar-direction headroom:** improve gain prediction for the existing latest-delta correction rather than changing direction rank.
+- **Large bounded-delta advantage:** improve causal gain estimation around the already-successful PR-39 correction.
+- **Large trust oracle advantage + useful disagreement correlation:** implement causal disagreement-controlled shrinkage.
+- **Large trust oracle advantage + weak disagreement signal:** retain the trust-segment idea and search for a better cache-only observer.
+- **Both branches show material headroom:** test the scalar-gain improvement first because it is the smaller state-space change, then retest trust shrinkage on top of it.
 - **Small headroom in both:** the PR-39 breach is close to saturated under this local geometry; move to a different forecast representation or coordinate rather than reviving rejected K=2/FinalLayer-adjoint families.
