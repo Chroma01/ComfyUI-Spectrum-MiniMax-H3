@@ -137,6 +137,10 @@ class SpectrumH3Config:
             raise ValueError(
                 "model_aware_mode must be 'off', 'schedule', 'schedule_confidence', or 'full'"
             )
+        if self.model_aware_trust_shrinkage and self.model_aware_mode != "full":
+            raise ValueError(
+                "model_aware_trust_shrinkage requires model_aware_mode='full'"
+            )
         if (
             not math.isfinite(self.model_aware_risk_threshold)
             or not 0.0 <= self.model_aware_risk_threshold <= 1.0
