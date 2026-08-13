@@ -70,7 +70,7 @@ trace_37620_57x60x44_t922
   text_length       = 922
 ```
 
-They are not the same trace rescored by a later shadow. When a true seed is unavailable, the runtime calibration export records `seed=null`; the offline evaluator accepts an explicit external `--seed` and `--label` annotation instead of inventing provenance.
+They are not the same trace rescored by a later shadow. New calibration exports capture the ComfyUI `OUTER_SAMPLE` seed when it is cleanly observable as an integral value. If no seed is cleanly visible, the runtime block records `seed=null` and the offline evaluator accepts an explicit external `--seed` and `--label` annotation instead of inventing provenance.
 
 ## Absolute video spectral evidence
 
@@ -316,15 +316,24 @@ topology_fingerprint
 trace_fingerprint
 ```
 
-`config_hash` is SHA-256 of canonical JSON for the complete `SpectrumH3Config` snapshot.
+`config_hash` is SHA-256 of canonical JSON for:
+
+```text
+{
+  spectrum_config: <complete SpectrumH3Config snapshot>,
+  sampler: <native sampler name>,
+  steps: <solver step count>,
+  scheduler: <scheduler metadata when genuinely available, otherwise null>
+}
+```
 
 `topology_fingerprint` covers the available native H3 topology/configuration identity, including feature/video/audio shapes, text length, hidden width, target row counts, patch size, sigma shifts, AdaLN mode, segments, refs, and keyframes.
 
 `schedule_fingerprint` covers the complete archive sequence of `(step_id, coordinate, actual)`.
 
-`trace_fingerprint` combines schema/source revision information, package/source revision when available, config hash, sampler/step count, schedule fingerprint, topology fingerprint, and the pre-target per-row target signature. Oracle/post-target values are deliberately excluded.
+`trace_fingerprint` combines schema/source revision information, package/source revision when available, the cleanly observed seed when available, config hash, sampler/step count, schedule fingerprint, topology fingerprint, and the pre-target per-row target signature. Oracle/post-target values are deliberately excluded.
 
-No hot-path Git subprocess or `.git` dependency exists. A source revision is recorded only when safely provided through `SPECTRUM_H3_SOURCE_REVISION`; otherwise it is null. Runtime seed is null unless cleanly available; the analysis tool accepts external annotations.
+No hot-path Git subprocess or `.git` dependency exists. A source revision is recorded only when safely provided through `SPECTRUM_H3_SOURCE_REVISION`; otherwise it is null. The ComfyUI `OUTER_SAMPLE` seed is captured only for the active run and removed from runtime state afterward. If it cannot be cleanly interpreted as an integral seed, it remains null. The analysis tool accepts external annotations in either case.
 
 ## Offline multi-run evaluator
 
