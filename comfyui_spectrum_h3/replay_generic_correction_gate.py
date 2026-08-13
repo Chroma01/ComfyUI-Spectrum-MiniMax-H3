@@ -117,7 +117,7 @@ def _begin_offline_capture_with_replay_generic_gate(
     archive = getattr(self, "_offline_archive", None)
     if archive is None:
         return
-    requested = bool(getattr(self.config, "model_aware_replay_generic_correction", True))
+    requested = bool(getattr(self.config, "model_aware_replay_generic_correction", False))
     effective = bool(self.config.model_aware_mode != "full" or requested)
     setattr(archive, _ARCHIVE_GATE_ATTR, effective)
 
@@ -128,7 +128,7 @@ def _build_forecast_weights_with_replay_generic_gate(
     if _ORIGINAL_OFFLINE_BUILD_FORECAST_WEIGHTS is None:
         raise RuntimeError("replay generic-correction gate was not installed correctly")
 
-    enabled = bool(getattr(self.archive, _ARCHIVE_GATE_ATTR, True))
+    enabled = bool(getattr(self.archive, _ARCHIVE_GATE_ATTR, False))
     original_steps = self.archive.steps
     opportunities = _generic_application_opportunities(self, original_steps)
 
@@ -171,7 +171,7 @@ def _debug_summary_with_replay_generic_gate(self: SpectrumH3Runtime) -> str:
         return summary
     telemetry = getattr(archive, _ARCHIVE_TELEMETRY_ATTR, None)
     if not isinstance(telemetry, _ReplayGenericCorrectionTelemetry):
-        enabled = bool(getattr(archive, _ARCHIVE_GATE_ATTR, True))
+        enabled = bool(getattr(archive, _ARCHIVE_GATE_ATTR, False))
         telemetry = _ReplayGenericCorrectionTelemetry(
             enabled=enabled,
             path=(
