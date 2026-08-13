@@ -386,12 +386,11 @@ def test_single_pass_causal_trust_application_is_unchanged(monkeypatch):
     assert trust_module._state(runtime).trust.applications == 2
 
 
-def test_offline_replay_does_not_apply_causal_kappa_transfer():
+def test_offline_replay_does_not_apply_causal_kappa_transfer_even_without_runtime_marker():
     baseline_archive = _archive()
     baseline = _build_smoother(baseline_archive)
 
     shadow_archive = _archive()
-    setattr(shadow_archive, replay_module._ARCHIVE_SHADOW_ONLY_ATTR, True)
     aggregate = _attach_trust(shadow_archive, audio_kappa=0.0, video_kappa=0.0)
     shadow = _build_smoother(shadow_archive)
 
@@ -401,7 +400,7 @@ def test_offline_replay_does_not_apply_causal_kappa_transfer():
         assert torch.equal(shadow._forecast_weights[key], weights)
 
 
-def test_replay_native_shadow_oracle_sweep_and_endpoint_audit():
+def test_replay_native_shadow_oracle_sweep_validation_attenuation_and_endpoint_audit():
     archive = _shadow_archive()
     setattr(archive, replay_module._ARCHIVE_SHADOW_ONLY_ATTR, True)
     aggregate = _attach_replay_shadow_records(archive)
@@ -424,6 +423,12 @@ def test_replay_native_shadow_oracle_sweep_and_endpoint_audit():
             assert math.isfinite(stream.mean(stream.candidate_ratio_sums[kappa]))
             assert math.isfinite(stream.mean(stream.candidate_advantage_sums[kappa]))
 
+    assert native.audio.mean(native.audio.effective_blend_sum) == pytest.approx(0.0)
+    assert native.audio.resolved_effective_blend_min() == pytest.approx(0.0)
+    assert native.audio.resolved_effective_blend_max() == pytest.approx(0.0)
+    assert 0.0 < native.video.mean(native.video.effective_blend_sum) <= 0.5
+    assert 0.0 <= native.video.resolved_effective_blend_min() <= 0.5
+    assert 0.0 < native.video.resolved_effective_blend_max() <= 0.5
     assert native.audio.replay_observer_count == 0
     assert native.video.replay_observer_count == 3
     assert -1.0 <= native.audio.causal_error_correlation.correlation() <= 1.0
@@ -568,10 +573,13 @@ def test_debug_summary_reports_replay_shadow_only_and_new_telemetry():
     assert "model_aware_trust_applied=0" in summary
     assert "model_aware_trust_path=offline_replay_shadow_only" in summary
     assert "model_aware_trust_replay_application=disabled_rejected_causal_transfer" in summary
-    assert "model_aware_trust_replay_shadow=loo_unattenuated_replay_native_calibration" in summary
+    assert "model_aware_trust_replay_shadow=loo_validation_attenuated_replay_native_calibration" in summary
+    assert "model_aware_trust_replay_shadow_reference=validation_attenuated_corrected_future_bracket" in summary
     assert "model_aware_trust_replay_shadow_audio_oracle_kappa_mean=" in summary
     assert "model_aware_trust_replay_shadow_audio_kappa_1p00_ratio_mean=" in summary
+    assert "model_aware_trust_replay_shadow_audio_effective_blend_mean=0.000000" in summary
     assert "model_aware_trust_replay_shadow_audio_observer=inactive_no_spectral_blend" in summary
+    assert "model_aware_trust_replay_shadow_video_effective_blend_mean=" in summary
     assert "model_aware_trust_replay_shadow_video_observer=spectral_vs_local" in summary
     assert "model_aware_trust_replay_shadow_video_replay_disagreement_shrink_corr=" in summary
     assert "model_aware_trust_extra_transformer_nfe=0" in summary
