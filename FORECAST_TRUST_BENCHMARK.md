@@ -132,7 +132,7 @@ causal_audio_blend_weight=0.0
 model_aware_causal_correction_s=0.0
 ```
 
-The first-pass skipped feature drives the sampler state and therefore determines later exact anchors. `OfflineSmoother` subsequently rebuilds forecast weights from the full retained exact-anchor archive. It combines future-bracketed local interpolation with a spectral proposal, applies validation attenuation, and applies the persisted PR #39 correction.
+The first-pass skipped feature drives the sampler state and therefore determines later exact anchors. `OfflineSmoother` subsequently rebuilds forecast weights from the full retained exact-anchor archive. It combines future-bracketed local interpolation with a spectral proposal, attenuates the configured spectral blend using its leave-one-out validation scores, and applies the persisted PR #39 correction.
 
 The causal trust calibration and the offline smoother therefore operate on different proposal geometries.
 
@@ -315,25 +315,43 @@ model_aware_trust_replay_application=disabled_rejected_causal_transfer
 
 The causal trust calculation remains available for telemetry and for comparison with replay-native results. The causal coefficient no longer modifies offline replay weights.
 
+The replay weight builder bypasses the rejected transfer for every `OfflineSmoother` construction, including direct/internal archive construction; when trust is disabled this remains baseline-identical because the preserved builder is the existing generic-correction replay path.
+
 The existing PR #39 generic replay correction remains active.
 
 Replay-native investigation is shadow-only:
 
 ```text
-model_aware_trust_replay_shadow=loo_unattenuated_replay_native_calibration
+model_aware_trust_replay_shadow=loo_validation_attenuated_replay_native_calibration
+model_aware_trust_replay_shadow_reference=validation_attenuated_corrected_future_bracket
 ```
 
 No replay controller is applied at this stage.
 
-## Replay-native shadow questions
+## Replay-native shadow geometry
 
-The next ordinary accelerated run answers five questions:
+For each withheld exact target, the shadow first removes that target from the anchor archive. It then reconstructs the two replay proposals already used by `OfflineSmoother`:
 
-1. Does the future-bracketed replay proposal have shrinkage oracle headroom?
-2. If it does, how large is the required shrinkage?
-3. Does persisted causal disagreement predict replay error or required replay shrinkage?
-4. Does a replay-native spectral-vs-local disagreement predict replay error or required shrinkage?
-5. Does the latest causal anchor remain a useful endpoint relative to the replay-local interpolation endpoint?
+- future-bracketed local interpolation;
+- global spectral interpolation from the retained cache.
+
+To match the actual smoother more closely, it also reconstructs the nearby leave-one-out validation scores using the retained cache and applies the same per-branch attenuation rule:
+
+```text
+effective_blend = configured_blend / max(1.0, validation_score)
+```
+
+The corrected replay proposal used for oracle/sweep scoring is therefore validation-attenuated rather than the old unattenuated diagnostic proposal.
+
+Per-stream validation-attenuated blend telemetry:
+
+```text
+model_aware_trust_replay_shadow_{stream}_effective_blend_mean
+model_aware_trust_replay_shadow_{stream}_effective_blend_min
+model_aware_trust_replay_shadow_{stream}_effective_blend_max
+```
+
+These fields let the next real run verify the expected audio local-only path and the attenuated video spectral contribution directly inside the same replay-native LOO experiment.
 
 ## Replay-native oracle
 
@@ -341,7 +359,7 @@ For each eligible withheld exact target:
 
 ```text
 h = withheld exact target
-p = replay proposal constructed without h
+p = validation-attenuated corrected replay proposal constructed without h
 a = persisted latest causal exact anchor available at original forecast time
 u = p - a
 
@@ -385,7 +403,7 @@ model_aware_trust_replay_shadow_{stream}_kappa_1p00_ratio_mean
 model_aware_trust_replay_shadow_{stream}_kappa_1p00_advantage_mean
 ```
 
-The `1.00` candidate must reproduce the replay baseline exactly up to floating-point tolerance.
+The `1.00` candidate reproduces the replay baseline up to floating-point tolerance.
 
 These coefficients are telemetry only. They are not user controls.
 
@@ -408,13 +426,15 @@ These metrics test observer transfer directly without assuming the causal `kappa
 
 ## Replay-native observer
 
-`OfflineSmoother` already has a future-bracketed local interpolation branch and a spectral branch. The replay-native shadow uses their bounded sampled proposals directly:
+The replay-native shadow also compares the pure spectral and local proposals that are naturally available from the same retained cache:
 
 ```text
 r_replay =
     RMS(p_spectral - p_local)
     / max(RMS(p_replay_baseline), eps)
 ```
+
+The scored replay baseline remains the validation-attenuated corrected proposal. The pure branch disagreement is an observer only; it does not replace that baseline.
 
 The observer is enabled only when the configured replay stream has a nonzero spectral branch. A stream with zero spectral blend does not fabricate a spectral-vs-local observer.
 
@@ -433,13 +453,13 @@ For the observed real run, audio had configured/effective spectral blend zero, s
 
 ## Endpoint audit
 
-The shadow records the uncorrected replay-local interpolation ratio:
+The shadow records the replay-local interpolation ratio:
 
 ```text
 model_aware_trust_replay_shadow_{stream}_local_ratio_mean
 ```
 
-It also evaluates the best interpolation coefficient on the segment from replay-local interpolation to the corrected replay proposal:
+It also evaluates the best interpolation coefficient on the segment from replay-local interpolation to the validation-attenuated corrected replay proposal:
 
 ```text
 model_aware_trust_replay_shadow_{stream}_local_oracle_ratio_mean
@@ -449,7 +469,7 @@ model_aware_trust_replay_shadow_{stream}_local_oracle_kappa_min
 model_aware_trust_replay_shadow_{stream}_local_oracle_kappa_max
 ```
 
-This gives a cheap replay-native endpoint audit using candidates the smoother already computes. The withheld target is used only for shadow scoring and oracle metrics. It never enters live controller state or the retained LOO forecaster history.
+This gives a cheap replay-native endpoint audit using candidates the smoother already computes. The withheld target is used only for shadow scoring and oracle metrics. It never enters the retained LOO forecaster history, the reconstructed validation histories, or live controller state.
 
 The previous/next replay bracket is used to construct the local future-bracketed proposal. The latest causal anchor remains a separately persisted causal endpoint. The corrected future-bracketed proposal remains the replay baseline. No new live endpoint is selected from this telemetry.
 
@@ -472,7 +492,7 @@ The revised path preserves these invariants:
 - `model_aware_trust_shrinkage=false` keeps existing workflow behavior;
 - single-pass causal trust remains unchanged;
 - default offline first-pass local-only capture remains unchanged;
-- offline replay no longer applies causal `kappa`;
+- offline replay never applies causal `kappa`;
 - replay-native logic is shadow-only;
 - ordinary model-aware scheduling is unchanged;
 - no hard refresh/re-pay is added;
@@ -481,7 +501,7 @@ The revised path preserves these invariants:
 - exact replay anchors remain exact;
 - target audio/video streams remain independent;
 - packed topology does not fabricate a modality split;
-- LOO targets are excluded from the retained shadow forecaster history;
+- LOO targets are excluded from the main retained shadow forecaster and from nested validation histories;
 - future exact targets are used only for offline scoring/oracle telemetry;
 - non-OOM diagnostic failures do not abort replay;
 - CUDA OOM propagates;
@@ -542,7 +562,7 @@ model_aware_trust_applied=0
 model_aware_trust_applications=0
 ```
 
-Inspect the replay oracle, fixed-kappa sweep, causal-disagreement correlations, replay-native disagreement correlations, and endpoint audit fields listed above.
+Inspect the replay oracle, validation-attenuated effective blends, fixed-kappa sweep, causal-disagreement correlations, replay-native disagreement correlations, and endpoint-audit fields listed above.
 
 ## Stop point
 
