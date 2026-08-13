@@ -68,6 +68,7 @@ jobs:
             comfyui_spectrum_h3/__init__.py \
             tests/test_generic_correction.py \
             tests/test_trust_probe.py \
+            tests/test_c1_single_pass_gate.py \
             tests/test_replay_component_shadow.py \
             tests/test_replay_shadow_composition.py \
             tests/test_replay_spectral_mixture_shadow.py \
