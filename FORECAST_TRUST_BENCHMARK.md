@@ -310,7 +310,7 @@ The replay-geometry diagnosis remains supported.
 
 ### Perceptual result
 
-The same-seed generated D and B outputs were judged **indistinguishable** by the user:
+The D and B outputs generated with the same seed were judged **indistinguishable** by the user:
 
 ```text
 no obvious visible improvement
