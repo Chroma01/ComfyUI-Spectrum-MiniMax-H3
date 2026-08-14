@@ -1,112 +1,33 @@
-# Spectrum MiniMax H3 v0.2.8
+# Spectrum MiniMax H3 v0.2.9
 
-v0.2.8 finalizes the native ER-SDE replay work and closes the forecast-trust/replay-calibration research cycle with the current user-facing evidence.
+v0.2.9 promotes the validated generic-correction controller for the opt-in full causal path, adds bounded decoded-media research and reporting, hardens the offline first-pass transition, and preserves native behavior for per-token denoise masks.
 
-## Native ER-SDE replay compatibility
+## Validated generic-correction default
 
-Native ComfyUI `SamplerER_SDE` replay-safety detection now accepts the reviewed deterministic native `noise_scaler` closures used by upstream ER-SDE while continuing to fail closed for arbitrary/custom/stateful scalers. An explicitly supplied custom `noise_sampler` remains replay-unsafe. Unknown future closure contracts remain replay-unsafe until reviewed.
-
-This restores the intended two-pass offline replay path for native/default ER-SDE without broadening custom stochastic replay support.
-
-## Narrowed ER-SDE terminal replay safeguard
-
-The v0.2.7 ER-SDE fix enforced a blanket minimum two-step actual tail. The reproduced failure class is narrower.
-
-The 25-step failure ended as:
+When `model_aware_mode = full` uses causal generic correction, the validated controller is now:
 
 ```text
-22 actual
-23 forecast
-24 actual
+generic_correction_mode = coordinate_rls
+generic_correction_attenuation = no_attenuation
+generic_correction_limiter = hard_clip
+generic_correction_limit = 0.40
+RLS lambda = 0.90
 ```
 
-Offline replay then reconstructed the penultimate feature across the final nonlinear bracket. v0.2.8 promotes the penultimate ER-SDE step only during offline capture when the normal runtime schedule would otherwise forecast it. The protected failing case becomes:
+Two independent three-run hidden-space compatibility groups selected the same candidate with approximately 15.78% lower normalized reconstruction error than exact legacy, 48 wins / 0 losses per group, and zero worst regression. Three controlled decoded native-H3 R/A/B triads then produced two candidate-favored verdicts, one mixed verdict, and no legacy-favored verdict. Broad VIDEO MS-SSIM, PSNR, and temporal-derivative fidelity favored the candidate in all three triads. AUDIO spectral metrics were generally candidate-favored; normalized correlation and SI-SDR remain phase-sensitive diagnostics outside the predeclared verdict gate.
+
+The decoded validation used native MiniMax H3, ER-SDE, 20 steps, 512x768, 192 frames, 24 fps, eight seconds, and three fixed seeds. Candidate and legacy used identical actual/forecast schedules and transformer-call budgets, with zero model-aware extra NFEs. Their observed sampler wall times were approximately 174.66 and 174.78 seconds. These results do not establish the same ranking for other samplers, step counts, resolutions, prompts, LoRAs, or model variants. The hidden-space percentage is reconstruction-ranking evidence, not a perceptual-quality percentage.
+
+The exact legacy configuration remains available for reproduction and saved workflows:
 
 ```text
-22 actual
-23 actual
-24 actual
+generic_correction_mode = legacy
+generic_correction_attenuation = mode_default
+generic_correction_limiter = rational
+generic_correction_limit = 0.25
 ```
 
-Normal 20-step and 32-step ER-SDE schedules already make their penultimate step actual, so they receive no additional transformer evaluation. Explicitly larger configured tails still take precedence. RES retains its independent three-step protected tail. Euler, RES/CFG++, and Turbo policies are unchanged.
-
-## Generic causal correction retained
-
-The generic latest-delta causal correction from PR #39 remains the supported correction used by `model_aware_mode=full`.
-
-In a controlled same-seed native ER-SDE 20-step comparison, `schedule_confidence` and `full` both used exactly:
-
-```text
-11 actual steps
-9 forecast steps
-11 actual transformer calls
-0 model-aware extra NFEs
-```
-
-`full` changed the measured hidden forecast ratios from:
-
-```text
-audio: 1.777636 -> 1.670690   (~6.02% hidden-error reduction)
-video: 1.313055 -> 1.250087   (~4.80% hidden-error reduction)
-```
-
-The recurring false eye-motion artifact that remained subtly visible with `schedule_confidence` was absent with `full`. The eyes remained synchronized with the intended eye-closing motion. The hidden-error percentages describe this specific feature-space trace; they are not perceptual-quality percentages.
-
-Earlier controlled native ER-SDE testing also isolated a pronunciation case where `full` retained the intended German pronunciation while `schedule_confidence` sounded like the base path.
-
-These perceptual conclusions are established for the tested native ER-SDE configuration. They are not generalized to Euler, RES/RES CFG++, Turbo/LightX2V, or other samplers.
-
-## Trust shrinkage closed for production promotion
-
-`model_aware_trust_shrinkage` remains:
-
-```text
-false
-```
-
-Causal trust shrinkage produced substantial hidden-feature observer improvements, then failed to show a reliable user-facing perceptual benefit across the completed A/B gate. It remains available for research/reproduction and saved-workflow compatibility. It is not recommended for production promotion in this release.
-
-No additional kappa tuning, denser search, or replacement trust formula is introduced.
-
-## Replay generic correction remains disabled
-
-`model_aware_replay_generic_correction` remains:
-
-```text
-false
-```
-
-Independent replay traces rejected transfer of the causal PR #39 scalar onto the different future-bracket replay direction. The causal correction remains unchanged in its supported causal geometry. The `true` replay setting remains a legacy/scientific-ablation path.
-
-## Offline replay remains supported
-
-Offline smoothing replay remains the compatibility-safe global default and retains its historical MiniMax H3 audio/stutter rationale.
-
-In the final controlled native ER-SDE eye-motion comparison, `full` single-pass produced the best temporal facial behavior among the tested paths. The replay run still showed the abnormal eye motion, used the same 11 first-pass transformer evaluations, added a transformer-free replay pass of about 13.25 seconds in that trace, and retained about 4315.5 MiB of archive data.
-
-This is an ER-SDE-scoped quality result. The release does not change the global replay default or infer the same ranking for other samplers.
-
-## Replay calibration research infrastructure
-
-PR #45 retains the research-only infrastructure needed to evaluate future replay calibration hypotheses without adding a runtime controller:
-
-- exact VIDEO per-target quadratic moments;
-- exact runtime ratio normalization/parity checks;
-- source/config/schedule/topology/trace provenance and fingerprints;
-- structural interior-target validation;
-- CPU-only offline evaluator;
-- whole-run cross-validation;
-- fixed Level 0 controls;
-- affine current-weight Level 1 baseline;
-- one-predictor Level 2 residual tests with coordinate control.
-
-No affine, disagreement, validation-penalty, coordinate, floor, interaction, tree, neural, AutoML, or other new applied replay controller is introduced.
-
-The following research branches remain closed as complete runtime solutions: pure global alpha, causal-kappa replay transfer, hold-anchor replay shrinkage, causal scalar replay transfer, K=2, FinalLayer-transformed correction, and previous-error direction families.
-
-## Compatibility and defaults
-
-Shipping defaults remain compatibility-safe:
+The global defaults remain compatibility-safe:
 
 ```text
 model_aware_mode = off
@@ -115,16 +36,38 @@ model_aware_replay_generic_correction = false
 offline_smoothing_replay = true
 ```
 
-For current native ER-SDE quality testing, the preferred tested configuration is:
+Widget ordering and explicit saved values remain stable.
 
-```text
-model_aware_mode = full
-model_aware_trust_shrinkage = false
-offline_smoothing_replay = false
-```
+## Objective decoded-media benchmark and reporting
 
-That recommendation is ER-SDE-specific. Existing saved input values continue to be honored.
+The recommended sequential R/A/B benchmark now reduces each decoded VIDEO immediately to a deterministic CPU `float16` analysis surface capped at 393,216 pixels per frame and retains AUDIO on CPU as `float32`. It keeps at most two pending benchmark IDs within a 4 GiB analysis-memory limit, preserves source topology in compatibility checks, rejects duplicate/incompatible roles and seeds, releases completed triads on success or failure, and never persists raw media. The original one-shot nodes remain available as explicitly labeled Full Media research alternatives.
+
+Objective comparison rows now expose raw legacy/candidate values, absolute candidate deltas, metric direction, verdict role, display units, and the existing decision-relative advantage where the predeclared gate requires it. Human-facing diagnostics use native units:
+
+- normalized correlation: correlation-point delta;
+- SI-SDR and PSNR: dB delta;
+- bounded lag: milliseconds.
+
+Diagnostics are visibly separated from verdict-primary and guardrail metrics in Markdown, aggregate output, and the ComfyUI console summary. Existing schema-v1 case JSON remains authoritative and can be normalized, rendered, and aggregated without regenerating the three collected triads. The verdict implementation and thresholds are unchanged.
+
+## Offline replay transition hardening
+
+The completed first-pass executor now returns and tears down before smoother construction. Transition telemetry covers the final actual observation, archive record/finalization, executor return, archive completion, smoother setup, and replay setup. The causal forecaster no longer retains a redundant terminal anchor after the archive becomes its long-lived owner. Completion/setup failures preserve the valid completed first-pass result.
+
+This addresses the observed end-of-first-pass stall boundary without attributing the historical freeze to a replay pass that had not started.
+
+## Native fallback for per-token denoise masks
+
+Spectrum detects the `denoise_mask` and `audio_denoise_mask` arguments introduced by ComfyUI's MiniMax H3 per-token masking support. When either mask is active, Spectrum disables feature forecasting for that run and delegates the call unchanged to the native MiniMax H3 executor before registering a forecast model call.
+
+Forecast reconstruction currently has one timestep-modulation row per target stream. Per-token masking can assign different timestep rows to individual VIDEO or AUDIO tokens, so forecasting that call would apply incorrect output-head modulation. The guard preserves the exact mask object and native semantics. It is inert when the arguments are absent or `None`, including on older reviewed ComfyUI revisions.
+
+## Runtime and research boundaries
+
+The promoted controller retains scalar/small-matrix state only. It adds no transformer call, sampler step, schedule ownership, persistent per-token gain field, or production hidden-tensor retention. Regional correction remains a separate research mode. Calibration captures scalar moments only, remains debug-only, and reports post-generation persistence failures as warnings.
+
+Automatic hidden-space reports distinguish candidate ranking evidence from the separate decoded/perceptual evidence used for promotion. Research reports do not mutate live settings.
 
 ## Validation
 
-The release is validated against the repository's pinned four-revision ComfyUI compatibility matrix. The matrix builds the wheel, runs the forecaster smoke test, scoped Ruff, `compileall`, and the complete pytest suite against each reviewed native MiniMax H3 revision. Focused coverage includes the narrowed ER-SDE terminal policy, native ER-SDE replay guard, generic correction, trust-off/default semantics, replay-generic-correction-off semantics, exact replay calibration and evaluator, provenance/fingerprints, and saved configuration defaults.
+The release branch is validated by the repository's pinned four-revision ComfyUI matrix. Each job builds the wheel, runs the native-H3 forecaster smoke test, scoped Ruff, `compileall`, and the full pytest suite. Coverage includes promoted defaults, exact legacy reproduction, controller reset/rollback, schedule and NFE invariants, objective schema-v1 normalization, native-unit diagnostic rendering, bounded sequential cleanup/resources, offline replay transition ownership, regional research summaries, malformed research data, video-only calibration groups, node registration, and independent VIDEO/AUDIO mask passthrough.
