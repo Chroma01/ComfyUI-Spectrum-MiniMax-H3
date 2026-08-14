@@ -32,7 +32,7 @@ anchor_residual_feedback = false
 selective_rollback_correction = false
 ```
 
-The default 20-step schedule normally produces **11 actual transformer evaluations and 9 forecasts** for the reviewed single-call samplers when no fallback or model-aware scheduling rule adds an actual step.
+With the current defaults, a 20-step **Euler** run normally produces **11 actual transformer evaluations and 9 forecasts** when no fallback or model-aware scheduling rule adds an actual step. Other reviewed samplers can impose sampler-specific tail or replay safeguards that change the count.
 
 For quality-critical work, run an exact-seed A/B with Spectrum enabled and disabled for the checkpoint, sampler, resolution, duration, prompt, references, and LoRAs you intend to use.
 
@@ -204,7 +204,7 @@ Ordinary sampler callbacks are intentionally replay-only. Invoking arbitrary cal
 
 The **only capture-pass live-preview integration currently supported explicitly is KJNodes' `Model Preview Override`**, used with Kijai's MiniMax H3 TAE. Spectrum recognizes KJNodes' `kj_preview_override` wrapper as observational and keeps it inside the two-pass wrapper. It updates during both capture and replay and works whether the preview override appears before or after Spectrum in the model chain.
 
-Built-in ComfyUI previews, ComfyUI-bleh Better Previews, VHS preview callbacks, and other callback-based preview implementations are not currently supported for capture-pass live preview.
+Built-in ComfyUI previews, ComfyUI-bleh Better Previews, VHS Preview, and other callback-based preview implementations are not currently supported for capture-pass live preview.
 
 ## Parameters
 
@@ -238,7 +238,7 @@ Warmup and final-tail constraints are actual. After warmup, the schedule gradual
 
 The degree-1 one-point bootstrap lets step 1 reuse the actual step-0 packed target hidden state as a zero-order prediction. It does not add a forecast to actual history. Step 2 therefore runs actual, after which normal degree-1 regression can start.
 
-Typical default schedules:
+Typical default **Euler** schedules:
 
 | Total steps | Actual | Forecast | Typical indices |
 |---:|---:|---:|---|
