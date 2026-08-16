@@ -57,7 +57,7 @@ The ER-SDE preflight now supports that audited passthrough structure without bro
 
 A real saved-workflow run later hard-wedged WSL after all ER-SDE solver steps and the Spectrum run summary had completed, before `Spectrum H3 run teardown` or downstream VAE/video nodes appeared.
 
-The old generic-correction hook performed optional persistence/evaluation synchronously inside `SpectrumH3Runtime.end_run()`. A filesystem/evaluator stall could therefore block a valid completed sampler result from reaching downstream nodes.
+The old generic-correction hook performed optional persistence/evaluation synchronously inside `SpectrumH3Runtime.end_run()`. Any filesystem/evaluator stall in that hook therefore blocked a valid completed sampler result from reaching downstream nodes.
 
 v0.2.11 changes the boundary:
 
@@ -94,7 +94,7 @@ This release does not change the global Python defaults for:
 - `audio_blend_weight=0.0`;
 - the validated full-mode `coordinate_rls + no_attenuation + hard_clip + 0.40` generic correction.
 
-Saved ComfyUI workflows can retain serialized values from older releases; updating the custom node does not automatically rewrite those widgets.
+Saved ComfyUI workflows retain the serialized widget values they already contain from older releases; updating the custom node does not automatically rewrite those widgets.
 
 Unknown or unreviewed sampler/noise/wrapper contracts continue to fail closed to native execution.
 
