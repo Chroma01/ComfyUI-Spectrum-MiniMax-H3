@@ -1,4 +1,5 @@
 from .config import AGGRESSIVE_PRESET, CONSERVATIVE_PRESET, SpectrumH3Config
+from .er_sde_offline_replay_safety import install_er_sde_offline_replay_safety
 from .er_sde_policy import install_er_sde_tail_policy
 from .external_patch_compat import install_external_patch_compat
 from .external_patch_hardening import install_external_patch_hardening
@@ -34,6 +35,7 @@ install_replay_calibration_provenance()
 install_er_sde_tail_policy()
 install_external_patch_compat()
 install_external_patch_hardening()
+install_er_sde_offline_replay_safety()
 
 # External compatibility wraps the already-installed safe end-run hook. Preserve
 # the inner implementation's identity and expose the effective outermost hook
