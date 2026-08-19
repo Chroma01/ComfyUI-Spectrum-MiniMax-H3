@@ -92,6 +92,64 @@ def test_stacked_diffaid_and_untwist_profiles_preserve_distinct_kinds():
     assert visual_descriptor.has_hard_temporal_transition is True
 
 
+def test_soft_end_widens_visual_guard_to_sigma_zero():
+    parsed = parse(
+        include_diffaid=False,
+        profile=untwist_profile(hard_end=False),
+    )
+    descriptor = parsed.descriptors[0]
+    assert descriptor.sigma_start == 0.0
+    assert descriptor.sigma_end == 1.0
+    assert descriptor.has_hard_temporal_transition is False
+
+
+def test_hard_start_maps_inclusive_progress_start_to_sigma_end():
+    parsed = parse(
+        include_diffaid=False,
+        profile=untwist_profile(progress_start=0.20, hard_start=True),
+    )
+    descriptor = parsed.descriptors[0]
+    assert descriptor.sigma_start == pytest.approx(0.10)
+    assert descriptor.sigma_end == pytest.approx(0.80)
+    assert descriptor.has_hard_temporal_transition is True
+
+
+def test_visual_profile_rejects_strength_inconsistent_with_scale_endpoints():
+    with pytest.raises(
+        compat.ExternalPatchContractError,
+        match="strength does not match",
+    ):
+        parse(
+            include_diffaid=False,
+            profile=untwist_profile(strength=0.24),
+        )
+
+
+def test_visual_profile_rejects_duplicate_instance_id_across_patch_kinds():
+    options = {
+        compat.EXTERNAL_PATCH_CONTRACTS_KEY: [
+            diffaid_contract(instance_id="untwist-h3-1")
+        ],
+        visual.VISUAL_PATCH_PROFILES_KEY: [untwist_profile()],
+    }
+    with pytest.raises(
+        compat.ExternalPatchContractError,
+        match="unique across all profile kinds",
+    ):
+        compat.parse_external_patch_contracts(options, block_count=5)
+
+
+def test_visual_profile_rejects_unsupported_scope():
+    with pytest.raises(
+        compat.ExternalPatchContractError,
+        match="unsupported scope",
+    ):
+        parse(
+            include_diffaid=False,
+            profile=untwist_profile(scope="unsupported"),
+        )
+
+
 def test_visual_strength_metadata_changes_external_profile_fingerprint():
     first = parse(include_diffaid=False)
     second = parse(
@@ -182,6 +240,21 @@ def commit_pending(fake):
     run.pending_active = None
     run.pending_sigma = None
     run.pending_transition_indices = ()
+
+
+def test_visual_runtime_active_flag_does_not_override_sigma_derived_schedule_state():
+    parsed = parse(include_diffaid=False)
+    progress = 17 / 18
+    active_entry = compat._runtime_entries(
+        visual_runtime(progress, active=True),
+        parsed,
+    )
+    inactive_entry = compat._runtime_entries(
+        visual_runtime(progress, active=False),
+        parsed,
+    )
+    assert active_entry == pytest.approx((1.0 - progress,))
+    assert inactive_entry == pytest.approx(active_entry)
 
 
 def test_untwist_end_percent_transition_forces_actual_after_point_nine():

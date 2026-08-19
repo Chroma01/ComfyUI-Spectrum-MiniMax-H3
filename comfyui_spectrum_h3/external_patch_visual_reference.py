@@ -152,10 +152,11 @@ def _parse_visual_profile(
             f"visual_profile[{position}].strength does not match the declared scale endpoints"
         )
 
-    # Spectrum's existing transaction guard operates on an inclusive normalized
-    # sigma interval. Convert only boundaries that the producer declares hard;
-    # a soft boundary is widened to the edge so it cannot spuriously force an
-    # actual step. Progress increases as sampling proceeds, hence the inversion.
+    # Both the producer's schedule_fraction() and Spectrum's active_at() are
+    # inclusive at their start/end coordinates. Preserve those endpoint semantics
+    # exactly under sigma = 1 - progress. Only producer-declared hard boundaries
+    # are retained; soft boundaries are widened to the edge so they cannot
+    # spuriously force an actual step.
     guard_progress_start = progress_start if hard_start else 0.0
     guard_progress_end = progress_end if hard_end else 1.0
     sigma_start = 1.0 - guard_progress_end
@@ -283,6 +284,10 @@ def _visual_runtime_entries(
             raise compat.ExternalPatchContractError(
                 f"visual_runtime[{instance_id}].active must be a boolean"
             )
+        # `active` is validated as part of the producer contract but is not the
+        # temporal guard input. The producer folds reference selection/mapping into
+        # cfg.enabled, while Spectrum's transaction state must follow the declared
+        # hard schedule boundaries. Derive that state only from exact progress.
         by_id[instance_id] = {
             "schema_version": VISUAL_PATCH_SCHEMA_VERSION,
             "provider": provider,
