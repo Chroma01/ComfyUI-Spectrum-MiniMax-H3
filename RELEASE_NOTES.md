@@ -1,88 +1,96 @@
-# Spectrum MiniMax H3 v0.2.15
+# Spectrum MiniMax H3 v0.2.16
 
-v0.2.15 adds first-class interoperability with H3 Continuum's continuation sampler contract and closes the native ER-SDE solver-space edge case exposed by Continuum's two-step actual prefix.
+v0.2.16 releases the MiniMax H3 Untwisting RoPE compatibility consumer from PR #65 together with the post-run research isolation and process-lifetime hardening already merged in PRs #64 and #66.
 
-## H3 Continuum actual-prefix interoperability
+The release does not change Spectrum's normal forecasting defaults, sampler cadence, generic-correction defaults, native ER-SDE stochastic ownership, or offline-replay policy.
 
-Spectrum can now consume H3 Continuum's optional versioned runtime request from:
+## Untwisting RoPE visual-reference compatibility
 
-```text
-transformer_options["h3_continuum"]
-```
+Spectrum now recognizes a separate versioned external-patch contract for deterministic MiniMax H3 visual-reference attention modulation produced by the H3 Untwisting RoPE integration.
 
-For the reviewed API v1 contract, an active request can specify an initial number of solver steps that must remain real H3 transformer evaluations. Spectrum treats that request as a run-local scheduling constraint rather than as a special sampler implementation.
-
-The integration is deliberately narrow:
-
-- no hard dependency on H3 Continuum is added;
-- missing, inactive, malformed, wrong-type, negative, or unknown-API metadata leaves ordinary Spectrum behavior unchanged;
-- the requested prefix is clamped to the available solver-step count;
-- the prefix applies to ordinary runs, single-pass fallback, and the offline-smoothing first pass;
-- offline replay is explicitly prefix-free because it reuses the already-captured anchor schedule;
-- each continuation sampling call accepts and logs its request independently, with no prefix state leaking into later chunks.
-
-The original interop design and runtime validation were contributed by **@ukr8b3g-cmyk** in PR #52 and reconciled onto current Spectrum main in PR #61 after the contributor branch became stale against the later ER-SDE, Diff-Aid, Python 3.13, and replay-safety work.
-
-## Diff-Aid coexistence
-
-Continuum's actual-prefix request composes with the v0.2.12 external-patch compatibility layer rather than bypassing it.
-
-A dedicated regression places a Diff-Aid hard-sigma transition on a step already protected by the Continuum prefix and verifies that:
-
-- the step remains one actual H3 evaluation;
-- the external transition is observed exactly once;
-- Diff-Aid does not request an additional compatibility NFE for an already-actual step;
-- the two-step prefix still accounts for exactly two transformer calls;
-- external-patch run state is released normally at teardown.
-
-## Native ER-SDE first forecast after an actual prefix
-
-Continuum commonly produces a continuation schedule beginning like:
+The new producer namespace is intentionally separate from the existing Diff-Aid contract:
 
 ```text
-actual 0  (Continuum prefix)
-actual 1  (Continuum prefix)
-forecast 2
-actual 3
-forecast 4
+spectrum_h3_visual_reference_patch_profiles
+spectrum_h3_visual_reference_patch_runtime
 ```
 
-The v0.2.11 ER-SDE solver-space bridge handled the original one-anchor bootstrap and later two-anchor lambda-space extrapolation, but deliberately rejected two *consecutive* actual anchors as extrapolation history. That made the first post-prefix forecast fall back to the older direct pending-`q` correction path.
+This preserves the strict v0.2.12 Diff-Aid `text_activation_modulation` schema while allowing Untwist to declare `visual_reference_attention_modulation` without being misidentified as a Diff-Aid patch or rejected into the all-actual fail-safe.
 
-Real Model Preview Override output reproduced the characteristic high-frequency/confetti corruption exactly on that first forecast.
+Spectrum validates the visual-reference profile's:
 
-v0.2.15 closes that gap:
+- schema version, provider, architecture, patch kind, and unique instance identity;
+- H3 block count and zero-based block coverage;
+- reference scope;
+- active denoising-progress interval and producer-declared hard boundaries;
+- high/low frequency scale endpoints;
+- interpolation `beta`;
+- temporal-axis scaling mode;
+- scalar strength summary against the declared endpoint scales.
 
-- any causal forecast immediately following an exact actual anchor is eligible for solver-space handling;
-- when the retained anchors are consecutive warmup/prefix actuals, the first forecast uses the newest exact solver-space denoised anchor as a hold;
-- later forecasts retain the existing bounded native-ER-SDE lambda-space extrapolation once the anchor geometry supports it;
-- unexpectedly missing extrapolation coordinates fall safe to the newest exact actual hold rather than reintroducing the noisy causal forecast;
-- offline replay deliberately retains its separate exact pending-`q` compensation path so replay-smoothed hidden features remain observable to the sampler;
-- the native ER-SDE RNG stream, stochastic latent ownership, `s_noise`, stages 1/2/3, and no-extra-NFE contract are unchanged.
+The full visual strength/configuration metadata participates in the external profile fingerprint, so behaviorally different Untwist profiles cannot alias the same Spectrum model-profile cache entry.
 
-The seeded replay regression now protects the actual invariant — byte-identical native stochastic draws — without incorrectly requiring the causal first-pass and replay denoised trajectories to be identical when their solver-facing policies intentionally differ.
+Per-call runtime progress is converted into Spectrum's existing normalized-sigma transaction guard. Only boundaries explicitly declared hard by the producer become compatibility transitions. If such a boundary is crossed on a step that Spectrum had scheduled as a forecast, that current step is promoted to one real H3 transformer evaluation. A transition landing on an already-actual step adds no duplicate NFE.
 
-## Runtime validation
+The default companion Untwist window ending at `end_percent=0.90` is covered by regression tests: the first forecast after crossing the hard end boundary is promoted to an actual anchor.
 
-The reconciled Continuum interop in PR #61 passed the complete repository CI matrix and was then validated on restarted ComfyUI 0.33.0 with the current H3 continuation path:
+Diff-Aid and Untwist descriptors can be stacked in the same run. Their kinds remain distinct in runtime/model-aware telemetry, for example:
 
-- the initial chunk ran without a Continuum prefix request;
-- continuation chunks accepted `H3 Continuum API v1, actual prefix=2` exactly once each;
-- steps 0 and 1 were actual evaluations with reason `H3 Continuum actual prefix`;
-- step 2 returned to normal Spectrum forecast policy;
-- no duplicate prefix NFEs or cross-chunk state leakage occurred;
-- current-Core `video_audio` continuation references (`ref_audio` + `ref_img`) were exercised;
-- Diff-Aid coexistence completed with zero external-patch contract failures;
-- sampling, VAE decode, Continuum assembly, downstream processing, and final video output completed.
+```text
+external_patch_kinds=text_activation_modulation,visual_reference_attention_modulation
+```
 
-The ER-SDE prefix fix in PR #62 passed the full five-lane matrix — four reviewed ComfyUI revisions on Python 3.12 plus the current Python 3.13 lane — including forecaster smoke, Ruff/compileall, focused compatibility suites, and the full native MiniMax H3 tests. PR #62's final CodeRabbit review reported no actionable findings.
+Malformed or inconsistent declared metadata continues to use Spectrum's existing fail-safe behavior rather than allowing an ambiguous forecast transaction. The compatibility layer adds no hard dependency on the Untwisting RoPE custom node; Spectrum only consumes the declared pure-data contract when it is present.
 
-A final real Continuum + native ER-SDE runtime gate used **2 × 5-second chunks** with Model Preview Override. The previously reproducible third-step / Spectrum `step=2` confetti was gone.
+## Post-run research process isolation
 
-## Compatibility and release scope
+PR #64 moves optional generic-correction post-run evaluation/report work out of the ComfyUI process and into an isolated Python subprocess.
 
-This release preserves the v0.2.14 native ER-SDE offline-replay/KJ preview protection, v0.2.13 Python 3.13 provenance normalization, v0.2.12 Diff-Aid interoperability, and the existing model-aware/generic-correction defaults.
+The previous in-process daemon-thread boundary could not satisfy Spectrum's post-run safety invariant: a native SIGSEGV in any Python thread terminates the entire process and cannot be contained by `except Exception`. A completed generation could therefore be lost after sampling had already finished while optional research analysis was running.
 
-Spectrum only consumes Continuum's declared API v1 metadata; it does not vendor or patch H3 Continuum itself. The installed Continuum version must independently support the installed ComfyUI H3 runtime.
+The isolated path now:
 
-There is no change to the normal Spectrum defaults, ordinary non-Continuum schedules, native ER-SDE random stream, or the standard transformer NFE budget outside the explicit Continuum prefix request.
+- releases core Spectrum runtime/history state before optional research dispatch;
+- starts the research worker through an isolated stdlib bootstrap with `-I` and `faulthandler`;
+- keeps only a lightweight watcher thread in the ComfyUI process for child I/O and lifetime management;
+- retains the single-worker bound so diagnostic jobs cannot accumulate;
+- caps stalled analysis and reports Python failures, timeouts, and fatal signals without invalidating the completed sampler result;
+- preserves the ordering invariant `calibration export -> core runtime/VRAM release -> optional research dispatch`.
+
+Forecasting math, native ER-SDE behavior, offline replay, generic-correction controller math, and downstream VAE/output execution are unchanged by this isolation.
+
+## Fatal-signal and timeout teardown hardening
+
+The first isolation implementation exposed a runner-specific process-lifetime race after PR #64 merged. A child could already have emitted CPython faulthandler's canonical `Fatal Python error: Segmentation fault` diagnostic while still failing to become reapable before the watcher's timeout. Killing it at that point could replace the useful native-signal diagnosis with the cleanup signal. The timeout cleanup also had an unbounded final `communicate()` path if descendants retained the worker's stdout/stderr pipes.
+
+PR #66 hardens that boundary by:
+
+- recognizing only CPython faulthandler's canonical fatal-error markers and normalizing them to signal names such as `SIGSEGV`;
+- preserving an already-observed fatal-signal diagnosis even when the child has not become reapable by the deadline;
+- retaining direct negative-return-code signal reporting for normally reaped children;
+- best-effort disabling POSIX core dumps before the worker executes;
+- launching the worker in its own POSIX session/process group;
+- terminating the whole research process group on timeout so descendants cannot keep inherited pipes alive;
+- bounding the post-kill drain with a separate termination grace period and closing parent pipe handles if cleanup still cannot drain;
+- preserving the Windows direct-process termination path;
+- preserving the single-worker bound and non-blocking sampler teardown.
+
+This fixes the violated lifetime/diagnostic invariant without broadening the research worker's authority over the generation process.
+
+## Included merged work since v0.2.15
+
+This release contains all runtime work merged after v0.2.15:
+
+- **#64 — Isolate post-run generic-correction research from ComfyUI**
+- **#66 — Harden isolated research crash and timeout teardown**
+- **#65 — Recognize Untwist H3 visual-reference external patch profiles**
+
+The v0.2.15 H3 Continuum interoperability and native ER-SDE post-prefix solver-space fix remain included unchanged, along with the v0.2.14 replay-preview safety, v0.2.13 Python 3.13 provenance normalization, and v0.2.12 Diff-Aid compatibility layer.
+
+## Validation and release boundary
+
+PR #65 passed the repository `tests` workflow on its implementation head before merge. Its regression coverage checks stacked Diff-Aid/Untwist recognition, distinct runtime patch kinds, strength-profile fingerprinting, hard `end_percent=0.90` boundary promotion, and required runtime/static contract consistency.
+
+PR #64 added isolation coverage for non-blocking dispatch, worker-slot lifetime, child failures, package-entrypoint avoidance, and intentional child SIGSEGV containment. PR #66 added deterministic fatal-marker normalization, POSIX core-dump/bootstrap checks, delayed-reap SIGSEGV handling, process-group timeout cleanup, and descendant-pipe teardown coverage.
+
+The v0.2.16 release commit changes release metadata only. The exact combined runtime tree is the already-merged `main` state containing #64, #66, and #65. The release remains gated by the repository's existing CI workflow: after this version bump is merged to `main`, the Comfy Registry publish workflow is triggered by `pyproject.toml`, and the GitHub release workflow publishes `v0.2.16` only from a successful tested `main` commit.
