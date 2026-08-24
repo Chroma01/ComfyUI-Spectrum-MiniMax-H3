@@ -200,6 +200,7 @@ The v0.2.11 path keeps the exact native ER-SDE sampler implementation and RNG st
 Custom/unreviewed `noise_sampler` or `noise_scaler` implementations fail closed to native behavior where their contract cannot be proven.
 
 RefDelta Solver v0.2.0+ is admitted through a separate API-v1 contract. Spectrum marks actual versus forecast results; RefDelta uses only actual outputs for risk and trajectory correction. RefDelta then publishes its final risk-gated stochastic tensor back to Spectrum, which uses that exact tensor for forecast-state compensation and seeded offline replay. Contract/version drift, custom stochastic callbacks, and malformed bridge state fail closed.
+Spectrum's CI pins the exact reviewed RefDelta v0.2.0 implementation while exercising this contract across its ComfyUI compatibility matrix.
 
 ComfyUI-TiledDiffusion's current `KSAMPLER.sample(*args, **kwargs)` passthrough monkeypatch is supported through a narrow semantic validator that recursively verifies its stored native delegate. Arbitrary variadic sampler wrappers are not accepted automatically.
 
