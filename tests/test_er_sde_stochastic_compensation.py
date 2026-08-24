@@ -17,6 +17,7 @@ from comfyui_spectrum_h3.er_sde_stochastic import (
     ERSDETrackingError,
 )
 from comfyui_spectrum_h3.runtime import OfflineReplayAbort, SpectrumH3Runtime
+from comfyui_spectrum_h3.refdelta_interop import RefDeltaInteropBridge
 from comfyui_spectrum_h3.sampling import (
     ACTUAL_KEY,
     BINDING_KEY,
@@ -177,6 +178,65 @@ def test_clear_releases_pending_state_between_generations():
 
     assert not tracker.has_pending
     assert tracker.consume(torch.ones((1, 2)), _descriptor(0)) is not None
+
+
+def test_refdelta_external_increment_tracks_the_exact_post_gate_tensor():
+    sample = torch.tensor([[2.0, -3.0]])
+    tracker = ERSDEStochasticTracker(
+        noise_sampler=lambda _sigma, _sigma_next: sample,
+        noise_scaler=lambda value: value**2,
+        effective_s_noise=0.5,
+        max_stage=3,
+        debug=False,
+        run_id=7,
+        external_increment=True,
+    )
+    tracker.noise_scaler(torch.tensor(0.5))
+    tracker.noise_scaler(torch.tensor(1.0))
+    assert tracker.noise_sampler(torch.tensor(0.8), torch.tensor(0.4)) is sample
+    exact_gated_q = torch.tensor([[0.125, -0.25]])
+    tracker.publish_external_increment(0, exact_gated_q)
+
+    raw_forecast = torch.tensor([[4.0, 5.0]]) + exact_gated_q
+    corrected = tracker.consume(raw_forecast, _descriptor(1))
+
+    torch.testing.assert_close(corrected, torch.tensor([[4.0, 5.0]]), rtol=0, atol=0)
+    assert not tracker.has_pending
+
+
+def test_refdelta_external_increment_must_be_published_before_next_model_step():
+    tracker = ERSDEStochasticTracker(
+        noise_sampler=lambda _sigma, _sigma_next: torch.ones((1, 2)),
+        noise_scaler=lambda value: value,
+        effective_s_noise=1.0,
+        max_stage=3,
+        debug=False,
+        run_id=7,
+        external_increment=True,
+    )
+    tracker.noise_scaler(torch.tensor(0.5))
+    tracker.noise_scaler(torch.tensor(1.0))
+    tracker.noise_sampler(torch.tensor(0.8), torch.tensor(0.4))
+
+    with pytest.raises(ERSDETrackingError, match="before the external"):
+        tracker.consume(torch.ones((1, 2)), _descriptor(1))
+
+
+def test_refdelta_bridge_preserves_actual_forecast_and_replay_provenance():
+    bridge = RefDeltaInteropBridge(run_id=7, tracker=None)
+
+    bridge.note_model_result(_descriptor(0, mode="actual"))
+    assert bridge.model_result_is_actual(0)
+    bridge.note_model_result(_descriptor(1, mode="forecast"))
+    assert not bridge.model_result_is_actual(1)
+    bridge.note_model_result(
+        _descriptor(2, mode="replay", replay_source_actual=True)
+    )
+    assert bridge.model_result_is_actual(2)
+    bridge.note_model_result(
+        _descriptor(3, mode="replay", replay_source_actual=False)
+    )
+    assert not bridge.model_result_is_actual(3)
 
 
 def test_second_noise_interval_before_consumption_fails_without_overwriting_q():

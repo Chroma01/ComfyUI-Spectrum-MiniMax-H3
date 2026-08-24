@@ -10,6 +10,12 @@ Spectrum is an **approximate accelerator**. Forecasted steps change the denoisin
 
 Full release details are kept in [RELEASE_NOTES.md](RELEASE_NOTES.md) and the GitHub release pages.
 
+### v0.2.18 — RefDelta Solver compatibility
+
+- Added a versioned, fail-closed interop contract for MiniMax H3 RefDelta Solver v0.2.0+.
+- Keeps Spectrum forecasts out of RefDelta's actual-anchor risk/correction history while retaining them in ER-SDE solver history.
+- Tracks RefDelta's exact post-gate stochastic increment for skipped-state compensation and offline replay.
+
 ### v0.2.16 — Untwist compatibility and post-run isolation
 
 - Added Spectrum compatibility for the MiniMax H3 integration in [**ComfyUI-Untwisting-RoPE**](https://github.com/xmarre/ComfyUI-Untwisting-RoPE), including distinct cache identity, hard-boundary anchoring, and stacking with Diff-Aid.
@@ -180,6 +186,7 @@ Forecasting is fail-closed and allowlisted for reviewed single-call sampler cont
 |---|---|---|
 | Euler | `sample_euler` | At most one forecast before an actual refresh. |
 | Native ER-SDE | `sample_er_sde` | Same conservative cadence plus stochastic-state tracking and solver-space dense output. |
+| RefDelta ER-SDE | `sample_refdelta_er_sde` | Requires RefDelta Solver v0.2.0+; preserves actual-only evidence and transfers the exact adaptive stochastic increment. |
 | MiniMax H3 Turbo | `_turbo_sampler` | Reviewed deterministic single-call contract. |
 | RES multistep | `sample_res_multistep` | Conservative cadence with protected native tail. |
 | RES multistep CFG++ | `sample_res_multistep_cfg_pp` | Same RES safeguards. |
@@ -191,6 +198,8 @@ Unknown or changed sampler contracts fall back to native execution rather than g
 The v0.2.11 path keeps the exact native ER-SDE sampler implementation and RNG stream. Spectrum tracks the native stochastic increment only to maintain state ownership and replay compatibility; it does not disable or rescale ER-SDE noise.
 
 Custom/unreviewed `noise_sampler` or `noise_scaler` implementations fail closed to native behavior where their contract cannot be proven.
+
+RefDelta Solver v0.2.0+ is admitted through a separate API-v1 contract. Spectrum marks actual versus forecast results; RefDelta uses only actual outputs for risk and trajectory correction. RefDelta then publishes its final risk-gated stochastic tensor back to Spectrum, which uses that exact tensor for forecast-state compensation and seeded offline replay. Contract/version drift, custom stochastic callbacks, and malformed bridge state fail closed.
 
 ComfyUI-TiledDiffusion's current `KSAMPLER.sample(*args, **kwargs)` passthrough monkeypatch is supported through a narrow semantic validator that recursively verifies its stored native delegate. Arbitrary variadic sampler wrappers are not accepted automatically.
 

@@ -40,6 +40,7 @@ def _sampler(function_name: str) -> SimpleNamespace:
         "_turbo_sampler",
         "sample_euler",
         "sample_er_sde",
+        "sample_refdelta_er_sde",
         "sample_res_multistep",
         "sample_res_multistep_cfg_pp",
     ),
@@ -73,6 +74,7 @@ def test_unreviewed_sampler_names_do_not_match_by_prefix(function_name):
         "_turbo_sampler",
         "sample_euler",
         "sample_er_sde",
+        "sample_refdelta_er_sde",
         "sample_res_multistep",
         "sample_res_multistep_cfg_pp",
     ),
@@ -89,7 +91,10 @@ def test_res_multistep_policy_refreshes_once_and_protects_tail(function_name):
     assert min_tail_actual_steps(sampler) == 3
 
 
-@pytest.mark.parametrize("function_name", ("sample_euler", "sample_er_sde", "_turbo_sampler"))
+@pytest.mark.parametrize(
+    "function_name",
+    ("sample_euler", "sample_er_sde", "sample_refdelta_er_sde", "_turbo_sampler"),
+)
 def test_non_res_policy_keeps_one_refresh_and_user_tail(function_name):
     sampler = _sampler(function_name)
 

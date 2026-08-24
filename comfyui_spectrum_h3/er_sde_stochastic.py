@@ -39,6 +39,15 @@ class _PendingIncrement:
     value: torch.Tensor
 
 
+@dataclass(frozen=True, slots=True)
+class _AwaitingExternalIncrement:
+    source_step_id: int
+    target_step_id: int
+    shape: torch.Size
+    device: torch.device
+    dtype: torch.dtype
+
+
 @dataclass(slots=True)
 class _DenoisedAnchor:
     step_id: int
@@ -106,6 +115,7 @@ class ERSDEStochasticTracker:
         max_stage: int,
         debug: bool,
         run_id: int,
+        external_increment: bool = False,
     ) -> None:
         if not math.isfinite(float(effective_s_noise)) or effective_s_noise <= 0.0:
             raise ValueError("ER-SDE stochastic tracking requires positive finite s_noise")
@@ -115,10 +125,12 @@ class ERSDEStochasticTracker:
         self.max_stage = int(max_stage)
         self.debug = bool(debug)
         self.run_id = int(run_id)
+        self.external_increment = bool(external_increment)
         self._scaler_prefix: list[tuple[torch.Tensor, torch.Tensor]] = []
         self._scaler_calls = 0
         self._noise_calls = 0
         self._pending: _PendingIncrement | None = None
+        self._awaiting_external: _AwaitingExternalIncrement | None = None
         self._solver_coordinates: dict[int, torch.Tensor] = {}
         self._denoised_anchors: list[_DenoisedAnchor] = []
 
@@ -183,6 +195,10 @@ class ERSDEStochasticTracker:
             raise ERSDETrackingError(
                 "ER-SDE produced a second stochastic increment before the first was consumed"
             )
+        if self._awaiting_external is not None:
+            raise ERSDETrackingError(
+                "ER-SDE requested new noise before publishing the prior external increment"
+            )
         if len(self._scaler_prefix) != 2:
             raise ERSDETrackingError(
                 "ER-SDE noise_scaler call ordering no longer matches the reviewed solver"
@@ -203,25 +219,71 @@ class ERSDEStochasticTracker:
             self._coordinate_tensor(er_lambda_t, label="er_lambda_t"),
         )
 
-        r = scaled_t / scaled_s
-        alpha_t = sigma_next / er_lambda_t
-        stochastic_scale = (
-            er_lambda_t ** 2 - er_lambda_s ** 2 * r ** 2
-        ).sqrt().nan_to_num(nan=0.0)
-
-        # Collapse scalar terms before the only latent-sized multiply. The retained
-        # tensor owns only the packed increment needed by the following model call.
-        coefficient = alpha_t * self.effective_s_noise * stochastic_scale
-        increment = noise * coefficient
-        if increment.shape != noise.shape:
-            raise ERSDETrackingError(
-                "ER-SDE stochastic increment shape changed through scalar scaling"
-            )
         self._noise_calls += 1
-        self._pending = _PendingIncrement(target_step_id, increment)
+        if self.external_increment:
+            self._awaiting_external = _AwaitingExternalIncrement(
+                source_step_id=source_step_id,
+                target_step_id=target_step_id,
+                shape=noise.shape,
+                device=noise.device,
+                dtype=noise.dtype,
+            )
+        else:
+            r = scaled_t / scaled_s
+            alpha_t = sigma_next / er_lambda_t
+            stochastic_scale = (
+                er_lambda_t ** 2 - er_lambda_s ** 2 * r ** 2
+            ).sqrt().nan_to_num(nan=0.0)
+
+            # Collapse scalar terms before the only latent-sized multiply. The retained
+            # tensor owns only the packed increment needed by the following model call.
+            coefficient = alpha_t * self.effective_s_noise * stochastic_scale
+            increment = noise * coefficient
+            if increment.shape != noise.shape:
+                raise ERSDETrackingError(
+                    "ER-SDE stochastic increment shape changed through scalar scaling"
+                )
+            self._pending = _PendingIncrement(target_step_id, increment)
         self._scaler_prefix.clear()
         self._scaler_calls = 0
         return noise
+
+    def publish_external_increment(
+        self,
+        source_step_id: int,
+        increment: torch.Tensor,
+    ) -> None:
+        """Accept the exact post-adaptation increment applied by a reviewed solver."""
+        if not self.external_increment:
+            raise ERSDETrackingError(
+                "external ER-SDE increment publication is not enabled"
+            )
+        awaiting = self._awaiting_external
+        if awaiting is None:
+            raise ERSDETrackingError(
+                "ER-SDE published an external increment without a matching noise draw"
+            )
+        if int(source_step_id) != awaiting.source_step_id:
+            raise ERSDETrackingError(
+                "ER-SDE external increment source step does not match its noise draw"
+            )
+        if not torch.is_tensor(increment):
+            raise ERSDETrackingError("ER-SDE external increment is not a tensor")
+        if (
+            increment.shape != awaiting.shape
+            or increment.device != awaiting.device
+            or increment.dtype != awaiting.dtype
+        ):
+            raise ERSDETrackingError(
+                "ER-SDE external increment does not match its reviewed noise draw"
+            )
+        if self._pending is not None:
+            raise ERSDETrackingError("ER-SDE external increment was published twice")
+        self._awaiting_external = None
+        self._pending = _PendingIncrement(
+            awaiting.target_step_id,
+            increment.detach().clone(memory_format=torch.contiguous_format),
+        )
 
     def _validate_descriptor(self, descriptor: ERSDEStepDescriptor) -> None:
         if descriptor.run_id != self.run_id:
@@ -237,6 +299,12 @@ class ERSDEStochasticTracker:
         descriptor: ERSDEStepDescriptor,
     ) -> torch.Tensor | None:
         pending = self._pending
+        awaiting = self._awaiting_external
+        if awaiting is not None:
+            raise ERSDETrackingError(
+                "ER-SDE model step arrived before the external stochastic increment "
+                f"for step {awaiting.target_step_id} was published"
+            )
         if pending is None:
             if descriptor.step_id == 0:
                 return None
@@ -248,6 +316,7 @@ class ERSDEStochasticTracker:
 
         # Transfer ownership immediately. Every exit below leaves no stale tensor.
         self._pending = None
+        self._awaiting_external = None
         if pending.target_step_id != descriptor.step_id:
             raise ERSDETrackingError(
                 "stale ER-SDE increment targets step "
@@ -497,6 +566,7 @@ class ERSDEStochasticTracker:
 
     def clear(self) -> None:
         self._pending = None
+        self._awaiting_external = None
         self._scaler_prefix.clear()
         self._scaler_calls = 0
         self._solver_coordinates.clear()
