@@ -131,6 +131,7 @@ class RuntimeStats:
     model_profile_sensitivity: float = 0.0
     model_profile_patch_perturbation: float = 0.0
     model_aware_forecasts: int = 0
+    model_aware_veto_suppressed: int = 0
     model_aware_anchor_updates: int = 0
     model_aware_failures: int = 0
     model_aware_risk_max: float = 0.0
@@ -206,6 +207,8 @@ class _StepState:
     adaptive_recompute: bool
     mode: str
     reason: str
+    stage_index: int = 0
+    state_residual_mode: bool = False
     bootstrap_forecast: bool = False
     calls: list[_CallState] = field(default_factory=list)
     actual_records: list[_ActualRecord] = field(default_factory=list)
@@ -225,6 +228,12 @@ class _RunState:
     run_id: int
     sampler_name: str
     total_steps: int
+    policy_steps: int
+    stage_count: int
+    stochastic_multistage: bool
+    separate_stage_histories: bool
+    forecastable_stage_indices: tuple[int, ...] | None
+    model_aware_can_force_actual: bool
     sigma_min: float
     sigma_max: float
     supported_sampler: bool
@@ -244,6 +253,7 @@ class RuntimeRollbackSnapshot:
     current_window: float
     consecutive_forecasts: int
     required_actual_refreshes: int
+    stage_required_actual_refreshes: tuple[tuple[int, int], ...]
     required_feedback_actuals: int
     disabled: bool
     disable_reason: str | None
@@ -264,10 +274,14 @@ class SpectrumH3Runtime:
             max_history=self.config.max_history,
             history_storage=self.config.history_storage,
         )
+        self._primary_forecaster = self.forecaster
+        self._stage_forecasters: dict[int, HistoryWeightForecaster] = {}
         self.model_aware = ModelAwareController(
             self.config.model_aware_mode,
             self.config.model_aware_risk_threshold,
         )
+        self._primary_model_aware = self.model_aware
+        self._stage_model_aware: dict[int, ModelAwareController] = {}
 
         self.stats = RuntimeStats(current_window=self.config.window_size)
         self._run_counter = 0
@@ -278,6 +292,7 @@ class SpectrumH3Runtime:
         self._current_window = float(self.config.window_size)
         self._consecutive_forecasts = 0
         self._required_actual_refreshes = 0
+        self._stage_required_actual_refreshes: dict[int, int] = {}
         self._required_feedback_actuals = 0
         self._disabled = False
         self._disable_reason: str | None = None
@@ -310,6 +325,18 @@ class SpectrumH3Runtime:
     @property
     def active_model_aware_decision(self) -> ModelAwareForecastDecision | None:
         return None if self._step is None else self._step.model_aware_decision
+
+    @property
+    def active_stage_index(self) -> int:
+        return 0 if self._step is None else self._step.stage_index
+
+    @property
+    def active_state_residual_mode(self) -> bool:
+        return bool(self._step is not None and self._step.state_residual_mode)
+
+    @property
+    def stochastic_multistage(self) -> bool:
+        return bool(self._run is not None and self._run.stochastic_multistage)
 
     @property
     def supported_sampler(self) -> bool:
@@ -657,6 +684,12 @@ class SpectrumH3Runtime:
         min_actual_steps_after_forecast: int = 0,
         min_tail_actual_steps: int = 0,
         min_actual_prefix_steps: int = 0,
+        expected_model_calls: int | None = None,
+        stage_count: int = 1,
+        stochastic_multistage: bool = False,
+        separate_stage_histories: bool | None = None,
+        forecastable_stage_indices: tuple[int, ...] | None = None,
+        model_aware_can_force_actual: bool = True,
     ) -> int:
         if self._run is not None:
             raise RuntimeError("Spectrum H3 runtime already has an active run")
@@ -673,8 +706,54 @@ class SpectrumH3Runtime:
         ):
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
                 raise ValueError(f"{name} must be an integer >= 0")
+        if isinstance(stage_count, bool) or not isinstance(stage_count, int) or stage_count < 1:
+            raise ValueError("stage_count must be an integer >= 1")
+        if stochastic_multistage and stage_count < 2:
+            raise ValueError("stochastic_multistage requires stage_count >= 2")
+        if type(model_aware_can_force_actual) is not bool:
+            raise ValueError("model_aware_can_force_actual must be boolean")
+        if separate_stage_histories is not None and type(separate_stage_histories) is not bool:
+            raise ValueError("separate_stage_histories must be boolean or None")
+        resolved_stage_histories = (
+            bool(stochastic_multistage)
+            if separate_stage_histories is None
+            else bool(separate_stage_histories)
+        )
+        if resolved_stage_histories and not stochastic_multistage:
+            raise ValueError(
+                "separate_stage_histories requires stochastic_multistage"
+            )
+        if forecastable_stage_indices is not None:
+            normalized_forecastable_stages = tuple(forecastable_stage_indices)
+            if len(set(normalized_forecastable_stages)) != len(normalized_forecastable_stages):
+                raise ValueError("forecastable_stage_indices must not contain duplicates")
+            if any(
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or index < 0
+                or index >= stage_count
+                for index in normalized_forecastable_stages
+            ):
+                raise ValueError(
+                    "forecastable_stage_indices entries must be integer stage indices "
+                    "within [0, stage_count)"
+                )
+        else:
+            normalized_forecastable_stages = None
         sigma_values = _as_cpu_float64_vector(sigmas)
-        total_steps = max(0, sigma_values.numel() - 1)
+        schedule_steps = max(0, sigma_values.numel() - 1)
+        if expected_model_calls is not None:
+            if (
+                isinstance(expected_model_calls, bool)
+                or not isinstance(expected_model_calls, int)
+                or expected_model_calls < schedule_steps
+            ):
+                raise ValueError(
+                    "expected_model_calls must be None or an integer >= the supplied sigma intervals"
+                )
+            total_steps = expected_model_calls
+        else:
+            total_steps = schedule_steps
         evaluated = sigma_values[:-1]
         finite_schedule = bool(evaluated.numel()) and bool(torch.isfinite(evaluated).all().item())
         sigma_min = float(evaluated.min().item()) if finite_schedule else 0.0
@@ -689,21 +768,57 @@ class SpectrumH3Runtime:
             run_id=self._run_counter,
             sampler_name=str(sampler_name),
             total_steps=total_steps,
+            policy_steps=schedule_steps,
+            stage_count=stage_count,
+            stochastic_multistage=bool(stochastic_multistage),
+            separate_stage_histories=resolved_stage_histories,
+            forecastable_stage_indices=normalized_forecastable_stages,
+            model_aware_can_force_actual=model_aware_can_force_actual,
             sigma_min=sigma_min,
             sigma_max=sigma_max,
             supported_sampler=effective_supported,
             max_consecutive_forecasts=max_consecutive_forecasts,
             min_actual_steps_after_forecast=min_actual_steps_after_forecast,
             min_tail_actual_steps=min_tail_actual_steps,
-            min_actual_prefix_steps=min(min_actual_prefix_steps, total_steps),
+            min_actual_prefix_steps=min(
+                min_actual_prefix_steps,
+                schedule_steps if stochastic_multistage else total_steps,
+            ),
         )
         self._step = None
-        self.forecaster.reset()
+        self._primary_forecaster.reset()
+        self.forecaster = self._primary_forecaster
+        self._stage_forecasters = {}
+        self._primary_model_aware.reset()
+        self._primary_model_aware.set_profile(self._model_profile)
+        self.model_aware = self._primary_model_aware
+        self._stage_model_aware = {}
+        if resolved_stage_histories:
+            self._stage_forecasters[0] = self._primary_forecaster
+            self._stage_model_aware[0] = self._primary_model_aware
+            for stage_index in range(1, stage_count):
+                self._stage_forecasters[stage_index] = HistoryWeightForecaster(
+                    degree=self.config.degree,
+                    ridge_lambda=self.config.ridge_lambda,
+                    max_history=self.config.max_history,
+                    history_storage=self.config.history_storage,
+                )
+                controller = ModelAwareController(
+                    self.config.model_aware_mode,
+                    self.config.model_aware_risk_threshold,
+                )
+                controller.set_profile(self._model_profile)
+                self._stage_model_aware[stage_index] = controller
         self._history_topology = None
         self._history_labels = None
         self._current_window = float(self.config.window_size)
         self._consecutive_forecasts = 0
         self._required_actual_refreshes = 0
+        self._stage_required_actual_refreshes = (
+            {stage_index: 0 for stage_index in range(stage_count)}
+            if resolved_stage_histories
+            else {}
+        )
         self._required_feedback_actuals = 0
         self._disabled = not effective_supported
         self._experiment_disabled = False
@@ -714,12 +829,10 @@ class SpectrumH3Runtime:
         self._forced_actual_reason = None
         self._forced_actual_is_replay = False
         self._rollback_replay_active = False
-        self.model_aware.reset()
-        self.model_aware.set_profile(self._model_profile)
         if not self.config.enabled:
             self._disable_reason = "forecasting disabled by configuration"
         elif not supported_sampler:
-            self._disable_reason = f"sampler {sampler_name!r} is not allowlisted for one-call solver-step tracking"
+            self._disable_reason = f"sampler {sampler_name!r} is not allowlisted for Spectrum model-call tracking"
         elif not schedule_valid:
             self._disable_reason = "supplied sigma schedule is empty, nonfinite, or has no usable range"
         elif total_steps <= 0:
@@ -766,11 +879,22 @@ class SpectrumH3Runtime:
             raise RuntimeError("attempted to end a stale Spectrum H3 run")
         self._step = None
         self._run = None
-        self.forecaster.reset()
+        for forecaster in self._stage_forecasters.values():
+            forecaster.reset()
+        self._stage_forecasters = {}
+        self._primary_forecaster.reset()
+        self.forecaster = self._primary_forecaster
+        for controller in self._stage_model_aware.values():
+            controller.reset()
+        self._stage_model_aware = {}
+        self._primary_model_aware.reset()
+        self._primary_model_aware.set_profile(self._model_profile)
+        self.model_aware = self._primary_model_aware
         self._history_topology = None
         self._history_labels = None
         self._consecutive_forecasts = 0
         self._required_actual_refreshes = 0
+        self._stage_required_actual_refreshes = {}
         self._required_feedback_actuals = 0
         self._rollback_requested = False
         self._forced_actual_reason = None
@@ -896,6 +1020,17 @@ class SpectrumH3Runtime:
         if step_id >= self._run.total_steps:
             raise RuntimeError("predict_noise call count exceeded the supplied sigma schedule")
         coordinate = self.coordinate_for_timestep(timestep)
+        stage_index = (
+            step_id % self._run.stage_count
+            if self._run.stochastic_multistage
+            else 0
+        )
+        if self._run.separate_stage_histories:
+            self.forecaster = self._stage_forecasters[stage_index]
+            self.model_aware = self._stage_model_aware[stage_index]
+        else:
+            self.forecaster = self._primary_forecaster
+            self.model_aware = self._primary_model_aware
 
         if self._offline_phase == "replay":
             archive = self._offline_archive
@@ -913,6 +1048,8 @@ class SpectrumH3Runtime:
                 adaptive_recompute=False,
                 mode="replay",
                 reason="offline smoothing replay",
+                stage_index=stage_index,
+                state_residual_mode=self._run.stochastic_multistage,
             )
             self._run.next_step_id += 1
             return {
@@ -923,8 +1060,18 @@ class SpectrumH3Runtime:
                 "reason": "offline smoothing replay",
             }
 
+        policy_step_id = (
+            step_id // self._run.stage_count
+            if self._run.stochastic_multistage
+            else step_id
+        )
+        policy_total_steps = (
+            self._run.policy_steps
+            if self._run.stochastic_multistage
+            else self._run.total_steps
+        )
         effective_tail = max(self.config.tail_actual_steps, self._run.min_tail_actual_steps)
-        tail_start = max(0, self._run.total_steps - effective_tail)
+        tail_start = max(0, policy_total_steps - effective_tail)
         advances_window = False
         bootstrap_forecast = False
         rollback_replay = False
@@ -942,16 +1089,27 @@ class SpectrumH3Runtime:
             actual, reason = True, "anchor residual feedback refresh"
             rollback_replay = False
             consumes_feedback_refresh = True
-        elif step_id < self._run.min_actual_prefix_steps:
+        elif policy_step_id < self._run.min_actual_prefix_steps:
             actual, reason = True, "H3 Continuum actual prefix"
-        elif step_id < self.config.warmup_steps:
+        elif policy_step_id < self.config.warmup_steps:
             actual, reason = True, "warmup"
-        elif step_id >= tail_start:
+        elif policy_step_id >= tail_start:
             actual, reason = True, "final actual tail"
         elif (
+            self._run.forecastable_stage_indices is not None
+            and stage_index not in self._run.forecastable_stage_indices
+        ):
+            actual, reason = True, "sampler-required exact stage"
+        elif (
+            self._run.separate_stage_histories
+            and self._stage_required_actual_refreshes.get(stage_index, 0) > 0
+        ):
+            actual, reason = True, "post-forecast stage-lane refresh"
+        elif (
             self.config.bootstrap_first_forecast
+            and not self._run.stochastic_multistage
             and self.config.degree == 1
-            and step_id == 1
+            and policy_step_id == 1
             and self.forecaster.history_length == 1
         ):
             actual, reason = False, "one-point bootstrap forecast"
@@ -1014,11 +1172,14 @@ class SpectrumH3Runtime:
                     model_aware_decision.video_subspace_telemetry.applied_bounded_norm_ratio,
                 )
                 if model_aware_decision.force_actual:
-                    actual = True
-                    reason = "model-aware forecast risk"
-                    advances_window = False
-                    bootstrap_forecast = False
-                    model_aware_forced_actual = True
+                    if self._run.model_aware_can_force_actual:
+                        actual = True
+                        reason = "model-aware forecast risk"
+                        advances_window = False
+                        bootstrap_forecast = False
+                        model_aware_forced_actual = True
+                    else:
+                        self.stats.model_aware_veto_suppressed += 1
             except (RuntimeError, TypeError, ValueError) as exc:
                 self._model_aware_disabled_reason = f"model-aware decision failed: {exc}"
                 self.stats.model_aware_failures += 1
@@ -1037,6 +1198,8 @@ class SpectrumH3Runtime:
             adaptive_recompute=advances_window,
             mode="actual" if actual else "forecast",
             reason=reason,
+            stage_index=stage_index,
+            state_residual_mode=self._run.stochastic_multistage,
             bootstrap_forecast=bootstrap_forecast,
             rollback_replay=rollback_replay,
             consumes_feedback_refresh=consumes_feedback_refresh,
@@ -1157,6 +1320,8 @@ class SpectrumH3Runtime:
         step_id: int,
         call_id: int,
         feature: torch.Tensor,
+        *,
+        take_ownership: bool = False,
     ) -> None:
         step = self._require_step(run_id, step_id)
         call = step.calls[int(call_id)]
@@ -1202,10 +1367,15 @@ class SpectrumH3Runtime:
                 # CPU while the full replay archive takes ownership on device.
                 capture_storage = "vram"
             if capture_storage == "vram":
-                # The observed target is a view into the complete final-block
-                # hidden state. A forced clone keeps only the compact target
-                # storage alive and prevents later reuse of the backing tensor.
-                archived = detached.clone(memory_format=torch.contiguous_format)
+                # Ordinary observations are views into the complete final-block
+                # hidden state and must be cloned. State-residual SEEDS callers
+                # already materialize a compact owned tensor and transfer
+                # ownership explicitly to avoid a second full target clone.
+                archived = (
+                    detached
+                    if take_ownership and detached.is_contiguous()
+                    else detached.clone(memory_format=torch.contiguous_format)
+                )
             else:
                 archived = detached.to(device="cpu", dtype=feature.dtype, copy=True).contiguous()
         finally:
@@ -2144,6 +2314,12 @@ class SpectrumH3Runtime:
                 raise ForecastRetryActual("forecast branch-row allocation was incomplete")
             self._consecutive_forecasts += 1
             self._required_actual_refreshes = self._run.min_actual_steps_after_forecast
+            if self._run.separate_stage_histories:
+                self._stage_required_actual_refreshes[step.stage_index] = max(
+                    1,
+                    self._stage_required_actual_refreshes.get(step.stage_index, 0),
+                    self._run.min_actual_steps_after_forecast,
+                )
             self.stats.forecast_steps += 1
             self.stats.forecast_model_calls += len(step.calls)
             if step.model_aware_decision is not None:
@@ -2286,6 +2462,15 @@ class SpectrumH3Runtime:
                     )
             self._consecutive_forecasts = 0
             self._required_actual_refreshes = max(0, self._required_actual_refreshes - 1)
+            if self._run.separate_stage_histories:
+                pending_stage_refresh = self._stage_required_actual_refreshes.get(
+                    step.stage_index,
+                    0,
+                )
+                if pending_stage_refresh > 0:
+                    self._stage_required_actual_refreshes[step.stage_index] = (
+                        pending_stage_refresh - 1
+                    )
             if step.consumes_feedback_refresh:
                 self._required_feedback_actuals = max(0, self._required_feedback_actuals - 1)
             self.stats.actual_steps += 1
@@ -2300,7 +2485,11 @@ class SpectrumH3Runtime:
                 step.adaptive_recompute
                 and not step.fallback
                 and not self._disabled
-                and step.step_id >= self.config.warmup_steps
+                and (
+                    step.step_id // self._run.stage_count
+                    if self._run.stochastic_multistage
+                    else step.step_id
+                ) >= self.config.warmup_steps
             ):
                 window_ceiling = max(float(self.config.window_size), float(self.config.max_history))
                 self._current_window = min(
@@ -2348,6 +2537,9 @@ class SpectrumH3Runtime:
             current_window=self._current_window,
             consecutive_forecasts=self._consecutive_forecasts,
             required_actual_refreshes=self._required_actual_refreshes,
+            stage_required_actual_refreshes=tuple(
+                sorted(self._stage_required_actual_refreshes.items())
+            ),
             required_feedback_actuals=self._required_feedback_actuals,
             disabled=self._disabled,
             disable_reason=self._disable_reason,
@@ -2469,6 +2661,9 @@ class SpectrumH3Runtime:
         self._current_window = snapshot.current_window
         self._consecutive_forecasts = snapshot.consecutive_forecasts
         self._required_actual_refreshes = snapshot.required_actual_refreshes
+        self._stage_required_actual_refreshes = dict(
+            snapshot.stage_required_actual_refreshes
+        )
         self._required_feedback_actuals = snapshot.required_feedback_actuals
         self._disabled = snapshot.disabled
         self._disable_reason = snapshot.disable_reason
@@ -2615,7 +2810,14 @@ class SpectrumH3Runtime:
         subspace_summary = " ".join(subspace_parts)
         return (
             f"run_id={self.stats.run_id} sampler={self.stats.sampler_name} "
-            f"steps={self.stats.total_steps} actual_steps={self.stats.actual_steps} "
+            f"steps={self.stats.total_steps} "
+            f"stage_count={self._run.stage_count if self._run is not None else 1} "
+            f"stochastic_multistage={self._run.stochastic_multistage if self._run is not None else False} "
+            f"stage_histories={'separate' if self._run is not None and self._run.separate_stage_histories else 'shared'} "
+            f"feature_geometry={('state_residual_stage_lanes' if self._run.separate_stage_histories else 'state_residual_shared_history') if self._run is not None and self._run.stochastic_multistage else 'absolute_hidden'} "
+            f"forecastable_stages={self._run.forecastable_stage_indices if self._run is not None else None} "
+            f"stage_refresh_pending={sum(self._stage_required_actual_refreshes.values())} "
+            f"actual_steps={self.stats.actual_steps} "
             f"forecast_steps={self.stats.forecast_steps} "
             f"actual_transformer_calls={self.stats.actual_transformer_calls} "
             f"forecast_calls={self.stats.forecast_model_calls} "
@@ -2692,6 +2894,7 @@ class SpectrumH3Runtime:
             f"model_aware_sensitivity={self.stats.model_profile_sensitivity:.6f} "
             f"model_aware_patch_perturbation={self.stats.model_profile_patch_perturbation:.6f} "
             f"model_aware_forecasts={self.stats.model_aware_forecasts} "
+            f"model_aware_veto_suppressed={self.stats.model_aware_veto_suppressed} "
             f"model_aware_anchor_updates={self.stats.model_aware_anchor_updates} "
             f"model_aware_failures={self.stats.model_aware_failures} "
             f"model_aware_risk_max={self.stats.model_aware_risk_max:.6f} "

@@ -15,6 +15,7 @@ from comfyui_spectrum_h3.sampling import (
     ER_SDE_DEFAULT_NOISE_SAMPLER_DIGEST,
     ER_SDE_KSAMPLER_SAMPLE_DIGEST,
     ER_SDE_NATIVE_FUNCTION_DIGEST,
+    SEEDS_NATIVE_FUNCTION_DIGESTS,
 )
 
 RES_VARIANTS = (
@@ -28,6 +29,11 @@ ANCESTRAL_VARIANTS = (
     "sample_res_multistep_ancestral",
     "sample_res_multistep_ancestral_cfg_pp",
 )
+
+SEEDS_VARIANTS = {
+    "sample_seeds_2": 2,
+    "sample_seeds_3": 3,
+}
 
 
 def _native_tree(relative_path: str) -> ast.Module:
@@ -369,6 +375,63 @@ def test_native_euler_makes_one_model_call_per_solver_iteration():
     assert len(loops) == 1
     assert len(_named_calls(loops[0], "model")) == 1
     assert len(_named_calls(function, "model")) == 1
+
+
+def test_native_standard_seeds_2_defaults_match_reviewed_ksampler_contract():
+    function = _native_sampling_functions()["sample_seeds_2"]
+    positional = [arg.arg for arg in function.args.args]
+    defaults = {
+        name: value
+        for name, value in zip(
+            positional[-len(function.args.defaults) :],
+            function.args.defaults,
+            strict=True,
+        )
+    }
+
+    assert ast.literal_eval(defaults["eta"]) == 1.0
+    assert ast.literal_eval(defaults["s_noise"]) == 1.0
+    assert ast.literal_eval(defaults["noise_sampler"]) is None
+    assert ast.literal_eval(defaults["r"]) == 0.5
+    assert ast.literal_eval(defaults["solver_type"]) == "phi_1"
+
+
+def test_native_seeds_2_callback_is_bound_to_outer_stage_model_result():
+    function = _native_sampling_functions()["sample_seeds_2"]
+    loop = next(node for node in function.body if isinstance(node, (ast.For, ast.AsyncFor)))
+    model_calls = [
+        node
+        for node in ast.walk(loop)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "model"
+    ]
+    callback_calls = [
+        node
+        for node in ast.walk(loop)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "callback"
+    ]
+
+    assert len(model_calls) == 2
+    assert len(callback_calls) == 1
+    first_model_line = min(node.lineno for node in model_calls)
+    second_model_line = max(node.lineno for node in model_calls)
+    callback_line = callback_calls[0].lineno
+    assert first_model_line < callback_line < second_model_line
+
+
+@pytest.mark.parametrize(("function_name", "stage_count"), SEEDS_VARIANTS.items())
+def test_native_seeds_stage_topology_matches_reviewed_contract(function_name, stage_count):
+    function = _native_sampling_functions()[function_name]
+    loops = [node for node in function.body if isinstance(node, (ast.For, ast.AsyncFor))]
+
+    assert len(loops) == 1
+    assert len(_named_calls(loops[0], "model")) == stage_count
+    assert len(_named_calls(function, "model")) == stage_count
+    assert len(_named_calls(loops[0], "noise_sampler")) == stage_count
+    assert _ast_digest(function) == SEEDS_NATIVE_FUNCTION_DIGESTS[function_name]
 
 
 @pytest.mark.parametrize("function_name", RES_VARIANTS)

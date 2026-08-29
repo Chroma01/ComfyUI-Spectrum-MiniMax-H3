@@ -23,6 +23,10 @@ from comfyui_spectrum_h3.sampling import (
     sampler_name,
     sampler_sample_wrapper,
     sampler_supports_seeded_replay,
+    _seeds_expected_model_calls,
+    _seeds_is_stochastic,
+    _seeds_option_contract,
+    _seeds_stage_schedule_reason,
 )
 
 
@@ -43,9 +47,11 @@ def _sampler(function_name: str) -> SimpleNamespace:
         "sample_refdelta_er_sde",
         "sample_res_multistep",
         "sample_res_multistep_cfg_pp",
+        "sample_seeds_2",
+        "sample_seeds_3",
     ),
 )
-def test_reviewed_single_call_samplers_are_supported(function_name):
+def test_reviewed_samplers_are_supported(function_name):
     sampler = _sampler(function_name)
 
     assert sampler_name(sampler) == function_name
@@ -77,6 +83,8 @@ def test_unreviewed_sampler_names_do_not_match_by_prefix(function_name):
         "sample_refdelta_er_sde",
         "sample_res_multistep",
         "sample_res_multistep_cfg_pp",
+        "sample_seeds_2",
+        "sample_seeds_3",
     ),
 )
 def test_supported_h3_samplers_limit_forecast_streaks(function_name):
@@ -93,7 +101,14 @@ def test_res_multistep_policy_refreshes_once_and_protects_tail(function_name):
 
 @pytest.mark.parametrize(
     "function_name",
-    ("sample_euler", "sample_er_sde", "sample_refdelta_er_sde", "_turbo_sampler"),
+    (
+        "sample_euler",
+        "sample_er_sde",
+        "sample_refdelta_er_sde",
+        "_turbo_sampler",
+        "sample_seeds_2",
+        "sample_seeds_3",
+    ),
 )
 def test_non_res_policy_keeps_one_refresh_and_user_tail(function_name):
     sampler = _sampler(function_name)
@@ -109,6 +124,233 @@ def test_unsupported_sampler_has_no_forecast_streak_policy():
     assert min_actual_steps_after_forecast(sampler) == 0
     assert min_tail_actual_steps(sampler) == 0
 
+
+
+
+
+@pytest.mark.parametrize(
+    ("function_name", "sigmas", "expected"),
+    (
+        ("sample_seeds_2", [1.0, 0.6, 0.2, 0.0], 5),
+        ("sample_seeds_3", [1.0, 0.6, 0.2, 0.0], 7),
+        ("sample_seeds_2", [1.0, 0.6, 0.2], 4),
+        ("sample_seeds_3", [1.0, 0.6, 0.2], 6),
+    ),
+)
+def test_seeds_expected_model_calls_tracks_internal_stages(
+    function_name, sigmas, expected
+):
+    assert (
+        _seeds_expected_model_calls(_sampler(function_name), torch.tensor(sigmas))
+        == expected
+    )
+
+
+@pytest.mark.parametrize(
+    ("options", "stochastic"),
+    (
+        ({}, True),
+        ({"eta": 1.0, "s_noise": 1.0}, True),
+        ({"eta": 0.0}, False),
+        ({"s_noise": 0.0}, False),
+        ({"eta": -0.5, "s_noise": 1.0}, False),
+    ),
+)
+def test_seeds_stochastic_gate_matches_native_inject_noise_condition(options, stochastic):
+    sampler = _sampler("sample_seeds_2")
+    sampler.extra_options = options
+
+    assert _seeds_is_stochastic(sampler) is stochastic
+
+
+@pytest.mark.parametrize(
+    ("function_name", "options", "replay_safe"),
+    (
+        ("sample_seeds_2", {}, False),
+        ("sample_seeds_3", {}, False),
+        ("sample_seeds_2", {"eta": 0.0}, True),
+        ("sample_seeds_3", {"s_noise": 0.0}, True),
+        (
+            "sample_seeds_2",
+            {"eta": 0.0, "noise_sampler": lambda *_args: torch.zeros(1)},
+            True,
+        ),
+    ),
+)
+def test_seeds_replay_safety_requires_deterministic_native_configuration(
+    function_name, options, replay_safe
+):
+    sampler = _sampler(function_name)
+    sampler.extra_options = options
+
+    assert sampler_supports_seeded_replay(sampler) is replay_safe
+
+
+def test_seeds_2_endpoint_stage_is_rejected_for_spectrum_tracking():
+    reason = _seeds_option_contract("sample_seeds_2", {"r": 1.0})
+
+    assert reason is not None
+    assert "strictly interior stage coordinate" in reason
+
+
+def test_seeds_3_non_interior_stage_order_is_rejected_for_spectrum_tracking():
+    reason = _seeds_option_contract(
+        "sample_seeds_3",
+        {"r_1": 0.75, "r_2": 0.5},
+    )
+
+    assert reason is not None
+    assert "strictly interior ordered stages" in reason
+
+
+@pytest.mark.parametrize(
+    ("options", "message"),
+    (
+        ({"eta": float("nan")}, "eta"),
+        ({"s_noise": float("inf")}, "s_noise"),
+        ({"noise_sampler": object()}, "noise_sampler"),
+    ),
+)
+def test_seeds_invalid_options_fail_closed(options, message):
+    reason = _seeds_option_contract("sample_seeds_2", options)
+
+    assert reason is not None
+    assert message in reason
+
+
+def test_stochastic_seeds_outer_wrapper_enters_state_residual_spectrum(monkeypatch, caplog):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            model_aware_mode="off",
+            offline_smoothing_replay=False,
+            debug=True,
+        )
+    )
+    guider = SimpleNamespace(
+        model_options={
+            BINDING_KEY: SpectrumH3Binding(runtime),
+            "transformer_options": {},
+        },
+        model_patcher=object(),
+    )
+    sampler = _sampler("sample_seeds_2")
+    sampler.extra_options = {}
+    calls = []
+
+    monkeypatch.setattr(
+        sampling_module,
+        "_native_seeds_preflight_reason",
+        lambda _sampler, _model_options: None,
+    )
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *args, **kwargs):
+            calls.append(
+                (
+                    runtime.active_run_id,
+                    runtime.stochastic_multistage,
+                    runtime.stats.total_steps,
+                    runtime._run.forecastable_stage_indices,
+                    runtime._run.separate_stage_histories,
+                    args,
+                    kwargs,
+                )
+            )
+            return "state-residual-seeds"
+
+    with caplog.at_level("WARNING"):
+        result = outer_sample_wrapper(
+            Executor(),
+            torch.ones(1),
+            torch.zeros(1),
+            sampler,
+            torch.tensor([1.0, 0.5, 0.0]),
+            seed=17,
+        )
+
+    assert result == "state-residual-seeds"
+    assert len(calls) == 1
+    assert calls[0][0] is not None
+    assert calls[0][1] is True
+    assert calls[0][2] == 3
+    assert calls[0][3] == (1,)
+    assert calls[0][4] is False
+    assert runtime.active_run_id is None
+    assert "running the untouched native sampler" not in caplog.text
+    assert "feature_geometry=state_residual_shared_history" in caplog.text
+    assert "stage_histories=shared" in caplog.text
+
+
+def test_stochastic_seeds_offline_request_runs_one_causal_spectrum_pass(monkeypatch, caplog):
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            model_aware_mode="off",
+            offline_smoothing_replay=True,
+        )
+    )
+    guider = SimpleNamespace(
+        model_options={
+            BINDING_KEY: SpectrumH3Binding(runtime),
+            "transformer_options": {},
+        },
+        model_patcher=object(),
+    )
+    sampler = _sampler("sample_seeds_2")
+    sampler.extra_options = {}
+    active_runs = []
+
+    monkeypatch.setattr(
+        sampling_module,
+        "_native_seeds_preflight_reason",
+        lambda _sampler, _model_options: None,
+    )
+
+    class Executor:
+        class_obj = guider
+
+        def __call__(self, *args, **kwargs):
+            active_runs.append(
+                (runtime.active_run_id, runtime.stochastic_multistage, runtime.offline_phase)
+            )
+            return "causal-stochastic-seeds"
+
+    with caplog.at_level("WARNING"):
+        result = outer_sample_wrapper(
+            Executor(),
+            torch.ones(1),
+            torch.zeros(1),
+            sampler,
+            torch.tensor([1.0, 0.5, 0.0]),
+            seed=17,
+        )
+
+    assert result == "causal-stochastic-seeds"
+    assert len(active_runs) == 1
+    assert active_runs[0][0] is not None
+    assert active_runs[0][1] is True
+    assert active_runs[0][2] is None
+    assert "one causal state-residual Spectrum pass" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("sigmas", "expected_fragment"),
+    (
+        (torch.tensor([1.0, 0.5, 0.0]), None),
+        (torch.tensor([1.0, 0.5, 0.25]), None),
+        (torch.tensor([1.0, 0.0, 0.0]), "nonpositive pre-terminal"),
+        (torch.tensor([1.0, float("nan"), 0.0]), "nonfinite"),
+    ),
+)
+def test_seeds_stage_schedule_contract(sigmas, expected_fragment):
+    reason = _seeds_stage_schedule_reason(sigmas)
+
+    if expected_fragment is None:
+        assert reason is None
+    else:
+        assert reason is not None
+        assert expected_fragment in reason
 
 def test_unsupported_sampler_does_not_build_unused_model_profile(monkeypatch):
     runtime = SpectrumH3Runtime(

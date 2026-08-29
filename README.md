@@ -180,7 +180,7 @@ The minimum reviewed packed-H3 integration contract starts at ComfyUI commit [`e
 
 ## Supported samplers
 
-Forecasting is fail-closed and allowlisted for reviewed single-call sampler contracts.
+Forecasting is fail-closed and allowlisted for reviewed sampler contracts.
 
 | Sampler | Function | Spectrum policy |
 |---|---|---|
@@ -190,8 +190,39 @@ Forecasting is fail-closed and allowlisted for reviewed single-call sampler cont
 | MiniMax H3 Turbo | `_turbo_sampler` | Reviewed deterministic single-call contract. |
 | RES multistep | `sample_res_multistep` | Conservative cadence with protected native tail. |
 | RES multistep CFG++ | `sample_res_multistep_cfg_pp` | Same RES safeguards. |
+| SEEDS-2 | `sample_seeds_2` | Reviewed two-stage topology with state-conditioned residual forecasting for stochastic internal stages. |
+| SEEDS-3 | `sample_seeds_3` | Reviewed three-stage topology with state-conditioned residual forecasting for stochastic internal stages. |
 
 Unknown or changed sampler contracts fall back to native execution rather than guessing.
+
+For SEEDS-2/3, every internal denoiser stage is a real MiniMax H3 model evaluation opportunity and therefore a Spectrum logical model call. A terminal-zero schedule contains `2N - 1` model evaluations for SEEDS-2 and `3N - 2` for SEEDS-3 when the outer sampler has `N` sigma intervals. Continuum's actual-prefix contract remains expressed in outer sampler steps; stochastic SEEDS applies that prefix in outer-step space while deterministic SEEDS retains the expanded logical-call mapping.
+
+Native SEEDS is stochastic by default (`eta > 0` and `s_noise > 0`). Its higher-stage construction deliberately evaluates the denoiser on intermediate states after correlated noise has been injected. The SEEDS paper identifies the dependence of noise on overlapping subintervals as essential to the Markov-preserving solver construction, and its ablation shows that naive noise substitutions sharply degrade sampling quality.
+
+Spectrum therefore does **not** subtract, rescale, reorder, regenerate, or approximate SEEDS' stochastic increments. Instead, stochastic SEEDS uses a state-conditioned feature geometry:
+
+```text
+final H3 target hidden = exact current-state input embedding
+                       + transformer residual
+```
+
+The current-state term is kept exact for every SEEDS stage. On actual H3 calls Spectrum captures the exact target input hidden state immediately before the first transformer block and stores only `final_hidden - input_hidden`. On a forecast call it recomputes the native target audio/video input projections from the exact current stochastic latent, forecasts only the transformer residual, then adds the exact current-state embedding back before the native H3 final layer.
+
+Stochastic SEEDS now uses one **shared residual history across the true interleaved model-call coordinates** instead of isolated per-stage histories. This is important for efficiency once stage 0 is protected: every exact outer-stage H3 evaluation becomes a fresh anchor for the following internal-stage forecast. The residual forecaster therefore sees the actual continuous SEEDS trajectory rather than discarding the nearest exact outer anchors and forcing an otherwise unnecessary same-lane refresh.
+
+The normal no-back-to-back forecast guard still applies. For SEEDS-2, an internal forecast is immediately followed by the next exact outer stage, which satisfies that refresh naturally. Stochastic SEEDS still suppresses Spectrum's one-point bootstrap, so the shared trajectory must first contain the normal minimum fit history before internal forecasting starts.
+
+The model-aware controller remains active on internal forecasts for risk telemetry, degree/ridge adaptation, blend confidence, and generic correction. Its ordinary `force_actual` veto is not used for stochastic SEEDS internal stages. That scheduler veto was calibrated for ordinary one-lane trajectories; on the shared interleaved SEEDS residual trajectory it can treat the intended outer/internal stage alternation as excess trajectory curvature. The exact outer-stage mask, hard external-patch transitions, Continuum prefix, warmup/tail rules, readiness checks, and transactional fallbacks remain authoritative actual-step boundaries.
+
+The native **outer stage (stage 0) is always actual** for stochastic SEEDS. Native ComfyUI emits its sampler callback immediately after this first model evaluation, and real H3 testing showed that forecasting this noise-conditioned outer evaluation produced the characteristic delayed heavy-noise preview artifact. The state-conditioned residual decomposition preserves the current noisy input exactly, but the transformer residual itself is still a nonlinear response to that specific fresh stochastic state; a time-only residual forecast cannot reconstruct that response reliably. Spectrum therefore forecasts only the internal SEEDS stages (stage 1 for SEEDS-2; stages 1 and 2 for SEEDS-3). This preserves every outer/callback denoiser evaluation exactly while still skipping internal transformer evaluations.
+
+A subsequent real SEEDS-2 run confirmed why the scheduling ownership matters. With stage 0 already exact and shared history active, the first chunk still finished at 15 actual / 4 forecast and the Continuum chunk at 16 / 3 because model-aware risk vetoed internal steps 11 and 15. Those combined risks were only marginally above the ordinary 0.65 threshold, while the interleaved stage geometry already supplied exact outer anchors between internal candidates. The stochastic-SEEDS policy now keeps those model-aware signals advisory instead of spending extra H3 transformer NFEs on top of the explicit sampler safety boundaries.
+
+This specifically addresses the failure mode found during real H3 testing: forecasting the absolute final hidden state ignored the fresh stochastic internal latent, while sampler-space noise subtraction and outer-stage denoised extrapolation both changed the SEEDS trajectory and produced visible corruption. The state-residual path leaves the native SEEDS Markov-preserving noise path untouched and conditions every skipped transformer evaluation on the actual latent produced by that path.
+
+Deterministic SEEDS remains supported as before. Setting either `eta=0` or `s_noise=0` disables native SEEDS stochastic injection, so the ordinary expanded logical-call forecast geometry remains valid. Offline smoothing replay remains available only for deterministic SEEDS. If replay is requested with stochastic SEEDS, Spectrum performs one causal state-residual pass instead; it never replays away the noise-conditioned stage structure.
+
+The `SamplerSEEDS2` node can emulate exponential-Heun variants with `r=1`. Spectrum leaves that endpoint-stage configuration native because the intermediate model call lands on the next outer sigma, producing duplicate timestep coordinates for different solver states. Reviewed Spectrum tracking therefore requires `0 < r < 1` for SEEDS-2 and `0 < r_1 < r_2 < 1` for SEEDS-3.
 
 ### ER-SDE compatibility details
 
@@ -208,7 +239,7 @@ ComfyUI-TiledDiffusion's current `KSAMPLER.sample(*args, **kwargs)` passthrough 
 
 Warmup and tail constraints are always actual. Reviewed samplers also limit the causal forecast horizon and require actual refreshes.
 
-The default degree-1 bootstrap can reuse step 0 as a one-point hold for step 1. Step 2 then runs actual before normal two-anchor degree-1 forecasting begins.
+For ordinary one-lane samplers, the default degree-1 bootstrap can reuse step 0 as a one-point hold for step 1. Step 2 then runs actual before normal two-anchor degree-1 forecasting begins. Stochastic SEEDS deliberately suppresses that bootstrap; its exact outer stages instead provide fresh anchors to the shared state-conditioned residual history.
 
 Typical 20-step Euler/ER-SDE single-pass cadence is approximately:
 

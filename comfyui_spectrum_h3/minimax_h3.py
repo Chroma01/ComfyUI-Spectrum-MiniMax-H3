@@ -19,6 +19,8 @@ from .sampling import (
 
 LOG = logging.getLogger(__name__)
 
+_STATE_BASIS_CHUNK_BYTES = 16 * 1024 * 1024
+
 
 def locate_minimax_h3_inner(model: Any) -> tuple[Any | None, str | None]:
     outer = getattr(model, "model", None)
@@ -48,6 +50,8 @@ def is_native_minimax_h3(inner: Any) -> bool:
         "sigma_shift_video",
         "sigma_shift_audio",
         "use_adaln_curves",
+        "video_patch_proj",
+        "audio_patch_proj",
     )
     if not class_match or not all(hasattr(inner, name) for name in required):
         return False
@@ -104,7 +108,14 @@ def _native_module(inner: Any):
     module = importlib.import_module(type(inner).__module__)
     # time_shift_slope is deliberately absent: cores that still expose it want the
     # audio velocity pre-scaled here, newer ones convert outside this wrapper.
-    required = ("PackedLayout", "unpatchify_video", "unpack_audio", "time_shift_sigma")
+    required = (
+        "PackedLayout",
+        "unpatchify_video",
+        "unpack_audio",
+        "time_shift_sigma",
+        "patchify_video",
+        "pack_audio",
+    )
     missing = [name for name in required if not hasattr(module, name)]
     if missing:
         raise RuntimeError(f"native MiniMax H3 module is missing required helpers: {', '.join(missing)}")
@@ -119,6 +130,58 @@ def _padded_shape(shape: tuple[int, ...], patch_size: tuple[int, int, int]) -> t
         ((h + ph - 1) // ph) * ph,
         ((w + pw - 1) // pw) * pw,
     )
+
+
+def _apply_exact_state_input_embedding_(
+    target: torch.Tensor,
+    inner: Any,
+    video_x: torch.Tensor,
+    audio_x: torch.Tensor,
+    *,
+    scale: float,
+) -> torch.Tensor:
+    """Add/subtract H3's exact target input embedding without running transformer blocks."""
+    if target.ndim != 3 or target.shape[0] != 1:
+        raise ValueError("state-residual target must be a batch-one [1, rows, hidden] tensor")
+    if target.shape[-1] != int(inner.hidden_size):
+        raise ValueError("state-residual target hidden width does not match native H3")
+
+    module = _native_module(inner)
+    common_dit = importlib.import_module("comfy.ldm.common_dit")
+    padded_video = common_dit.pad_to_patch_size(video_x, tuple(inner.patch_size))
+    video_rows = module.patchify_video(
+        padded_video.to(torch.float32),
+        tuple(inner.patch_size),
+    )
+    audio_rows = module.pack_audio(audio_x.to(torch.float32))
+    if audio_rows.ndim != 2 or video_rows.ndim != 2:
+        raise ValueError("native H3 patch helpers returned an unexpected row layout")
+
+    compact = target[0]
+    total_rows = int(audio_rows.shape[0] + video_rows.shape[0])
+    if compact.shape[0] != total_rows:
+        raise ValueError(
+            "state-residual target rows do not match native H3 audio/video input rows"
+        )
+
+    element_size = torch.empty((), dtype=compact.dtype).element_size()
+    rows_per_chunk = max(
+        1,
+        _STATE_BASIS_CHUNK_BYTES
+        // max(1, int(inner.hidden_size) * element_size),
+    )
+    offset = 0
+    for rows, projection in (
+        (audio_rows, inner.audio_patch_proj),
+        (video_rows, inner.video_patch_proj),
+    ):
+        count = int(rows.shape[0])
+        for start in range(0, count, rows_per_chunk):
+            stop = min(count, start + rows_per_chunk)
+            embedded = projection(rows[start:stop]).to(compact.dtype)
+            compact[offset + start : offset + stop].add_(embedded, alpha=float(scale))
+        offset += count
+    return target
 
 
 def _resolve_layout(inner: Any, context: torch.Tensor, video_x: torch.Tensor, audio_x: torch.Tensor, payload: dict[str, Any]):
@@ -365,11 +428,34 @@ def _execute_actual(
     patches_replace["dit"] = dit_replacements
     local_options["patches_replace"] = patches_replace
     existing = dit_replacements.get(("double_block", last_index))
+    first_index = 0
+    existing_first = dit_replacements.get(("double_block", first_index))
     observed = False
     actual_target = None
+    state_input_target = None
+
+    if runtime.active_state_residual_mode and first_index != last_index:
+        def capture_state_input(args, replacement_context):
+            nonlocal state_input_target
+            hidden = args.get("img")
+            (aa, _), (_, vb) = target_segments(layout)
+            if not torch.is_tensor(hidden) or hidden.ndim != 2 or hidden.shape[0] < vb:
+                raise RuntimeError(
+                    "initial MiniMax H3 hidden feature is incompatible with state-residual forecasting"
+                )
+            state_input_target = hidden[aa:vb].detach().clone(
+                memory_format=torch.contiguous_format
+            )
+            return (
+                existing_first(args, replacement_context)
+                if existing_first is not None
+                else replacement_context["original_block"](args)
+            )
+
+        dit_replacements[("double_block", first_index)] = capture_state_input
 
     def capture_replacement(args, replacement_context):
-        nonlocal actual_target, observed
+        nonlocal actual_target, observed, state_input_target
         output = existing(args, replacement_context) if existing is not None else replacement_context["original_block"](args)
         if not isinstance(output, dict) or "img" not in output or not torch.is_tensor(output["img"]):
             raise RuntimeError("final MiniMax H3 block replacement did not return {'img': tensor}")
@@ -382,7 +468,45 @@ def _execute_actual(
         # second full target tensor on the GPU before the required CPU archive.
         target = hidden[aa:vb].unsqueeze(0)
         actual_target = target
-        runtime.observe_actual(run_id, step_id, call_id, target)
+        if runtime.active_state_residual_mode:
+            try:
+                if state_input_target is None:
+                    # This only applies to an unexpected one-block native contract.
+                    history_target = target.detach().clone(
+                        memory_format=torch.contiguous_format
+                    )
+                    _apply_exact_state_input_embedding_(
+                        history_target,
+                        inner,
+                        x[0],
+                        x[1],
+                        scale=-1.0,
+                    )
+                else:
+                    # Native H3 updates the packed hidden state in-place. Capture
+                    # the exact pre-block target once, then turn that owned buffer
+                    # into final_hidden - input_hidden at the last block.
+                    state_input_target.neg_().add_(target[0])
+                    history_target = state_input_target.unsqueeze(0)
+                    state_input_target = None
+                runtime.observe_actual(
+                    run_id,
+                    step_id,
+                    call_id,
+                    history_target,
+                    take_ownership=True,
+                )
+            except torch.cuda.OutOfMemoryError:
+                raise
+            except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+                runtime.fallback_current_step(
+                    run_id,
+                    step_id,
+                    f"SEEDS state-residual actual transform failed: {exc}",
+                )
+                runtime.observe_actual(run_id, step_id, call_id, target)
+        else:
+            runtime.observe_actual(run_id, step_id, call_id, target)
         observed = True
         return output
 
@@ -651,6 +775,39 @@ def diffusion_model_wrapper(
             kwargs,
         )
 
+    if runtime.active_state_residual_mode:
+        try:
+            _apply_exact_state_input_embedding_(
+                predicted,
+                inner,
+                video_x,
+                audio_x,
+                scale=1.0,
+            )
+        except torch.cuda.OutOfMemoryError:
+            raise
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            runtime.fallback_current_step(
+                int(run_id),
+                int(step_id),
+                f"SEEDS state-residual forecast reconstruction failed: {exc}",
+            )
+            return _execute_actual(
+                executor,
+                inner,
+                runtime,
+                int(run_id),
+                int(step_id),
+                call_id,
+                layout,
+                x,
+                timestep,
+                context,
+                options,
+                minimax_payload,
+                kwargs,
+            )
+
     sanitized, event = _sanitize_prediction(predicted, context.dtype)
     if sanitized is None:
         runtime.fallback_current_step(int(run_id), int(step_id), event["reason"] if event else "forecast sanitization failed")
@@ -693,9 +850,12 @@ def diffusion_model_wrapper(
         raise
     if runtime.config.debug:
         LOG.warning(
-            "Spectrum H3 forecast complete run_id=%s step=%s chunks=%s history=%s",
+            "Spectrum H3 forecast complete run_id=%s step=%s stage=%s geometry=%s "
+            "chunks=%s history=%s",
             run_id,
             step_id,
+            runtime.active_stage_index,
+            "state_residual" if runtime.active_state_residual_mode else "absolute_hidden",
             runtime.last_prediction_chunk_count,
             runtime.prediction_history_length,
         )

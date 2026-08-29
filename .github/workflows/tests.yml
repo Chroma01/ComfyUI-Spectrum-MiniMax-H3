@@ -108,6 +108,7 @@ jobs:
             tests/test_continuum_interop.py \
             tests/test_er_sde_solver_dense_output.py \
             tests/test_er_sde_stochastic_compensation.py \
+            tests/test_seeds_deterministic_contract.py \
             tests/test_generic_correction.py \
             tests/test_generic_correction_calibration.py \
             tests/test_generic_correction_core.py \

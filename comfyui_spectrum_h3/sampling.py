@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import inspect
 import logging
+import math
 import sys
 import time
 from dataclasses import dataclass
@@ -54,6 +55,18 @@ SUPPORTED_SINGLE_CALL_SAMPLERS = frozenset(
         "sample_res_multistep_cfg_pp",
     }
 )
+
+SEEDS_SAMPLERS = frozenset({"sample_seeds_2", "sample_seeds_3"})
+SUPPORTED_SAMPLERS = SUPPORTED_SINGLE_CALL_SAMPLERS | SEEDS_SAMPLERS
+SEEDS_STAGE_COUNTS = {"sample_seeds_2": 2, "sample_seeds_3": 3}
+SEEDS_NATIVE_FUNCTION_DIGESTS = {
+    "sample_seeds_2": "e7bcf519718453f77e7ade9b71678c1b593472c8e9b0af142f64f97a9267f383",
+    "sample_seeds_3": "8cb90838a30f6ed0d9ba267f0a16275ce8ec5d65a9a5475f1a10cb573d45ce42",
+}
+SEEDS_TRACKED_OPTIONS = {
+    "sample_seeds_2": frozenset({"eta", "s_noise", "noise_sampler", "r", "solver_type"}),
+    "sample_seeds_3": frozenset({"eta", "s_noise", "noise_sampler", "r_1", "r_2"}),
+}
 
 RES_MULTISTEP_SAMPLERS = frozenset(
     {
@@ -118,7 +131,176 @@ def sampler_name(sampler: Any) -> str:
 
 
 def sampler_is_supported(sampler: Any) -> bool:
-    return sampler_name(sampler) in SUPPORTED_SINGLE_CALL_SAMPLERS
+    return sampler_name(sampler) in SUPPORTED_SAMPLERS
+
+
+def _seeds_expected_model_calls(sampler: Any, sigmas: Any) -> int | None:
+    """Count native SEEDS denoiser calls for the supplied outer sigma schedule."""
+    stage_count = SEEDS_STAGE_COUNTS.get(sampler_name(sampler))
+    if stage_count is None or not torch.is_tensor(sigmas) or sigmas.ndim != 1:
+        return None
+    sigma_values = sigmas.detach().reshape(-1)
+    outer_steps = max(0, int(sigma_values.numel()) - 1)
+    if outer_steps == 0:
+        return 0
+    nonterminal_steps = int(torch.count_nonzero(sigma_values[1:]).item())
+    return outer_steps + (stage_count - 1) * nonterminal_steps
+
+
+def _seeds_prefix_model_calls(
+    sampler: Any,
+    sigmas: Any,
+    outer_prefix: int,
+) -> int | None:
+    """Translate an outer-step prefix contract into SEEDS logical model calls."""
+    if not torch.is_tensor(sigmas) or sigmas.ndim != 1:
+        return None
+    outer_steps = max(0, int(sigmas.numel()) - 1)
+    prefix_steps = min(max(0, int(outer_prefix)), outer_steps)
+    if prefix_steps == 0:
+        return 0
+    return _seeds_expected_model_calls(sampler, sigmas[: prefix_steps + 1])
+
+
+def _seeds_stage_schedule_reason(sigmas: Any) -> str | None:
+    """Validate the native stage lane topology used by stochastic SEEDS forecasting."""
+    if not torch.is_tensor(sigmas) or sigmas.ndim != 1 or sigmas.numel() < 2:
+        return "SEEDS sigma schedule is not a one-dimensional tensor with at least one interval"
+    values = sigmas.detach().reshape(-1)
+    if not bool(torch.isfinite(values).all().item()):
+        return "SEEDS sigma schedule contains nonfinite values"
+    if bool((values[:-1] <= 0).any().item()):
+        return "SEEDS sigma schedule contains a nonpositive pre-terminal sigma"
+    if float(values[-1].item()) < 0.0:
+        return "SEEDS sigma schedule ends at a negative sigma"
+    if bool((values[1:] >= values[:-1]).any().item()):
+        return "SEEDS sigma schedule is not strictly descending"
+    return None
+
+
+def _seeds_option_contract(name: str, options: Any) -> str | None:
+    """Validate the reviewed native SEEDS option and stage surface."""
+    if name not in SEEDS_SAMPLERS:
+        return f"{name!r} is not a reviewed SEEDS sampler"
+    if not isinstance(options, dict):
+        return "SEEDS sampler options are not a dictionary"
+
+    unknown = set(options) - SEEDS_TRACKED_OPTIONS[name]
+    if unknown:
+        return f"SEEDS sampler has unreviewed options: {sorted(unknown)}"
+
+    for option_name, default in (("eta", 1.0), ("s_noise", 1.0)):
+        value = options.get(option_name, default)
+        if isinstance(value, bool):
+            return f"SEEDS {option_name} must be numeric"
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return f"SEEDS {option_name} must be numeric"
+        if not math.isfinite(numeric):
+            return f"SEEDS {option_name} must be finite"
+
+    noise_sampler = options.get("noise_sampler")
+    if noise_sampler is not None and not callable(noise_sampler):
+        return "SEEDS noise_sampler must be callable or None"
+
+    if name == "sample_seeds_2":
+        if options.get("solver_type", "phi_1") not in {"phi_1", "phi_2"}:
+            return "SEEDS-2 solver_type must be 'phi_1' or 'phi_2'"
+        try:
+            r = float(options.get("r", 0.5))
+        except (TypeError, ValueError):
+            return "SEEDS-2 r is not numeric"
+        if not math.isfinite(r) or not 0.0 < r < 1.0:
+            return "SEEDS-2 requires a strictly interior stage coordinate 0 < r < 1"
+    else:
+        try:
+            r_1 = float(options.get("r_1", 1.0 / 3.0))
+            r_2 = float(options.get("r_2", 2.0 / 3.0))
+        except (TypeError, ValueError):
+            return "SEEDS-3 r_1 and r_2 must be numeric"
+        if (
+            not math.isfinite(r_1)
+            or not math.isfinite(r_2)
+            or not 0.0 < r_1 < r_2 < 1.0
+        ):
+            return "SEEDS-3 requires strictly interior ordered stages 0 < r_1 < r_2 < 1"
+    return None
+
+
+def _seeds_is_stochastic(sampler: Any) -> bool:
+    """Return whether native SEEDS is configured to inject stochastic latent state."""
+    options = getattr(sampler, "extra_options", {}) or {}
+    if not isinstance(options, dict):
+        return True
+    try:
+        eta = float(options.get("eta", 1.0))
+        s_noise = float(options.get("s_noise", 1.0))
+    except (TypeError, ValueError):
+        return True
+    if not math.isfinite(eta) or not math.isfinite(s_noise):
+        return True
+    # Native SEEDS multiplies s_noise by model_sampling.noise_scale later.
+    # Treat configured-positive s_noise conservatively as stochastic: a model
+    # with an effective zero noise_scale merely takes the safe native fallback.
+    return eta > 0.0 and s_noise > 0.0
+
+
+def _seeds_sampler_contract(sampler: Any) -> tuple[bool, str | None]:
+    """Validate the reviewed native SEEDS multistage contract."""
+    import comfy.k_diffusion.sampling as native_sampling
+    import comfy.samplers
+
+    name = sampler_name(sampler)
+    if name not in SEEDS_SAMPLERS:
+        return False, f"{name!r} is not a reviewed SEEDS sampler"
+
+    function = getattr(sampler, "sampler_function", None)
+    if function is not getattr(native_sampling, name, None):
+        return False, f"sampler function is not native ComfyUI {name}"
+    if function_ast_digest(function) != SEEDS_NATIVE_FUNCTION_DIGESTS[name]:
+        return False, f"native {name} implementation is not a reviewed revision"
+
+    if type(sampler) is not comfy.samplers.KSAMPLER:
+        return False, "SEEDS sampler object is not native ComfyUI KSAMPLER"
+    if (
+        comfy.samplers.KSAMPLER.__module__ != "comfy.samplers"
+        or comfy.samplers.KSAMPLER.__name__ != "KSAMPLER"
+    ):
+        return False, "native ComfyUI KSAMPLER class provenance is unreviewed"
+    sample_contract = _ksampler_sample_contract(sampler)
+    if not sample_contract.accepted:
+        return False, (
+            f"KSAMPLER.sample contract rejected: {sample_contract.failure}; "
+            f"{sample_contract.provenance.log_fields()}"
+        )
+
+    options = getattr(sampler, "extra_options", {}) or {}
+    option_reason = _seeds_option_contract(name, options)
+    if option_reason is not None:
+        return False, option_reason
+    return True, None
+
+
+def _native_seeds_preflight_reason(
+    sampler: Any,
+    model_options: dict[str, Any] | None,
+) -> str | None:
+    """Fail closed before Spectrum retains any state for a native SEEDS run."""
+    supported, reason = _seeds_sampler_contract(sampler)
+    if not supported:
+        return reason or "native SEEDS contract is unproven"
+
+    import comfy.patcher_extension
+
+    wrappers = comfy.patcher_extension.get_all_wrappers(
+        comfy.patcher_extension.WrappersMP.SAMPLER_SAMPLE,
+        model_options or {},
+        is_model_options=True,
+    )
+    if len(wrappers) != 1 or wrappers[0] is not sampler_sample_wrapper:
+        return "another SAMPLER_SAMPLE wrapper makes SEEDS model-call ordering unproven"
+    return None
 
 
 def _er_sde_noise_scaler_supports_replay(noise_scaler: Any) -> bool:
@@ -164,7 +346,14 @@ def sampler_supports_seeded_replay(sampler: Any) -> bool:
     """Return whether a fresh invocation can reconstruct the sampler's random stream."""
     if not sampler_is_supported(sampler):
         return False
-    if sampler_name(sampler) not in ER_SDE_SAMPLERS:
+
+    name = sampler_name(sampler)
+    if name in SEEDS_SAMPLERS:
+        options = getattr(sampler, "extra_options", {}) or {}
+        if _seeds_option_contract(name, options) is not None:
+            return False
+        return not _seeds_is_stochastic(sampler)
+    if name not in ER_SDE_SAMPLERS:
         return True
 
     options = getattr(sampler, "extra_options", {}) or {}
@@ -362,7 +551,7 @@ def max_consecutive_forecasts(sampler: Any) -> int | None:
 
 
 def min_actual_steps_after_forecast(sampler: Any) -> int:
-    return 1 if sampler_name(sampler) in SUPPORTED_SINGLE_CALL_SAMPLERS else 0
+    return 1 if sampler_name(sampler) in SUPPORTED_SAMPLERS else 0
 
 
 def min_tail_actual_steps(sampler: Any) -> int:
@@ -479,6 +668,48 @@ def outer_sample_wrapper(
 
     runtime = binding.runtime
     name = sampler_name(sampler)
+    expected_model_calls = None
+    if name in SEEDS_SAMPLERS:
+        preflight_reason = _native_seeds_preflight_reason(
+            sampler,
+            getattr(guider, "model_options", None),
+        )
+        if preflight_reason is None:
+            preflight_reason = _seeds_stage_schedule_reason(sigmas)
+        if preflight_reason is not None:
+            LOG.warning(
+                "Spectrum H3 disabled for this SEEDS run; running the untouched "
+                "native sampler: %s",
+                preflight_reason,
+            )
+            return executor(
+                noise,
+                latent_image,
+                sampler,
+                sigmas,
+                denoise_mask,
+                callback,
+                disable_pbar,
+                seed,
+                latent_shapes=latent_shapes,
+            )
+        expected_model_calls = _seeds_expected_model_calls(sampler, sigmas)
+        if expected_model_calls is None:
+            LOG.warning(
+                "Spectrum H3 disabled for this SEEDS run; running the untouched "
+                "native sampler because the model-call topology could not be resolved"
+            )
+            return executor(
+                noise,
+                latent_image,
+                sampler,
+                sigmas,
+                denoise_mask,
+                callback,
+                disable_pbar,
+                seed,
+                latent_shapes=latent_shapes,
+            )
     if name in ER_SDE_SAMPLERS:
         preflight_reason = _native_er_sde_preflight_reason(
             sampler,
@@ -503,9 +734,11 @@ def outer_sample_wrapper(
             )
     continuum_prefix = _continuum_actual_prefix(getattr(guider, "model_options", None))
     continuum_log_emitted = False
+    stochastic_seeds = name in SEEDS_SAMPLERS and _seeds_is_stochastic(sampler)
     profile_eligible = sampler_is_supported(sampler) and (
         not runtime.config.offline_smoothing_replay
         or sampler_supports_seeded_replay(sampler)
+        or stochastic_seeds
     )
     if runtime.config.model_aware_mode != "off" and profile_eligible:
         try:
@@ -554,6 +787,15 @@ def outer_sample_wrapper(
     ):
         nonlocal continuum_log_emitted
         phase_prefix = _continuum_prefix_for_phase(continuum_prefix, phase)
+        if expected_model_calls is not None and not stochastic_seeds:
+            expanded_prefix = _seeds_prefix_model_calls(
+                sampler,
+                run_sigmas,
+                phase_prefix,
+            )
+            if expanded_prefix is None:
+                raise RuntimeError("SEEDS prefix model-call topology became unavailable")
+            phase_prefix = expanded_prefix
         run_id = runtime.start_run(
             run_sigmas,
             name,
@@ -562,6 +804,16 @@ def outer_sample_wrapper(
             min_actual_steps_after_forecast=min_actual_steps_after_forecast(sampler),
             min_tail_actual_steps=min_tail_actual_steps(sampler),
             min_actual_prefix_steps=phase_prefix,
+            expected_model_calls=expected_model_calls,
+            stage_count=SEEDS_STAGE_COUNTS.get(name, 1),
+            stochastic_multistage=stochastic_seeds,
+            separate_stage_histories=False if stochastic_seeds else None,
+            forecastable_stage_indices=(
+                tuple(range(1, SEEDS_STAGE_COUNTS[name]))
+                if stochastic_seeds
+                else None
+            ),
+            model_aware_can_force_actual=not stochastic_seeds,
         )
         if phase_prefix > 0 and runtime.supported_sampler and not continuum_log_emitted:
             LOG.warning(
@@ -576,14 +828,29 @@ def outer_sample_wrapper(
             runtime.disable_experiment(
                 "ER-SDE is reviewed only for ordinary Spectrum and offline smoothing replay"
             )
+        if stochastic_seeds and (
+            runtime.config.anchor_residual_feedback
+            or runtime.config.selective_rollback_correction
+        ):
+            runtime.disable_experiment(
+                "stochastic SEEDS uses stage-lane state-residual forecasting; "
+                "rollback/residual experiments are not reviewed for this geometry"
+            )
         if runtime.config.debug:
             LOG.warning(
-                "Spectrum H3 run start phase=%s run_id=%s sampler=%s steps=%s supported=%s",
+                "Spectrum H3 run start phase=%s run_id=%s sampler=%s steps=%s supported=%s "
+                "seeds_stochastic=%s stage_count=%s feature_geometry=%s stage_histories=%s "
+                "model_aware_force_actual=%s",
                 phase,
                 run_id,
                 name,
                 runtime.stats.total_steps,
                 runtime.supported_sampler,
+                stochastic_seeds,
+                SEEDS_STAGE_COUNTS.get(name, 1),
+                "state_residual_shared_history" if stochastic_seeds else "absolute_hidden",
+                "shared" if stochastic_seeds else "single",
+                not stochastic_seeds,
             )
         started = time.perf_counter()
         try:
@@ -648,6 +915,21 @@ def outer_sample_wrapper(
             latent_shapes=latent_shapes,
         )
     if not sampler_supports_seeded_replay(sampler):
+        if stochastic_seeds:
+            LOG.warning(
+                "Spectrum H3 offline smoothing replay is disabled for stochastic SEEDS "
+                "because replay must not replace its Markov-preserving noise-conditioned "
+                "stage evaluations; running one causal state-residual Spectrum pass"
+            )
+            return execute_run(
+                noise,
+                latent_image,
+                sigmas,
+                denoise_mask,
+                callback,
+                disable_pbar,
+                phase="single_pass_replay_fallback",
+            )
         LOG.warning(
             "Spectrum H3 offline smoothing replay requires ER-SDE's native seeded "
             "noise_sampler and noise_scaler; running one native pass"
@@ -690,11 +972,17 @@ def outer_sample_wrapper(
         _copy_condition_structure(guider.conds) if hasattr(guider, "conds") else None
     )
     offline_steps = max(0, sigmas.numel() - 1)
+    offline_logical_steps = (
+        offline_steps if expected_model_calls is None else expected_model_calls
+    )
     capture_callback, replay_callback, complete_progress = _offline_progress_callbacks(
         callback,
         offline_steps,
     )
-    runtime.begin_offline_capture(total_steps=offline_steps, sampler_name=name)
+    runtime.begin_offline_capture(
+        total_steps=offline_logical_steps,
+        sampler_name=name,
+    )
     try:
         first_result = execute_run(
             noise,

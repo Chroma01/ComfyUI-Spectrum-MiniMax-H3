@@ -4,6 +4,7 @@ import pytest
 import torch
 
 from comfyui_spectrum_h3.config import SpectrumH3Config
+from comfyui_spectrum_h3.model_aware import ModelForecastabilityProfile, ProfileLookup
 from comfyui_spectrum_h3.runtime import ForecastRetryActual, SpectrumH3Runtime
 
 TOPOLOGY = (
@@ -14,6 +15,33 @@ TOPOLOGY = (
     ("target_video_rows", 2),
 )
 LABEL = ((0, "positive"),)
+
+
+def _test_model_profile() -> ModelForecastabilityProfile:
+    return ModelForecastabilityProfile(
+        cache_key=("test",),
+        base_model_identity="test",
+        patch_identity="test",
+        active_patch_count=0,
+        active_patch_keys=0,
+        recognized_lora_count=0,
+        unknown_patch_count=0,
+        sampled_base_tensors=1,
+        profile_confidence=1.0,
+        aggregate_sensitivity=0.2,
+        patch_perturbation=0.0,
+        final_block_perturbation=0.0,
+        audio_sensitivity=1.0,
+        video_sensitivity=1.0,
+        audio_head_weight=None,
+        video_head_weight=None,
+        audio_head_gram_diagonal=None,
+        video_head_gram_diagonal=None,
+        forecast_risk_prior=0.2,
+        build_seconds=0.0,
+        estimated_bytes=0,
+        transient_workspace_bytes=0,
+    )
 
 
 def _runtime(**overrides):
@@ -121,6 +149,362 @@ def test_model_aware_off_never_enters_controller_and_keeps_legacy_forecast_path(
     assert runtime.stats.model_aware_decision_seconds == 0.0
     assert runtime.stats.model_aware_correction_seconds == 0.0
     runtime.end_run(run_id)
+
+
+def test_stochastic_seeds_uses_independent_stage_forecast_histories():
+    runtime = _runtime(
+        model_aware_mode="off",
+        warmup_steps=0,
+        tail_actual_steps=0,
+        bootstrap_first_forecast=False,
+        window_size=2.0,
+        flex_window=0.0,
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.7, 0.4, 0.0]),
+        "sample_seeds_2",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=0,
+        expected_model_calls=5,
+        stage_count=2,
+        stochastic_multistage=True,
+    )
+
+    decisions = []
+    for timestep, feature_value in (
+        (1.0, 0.0),
+        (0.85, 100.0),
+        (0.7, 2.0),
+        (0.55, 102.0),
+    ):
+        decision = runtime.begin_step(torch.tensor([timestep]))
+        decisions.append(decision)
+        assert decision["actual"]
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=TOPOLOGY,
+            labels=LABEL,
+            expected_shape=(1, 3, 4),
+        )
+        assert actual
+        runtime.observe_actual(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            torch.full((1, 3, 4), feature_value),
+        )
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    assert [decision["step_id"] for decision in decisions] == [0, 1, 2, 3]
+    assert runtime._stage_forecasters[0].history_length == 2
+    assert runtime._stage_forecasters[1].history_length == 2
+
+    forecast = runtime.begin_step(torch.tensor([0.4]))
+    assert forecast["step_id"] == 4
+    assert runtime.active_stage_index == 0
+    assert runtime.active_state_residual_mode is True
+    assert forecast["actual"] is False
+    call_id, actual = runtime.begin_model_call(
+        forecast["run_id"],
+        forecast["step_id"],
+        topology=TOPOLOGY,
+        labels=LABEL,
+        expected_shape=(1, 3, 4),
+    )
+    assert not actual
+    prediction = runtime.predict(
+        forecast["run_id"],
+        forecast["step_id"],
+        call_id,
+        device=torch.device("cpu"),
+        dtype=torch.float32,
+    )
+    assert prediction is not None
+    assert float(prediction.abs().max()) < 20.0
+    runtime.finalize_step(forecast["run_id"], forecast["step_id"])
+    runtime.end_run(run_id)
+
+
+def test_stochastic_multistage_disables_one_point_bootstrap_per_stage_lane():
+    runtime = _runtime(
+        model_aware_mode="off",
+        warmup_steps=1,
+        tail_actual_steps=0,
+        bootstrap_first_forecast=True,
+        window_size=2.0,
+        flex_window=0.0,
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.7, 0.4, 0.0]),
+        "sample_seeds_2",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+        expected_model_calls=5,
+        stage_count=2,
+        stochastic_multistage=True,
+    )
+
+    first = _complete_step(runtime, 1.0)
+    second = _complete_step(runtime, 0.9)
+    third = _complete_step(runtime, 0.7)
+    fourth = _complete_step(runtime, 0.6)
+
+    assert first["actual"] and second["actual"]
+    assert third["actual"] and fourth["actual"]
+    assert third["reason"] == "insufficient actual history"
+    assert fourth["reason"] == "insufficient actual history"
+    assert "bootstrap" not in third["reason"]
+    assert "bootstrap" not in fourth["reason"]
+    assert runtime._stage_forecasters[0].history_length == 2
+    assert runtime._stage_forecasters[1].history_length == 2
+    runtime.end_run(run_id)
+
+
+def test_stochastic_multistage_requires_actual_refresh_in_the_same_lane():
+    runtime = _runtime(
+        model_aware_mode="off",
+        warmup_steps=0,
+        tail_actual_steps=0,
+        bootstrap_first_forecast=False,
+        window_size=2.0,
+        flex_window=0.0,
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0]),
+        "sample_seeds_2",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=0,
+        expected_model_calls=9,
+        stage_count=2,
+        stochastic_multistage=True,
+    )
+
+    decisions = [
+        _complete_step(runtime, timestep)
+        for timestep in (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2)
+    ]
+
+    # Two anchors per lane are required before the first forecast. A forecast in
+    # lane 0 cannot be "refreshed" by an actual evaluation in lane 1: lane 0's
+    # next occurrence is forced actual before it may forecast again. The same
+    # invariant applies symmetrically to lane 1.
+    assert [decision["actual"] for decision in decisions[:4]] == [True, True, True, True]
+    assert decisions[4]["actual"] is False
+    assert decisions[4]["step_id"] == 4
+    assert decisions[5]["actual"] is True
+    assert decisions[6]["actual"] is True
+    assert decisions[6]["reason"] == "post-forecast stage-lane refresh"
+    assert decisions[7]["actual"] is False
+    assert decisions[8]["actual"] is True
+    assert runtime._stage_required_actual_refreshes[0] == 0
+    assert runtime._stage_required_actual_refreshes[1] == 1
+    runtime.end_run(run_id)
+
+
+def test_stochastic_seeds_protects_outer_stage_and_forecasts_internal_stage_only():
+    runtime = _runtime(
+        model_aware_mode="off",
+        warmup_steps=0,
+        tail_actual_steps=0,
+        bootstrap_first_forecast=False,
+        window_size=2.0,
+        flex_window=0.0,
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0]),
+        "sample_seeds_2",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=0,
+        expected_model_calls=9,
+        stage_count=2,
+        stochastic_multistage=True,
+        forecastable_stage_indices=(1,),
+    )
+
+    decisions = [
+        _complete_step(runtime, timestep)
+        for timestep in (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2)
+    ]
+
+    stage0 = decisions[0::2]
+    stage1 = decisions[1::2]
+    assert all(decision["actual"] for decision in stage0)
+    assert all(
+        decision["reason"] == "sampler-required exact stage"
+        for decision in stage0[2:]
+    )
+    assert [decision["actual"] for decision in stage1] == [True, True, False, True]
+    assert stage1[2]["reason"] == "adaptive forecast"
+    assert stage1[3]["reason"] == "post-forecast stage-lane refresh"
+    runtime.end_run(run_id)
+
+
+def test_stochastic_seeds_shared_history_uses_exact_outer_anchors_without_lane_refresh():
+    runtime = _runtime(
+        model_aware_mode="schedule_confidence",
+        model_aware_risk_threshold=0.0,
+        warmup_steps=0,
+        tail_actual_steps=0,
+        bootstrap_first_forecast=False,
+        window_size=2.0,
+        flex_window=0.0,
+    )
+    runtime.set_model_profile(
+        ProfileLookup(
+            profile=_test_model_profile(),
+            cache_hit=False,
+            lookup_seconds=0.0,
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0]),
+        "sample_seeds_2",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+        expected_model_calls=9,
+        stage_count=2,
+        stochastic_multistage=True,
+        separate_stage_histories=False,
+        forecastable_stage_indices=(1,),
+        model_aware_can_force_actual=False,
+    )
+
+    decisions = [
+        _complete_step(runtime, timestep)
+        for timestep in (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2)
+    ]
+
+    stage0 = decisions[0::2]
+    stage1 = decisions[1::2]
+
+    assert all(decision["actual"] for decision in stage0)
+    assert [decision["actual"] for decision in stage1] == [True, False, False, False]
+    assert all(
+        decision["reason"] == "adaptive forecast"
+        for decision in stage1[1:]
+    )
+    assert runtime._run is not None
+    assert runtime._run.separate_stage_histories is False
+    assert runtime._stage_forecasters == {}
+    assert runtime._stage_required_actual_refreshes == {}
+    assert runtime.forecaster is runtime._primary_forecaster
+    # Exact stage-0 calls continuously refresh the one shared residual history.
+    assert runtime.forecaster.history_length == 4
+    assert runtime.stats.actual_steps == 6
+    assert runtime.stats.forecast_steps == 3
+    # The deliberately zero risk threshold requests an actual on every
+    # forecast candidate. Stochastic SEEDS keeps that signal as telemetry and
+    # confidence/blend input, but the outer-stage safety policy owns the NFE
+    # decision for internal stages.
+    assert runtime.stats.model_aware_veto_suppressed == 3
+    assert runtime.stats.model_aware_forecasts == 3
+    runtime.end_run(run_id)
+
+
+def test_forecastable_stage_indices_validation():
+    runtime = _runtime(force_actual=True)
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+
+    with pytest.raises(ValueError, match="duplicates"):
+        runtime.start_run(
+            sigmas,
+            "sample_seeds_2",
+            supported_sampler=True,
+            expected_model_calls=3,
+            stage_count=2,
+            stochastic_multistage=True,
+            forecastable_stage_indices=(1, 1),
+        )
+
+    with pytest.raises(ValueError, match="within"):
+        runtime.start_run(
+            sigmas,
+            "sample_seeds_2",
+            supported_sampler=True,
+            expected_model_calls=3,
+            stage_count=2,
+            stochastic_multistage=True,
+            forecastable_stage_indices=(2,),
+        )
+
+
+def test_stochastic_seeds_3_stage_lane_indexing_matches_native_call_order():
+    runtime = _runtime(
+        model_aware_mode="off",
+        force_actual=True,
+        warmup_steps=0,
+        tail_actual_steps=0,
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_seeds_3",
+        supported_sampler=True,
+        expected_model_calls=4,
+        stage_count=3,
+        stochastic_multistage=True,
+    )
+
+    observed_stages = []
+    for timestep in (1.0, 0.8, 0.6, 0.5):
+        decision = runtime.begin_step(torch.tensor([timestep]))
+        observed_stages.append(runtime.active_stage_index)
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=TOPOLOGY,
+            labels=LABEL,
+            expected_shape=(1, 3, 4),
+        )
+        assert actual
+        runtime.observe_actual(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            torch.zeros((1, 3, 4)),
+        )
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    assert observed_stages == [0, 1, 2, 0]
+    assert runtime._stage_forecasters[0].history_length == 2
+    assert runtime._stage_forecasters[1].history_length == 1
+    assert runtime._stage_forecasters[2].history_length == 1
+    runtime.end_run(run_id)
+
+
+def test_runtime_accepts_expanded_model_call_count_for_multistage_sampler():
+    runtime = _runtime(force_actual=True)
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_seeds_2",
+        supported_sampler=True,
+        expected_model_calls=3,
+    )
+
+    for timestep in (1.0, 0.75, 0.5):
+        _complete_step(runtime, timestep)
+
+    assert runtime.stats.total_steps == 3
+    with pytest.raises(RuntimeError, match="predict_noise call count exceeded"):
+        runtime.begin_step(torch.tensor([0.25]))
+    runtime.end_run(run_id)
+
+
+def test_runtime_rejects_model_call_count_smaller_than_sigma_interval_count():
+    runtime = _runtime(force_actual=True)
+
+    with pytest.raises(ValueError, match="expected_model_calls"):
+        runtime.start_run(
+            torch.tensor([1.0, 0.75, 0.5, 0.0]),
+            "sample_seeds_2",
+            supported_sampler=True,
+            expected_model_calls=2,
+        )
 
 
 def test_preliminary_runtime_defaults():

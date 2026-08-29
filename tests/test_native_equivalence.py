@@ -78,6 +78,34 @@ def _tiny_model():
     return model, block
 
 
+def _tiny_state_residual_model():
+    _, MiniMaxH3Model, _ = _native_imports()
+    torch.manual_seed(37)
+    model = MiniMaxH3Model(
+        hidden_size=8,
+        num_layers=2,
+        token_refiner_num_layers=1,
+        num_attention_heads=1,
+        attention_head_dim=8,
+        ffn_hidden_size=16,
+        latents_dim=2,
+        audio_latents_dim=2,
+        patch_size=(1, 2, 2),
+        text_dim=8,
+        timestep_input_dim=4,
+        time_embed_hidden_size=8,
+        time_embed_dim=4,
+        rope_inv_freq_len=1,
+        dtype=torch.float32,
+        device=torch.device("cpu"),
+        operations=torch.nn,
+    )
+    blocks = [_CountingBlock(), _CountingBlock()]
+    model.blocks[0] = blocks[0]
+    model.blocks[1] = blocks[1]
+    return model, blocks
+
+
 def _inputs(PackedLayout):
     video = torch.randn(1, 2, 1, 4, 4)
     audio = torch.randn(1, 2, 2, 3)
@@ -131,6 +159,75 @@ def _wrapped_call(model, runtime, sigma, model_timestep, x, context, payload, la
     output = executor.execute(x, torch.tensor([model_timestep]), context, options, minimax_payload=payload)
     runtime.finalize_step(decision["run_id"], decision["step_id"])
     return output, decision
+
+
+def test_stochastic_seeds_state_residual_forecast_uses_exact_current_input_and_skips_blocks():
+    _, _, PackedLayout = _native_imports()
+    model, blocks = _tiny_state_residual_model()
+    base_x, context, payload = _inputs(PackedLayout)
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            model_aware_mode="off",
+            warmup_steps=0,
+            tail_actual_steps=0,
+            bootstrap_first_forecast=False,
+            window_size=2.0,
+            flex_window=0.0,
+            offline_smoothing_replay=False,
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.7, 0.4, 0.0]),
+        "sample_seeds_2",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=0,
+        expected_model_calls=5,
+        stage_count=2,
+        stochastic_multistage=True,
+    )
+
+    for index, sigma in enumerate((1.0, 0.85, 0.7, 0.55)):
+        x = [
+            base_x[0] + 0.05 * index,
+            base_x[1] - 0.03 * index,
+        ]
+        output, decision = _wrapped_call(
+            model,
+            runtime,
+            sigma,
+            sigma * 1000.0,
+            x,
+            context,
+            payload,
+        )
+        assert decision["actual"]
+        assert all(torch.isfinite(part).all() for part in output)
+
+    calls_before_forecast = [block.calls for block in blocks]
+    forecast_x = [
+        base_x[0] + 0.4,
+        base_x[1] - 0.2,
+    ]
+    output, decision = _wrapped_call(
+        model,
+        runtime,
+        0.4,
+        400.0,
+        forecast_x,
+        context,
+        payload,
+    )
+
+    assert decision["actual"] is False
+    assert runtime.active_stage_index == 0
+    assert [block.calls for block in blocks] == calls_before_forecast
+    assert all(torch.isfinite(part).all() for part in output)
+    assert runtime.stats.actual_transformer_calls == 4
+    assert runtime.stats.forecast_model_calls == 1
+    runtime.end_run(run_id)
 
 
 def test_forced_actual_wrapper_is_native_equivalent_and_does_not_mutate_options():
