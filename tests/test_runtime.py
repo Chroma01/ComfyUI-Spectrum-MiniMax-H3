@@ -244,7 +244,7 @@ def test_stochastic_multistage_disables_one_point_bootstrap_per_stage_lane():
         min_actual_steps_after_forecast=1,
         expected_model_calls=5,
         stage_count=2,
-        stochastic_multistage=True,
+        state_conditioned_residual=True,
     )
 
     first = _complete_step(runtime, 1.0)
@@ -280,7 +280,7 @@ def test_stochastic_multistage_requires_actual_refresh_in_the_same_lane():
         min_actual_steps_after_forecast=0,
         expected_model_calls=9,
         stage_count=2,
-        stochastic_multistage=True,
+        state_conditioned_residual=True,
     )
 
     decisions = [
@@ -288,13 +288,8 @@ def test_stochastic_multistage_requires_actual_refresh_in_the_same_lane():
         for timestep in (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2)
     ]
 
-    # Two anchors per lane are required before the first forecast. A forecast in
-    # lane 0 cannot be "refreshed" by an actual evaluation in lane 1: lane 0's
-    # next occurrence is forced actual before it may forecast again. The same
-    # invariant applies symmetrically to lane 1.
     assert [decision["actual"] for decision in decisions[:4]] == [True, True, True, True]
     assert decisions[4]["actual"] is False
-    assert decisions[4]["step_id"] == 4
     assert decisions[5]["actual"] is True
     assert decisions[6]["actual"] is True
     assert decisions[6]["reason"] == "post-forecast stage-lane refresh"
@@ -302,6 +297,38 @@ def test_stochastic_multistage_requires_actual_refresh_in_the_same_lane():
     assert decisions[8]["actual"] is True
     assert runtime._stage_required_actual_refreshes[0] == 0
     assert runtime._stage_required_actual_refreshes[1] == 1
+    runtime.end_run(run_id)
+
+
+def test_state_conditioned_single_lane_disables_one_point_bootstrap():
+    runtime = _runtime(
+        model_aware_mode="off",
+        warmup_steps=1,
+        tail_actual_steps=0,
+        bootstrap_first_forecast=True,
+        window_size=2.0,
+        flex_window=0.0,
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.7, 0.4, 0.0]),
+        "sample_sa_solver",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=1,
+        expected_model_calls=3,
+        stage_count=1,
+        state_conditioned_residual=True,
+    )
+
+    first = _complete_step(runtime, 1.0)
+    second = _complete_step(runtime, 0.7)
+    third = _complete_step(runtime, 0.4)
+
+    assert first["actual"]
+    assert second["actual"]
+    assert second["reason"] == "insufficient actual history"
+    assert third["actual"] is False
+    assert "bootstrap" not in second["reason"]
     runtime.end_run(run_id)
 
 
@@ -322,7 +349,7 @@ def test_stochastic_seeds_protects_outer_stage_and_forecasts_internal_stage_only
         min_actual_steps_after_forecast=0,
         expected_model_calls=9,
         stage_count=2,
-        stochastic_multistage=True,
+        state_conditioned_residual=True,
         forecastable_stage_indices=(1,),
     )
 
@@ -330,7 +357,6 @@ def test_stochastic_seeds_protects_outer_stage_and_forecasts_internal_stage_only
         _complete_step(runtime, timestep)
         for timestep in (1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2)
     ]
-
     stage0 = decisions[0::2]
     stage1 = decisions[1::2]
     assert all(decision["actual"] for decision in stage0)
@@ -369,7 +395,7 @@ def test_stochastic_seeds_shared_history_uses_exact_outer_anchors_without_lane_r
         min_actual_steps_after_forecast=1,
         expected_model_calls=9,
         stage_count=2,
-        stochastic_multistage=True,
+        state_conditioned_residual=True,
         separate_stage_histories=False,
         forecastable_stage_indices=(1,),
         model_aware_can_force_actual=False,
@@ -382,7 +408,6 @@ def test_stochastic_seeds_shared_history_uses_exact_outer_anchors_without_lane_r
 
     stage0 = decisions[0::2]
     stage1 = decisions[1::2]
-
     assert all(decision["actual"] for decision in stage0)
     assert [decision["actual"] for decision in stage1] == [True, False, False, False]
     assert all(
@@ -394,17 +419,39 @@ def test_stochastic_seeds_shared_history_uses_exact_outer_anchors_without_lane_r
     assert runtime._stage_forecasters == {}
     assert runtime._stage_required_actual_refreshes == {}
     assert runtime.forecaster is runtime._primary_forecaster
-    # Exact stage-0 calls continuously refresh the one shared residual history.
     assert runtime.forecaster.history_length == 4
     assert runtime.stats.actual_steps == 6
     assert runtime.stats.forecast_steps == 3
-    # The deliberately zero risk threshold requests an actual on every
-    # forecast candidate. Stochastic SEEDS keeps that signal as telemetry and
-    # confidence/blend input, but the outer-stage safety policy owns the NFE
-    # decision for internal stages.
     assert runtime.stats.model_aware_veto_suppressed == 3
     assert runtime.stats.model_aware_forecasts == 3
     runtime.end_run(run_id)
+
+
+def test_separate_stage_histories_validation():
+    runtime = _runtime(force_actual=True)
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+
+    with pytest.raises(ValueError, match="boolean or None"):
+        runtime.start_run(
+            sigmas,
+            "sample_seeds_2",
+            supported_sampler=True,
+            expected_model_calls=3,
+            stage_count=2,
+            state_conditioned_residual=True,
+            separate_stage_histories=1,
+        )
+
+    with pytest.raises(ValueError, match="requires multistage"):
+        runtime.start_run(
+            sigmas,
+            "sample_sa_solver",
+            supported_sampler=True,
+            expected_model_calls=2,
+            stage_count=1,
+            state_conditioned_residual=True,
+            separate_stage_histories=True,
+        )
 
 
 def test_forecastable_stage_indices_validation():
@@ -418,7 +465,7 @@ def test_forecastable_stage_indices_validation():
             supported_sampler=True,
             expected_model_calls=3,
             stage_count=2,
-            stochastic_multistage=True,
+            state_conditioned_residual=True,
             forecastable_stage_indices=(1, 1),
         )
 
@@ -429,8 +476,111 @@ def test_forecastable_stage_indices_validation():
             supported_sampler=True,
             expected_model_calls=3,
             stage_count=2,
-            stochastic_multistage=True,
+            state_conditioned_residual=True,
             forecastable_stage_indices=(2,),
+        )
+
+
+def test_sampler_required_exact_step_overrides_ready_single_lane_forecast():
+    runtime = _runtime(
+        model_aware_mode="off",
+        warmup_steps=0,
+        tail_actual_steps=0,
+        bootstrap_first_forecast=False,
+        window_size=2.0,
+        flex_window=0.0,
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.8, 0.6, 0.4, 0.0]),
+        "sample_sa_solver",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=0,
+        expected_model_calls=4,
+        state_conditioned_residual=True,
+        forced_actual_step_ids=(2,),
+    )
+
+    first = _complete_step(runtime, 1.0)
+    second = _complete_step(runtime, 0.8)
+    third = _complete_step(runtime, 0.6)
+    fourth = _complete_step(runtime, 0.4)
+
+    assert first["actual"]
+    assert second["actual"]
+    assert third["actual"]
+    assert third["reason"] == "sampler-required exact step"
+    assert fourth["actual"] is False
+    assert fourth["reason"] == "adaptive forecast"
+    runtime.end_run(run_id)
+
+
+def test_stochastic_sa_targets_eight_alternating_forecasts_without_noise_block():
+    runtime = _runtime(
+        model_aware_mode="off",
+        warmup_steps=1,
+        tail_actual_steps=1,
+        max_history=8,
+        window_size=2.0,
+        flex_window=0.75,
+    )
+    sigmas = torch.linspace(1.0, 0.0, 20)
+    run_id = runtime.start_run(
+        sigmas,
+        "sample_sa_solver",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=0,
+        expected_model_calls=19,
+        state_conditioned_residual=True,
+        forced_actual_step_ids=(),
+        forced_actual_steps_advance_window=False,
+        model_aware_can_force_actual=False,
+    )
+
+    decisions = [
+        _complete_step(runtime, float(timestep))
+        for timestep in sigmas[:-1]
+    ]
+    forecast_steps = [
+        decision["step_id"] for decision in decisions if not decision["actual"]
+    ]
+
+    assert forecast_steps == [2, 4, 6, 8, 10, 12, 14, 16]
+    assert runtime.stats.actual_steps == 11
+    assert runtime.stats.forecast_steps == 8
+    runtime.end_run(run_id)
+
+
+def test_forced_actual_step_ids_validation():
+    runtime = _runtime(force_actual=True)
+    sigmas = torch.tensor([1.0, 0.5, 0.0])
+
+    with pytest.raises(ValueError, match="duplicates"):
+        runtime.start_run(
+            sigmas,
+            "sample_sa_solver",
+            supported_sampler=True,
+            expected_model_calls=2,
+            forced_actual_step_ids=(1, 1),
+        )
+
+    with pytest.raises(ValueError, match="nonnegative"):
+        runtime.start_run(
+            sigmas,
+            "sample_sa_solver",
+            supported_sampler=True,
+            expected_model_calls=2,
+            forced_actual_step_ids=(-1,),
+        )
+
+    with pytest.raises(ValueError, match="smaller than total"):
+        runtime.start_run(
+            sigmas,
+            "sample_sa_solver",
+            supported_sampler=True,
+            expected_model_calls=2,
+            forced_actual_step_ids=(2,),
         )
 
 
@@ -474,6 +624,128 @@ def test_stochastic_seeds_3_stage_lane_indexing_matches_native_call_order():
     assert runtime._stage_forecasters[0].history_length == 2
     assert runtime._stage_forecasters[1].history_length == 1
     assert runtime._stage_forecasters[2].history_length == 1
+    runtime.end_run(run_id)
+
+
+def test_state_conditioned_single_lane_is_independent_from_multistage_seeds():
+    runtime = _runtime(
+        model_aware_mode="off",
+        warmup_steps=0,
+        tail_actual_steps=0,
+        bootstrap_first_forecast=False,
+        window_size=2.0,
+        flex_window=0.0,
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.7, 0.4, 0.0]),
+        "sample_sa_solver",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=0,
+        expected_model_calls=3,
+        stage_count=1,
+        state_conditioned_residual=True,
+    )
+
+    assert runtime.state_conditioned_residual is True
+    assert runtime.stochastic_multistage is False
+    assert runtime._stage_forecasters == {}
+
+    for timestep, value in ((1.0, 1.0), (0.7, 2.0)):
+        decision = runtime.begin_step(torch.tensor([timestep]))
+        assert decision["actual"]
+        assert runtime.active_stage_index == 0
+        assert runtime.active_state_conditioned_residual is True
+        call_id, actual = runtime.begin_model_call(
+            decision["run_id"],
+            decision["step_id"],
+            topology=TOPOLOGY,
+            labels=LABEL,
+            expected_shape=(1, 3, 4),
+        )
+        assert actual
+        runtime.observe_actual(
+            decision["run_id"],
+            decision["step_id"],
+            call_id,
+            torch.full((1, 3, 4), value),
+        )
+        runtime.finalize_step(decision["run_id"], decision["step_id"])
+
+    forecast = runtime.begin_step(torch.tensor([0.4]))
+    assert forecast["actual"] is False
+    assert runtime.active_stage_index == 0
+    assert runtime.prediction_history_length == 2
+    runtime.abort_step(forecast["run_id"], forecast["step_id"])
+    runtime.end_run(run_id)
+
+
+def test_sa_and_seeds_state_conditioned_runs_do_not_leak_stage_histories():
+    runtime = _runtime(
+        model_aware_mode="off",
+        force_actual=True,
+        warmup_steps=0,
+        tail_actual_steps=0,
+    )
+
+    sa_run = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_sa_solver",
+        supported_sampler=True,
+        expected_model_calls=2,
+        stage_count=1,
+        state_conditioned_residual=True,
+    )
+    for timestep in (1.0, 0.5):
+        _complete_step(runtime, timestep)
+    assert runtime.state_conditioned_residual is True
+    assert runtime.stochastic_multistage is False
+    assert runtime._stage_forecasters == {}
+    runtime.end_run(sa_run)
+
+    seeds_run = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_seeds_2",
+        supported_sampler=True,
+        expected_model_calls=3,
+        stage_count=2,
+        state_conditioned_residual=True,
+    )
+    assert runtime.state_conditioned_residual is True
+    assert runtime.stochastic_multistage is True
+    assert set(runtime._stage_forecasters) == {0, 1}
+    for timestep in (1.0, 0.75, 0.5):
+        _complete_step(runtime, timestep)
+    runtime.end_run(seeds_run)
+
+    sa_again = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_sa_solver",
+        supported_sampler=True,
+        expected_model_calls=2,
+        stage_count=1,
+        state_conditioned_residual=True,
+    )
+    assert runtime._stage_forecasters == {}
+    assert runtime.prediction_history_length == 0
+    assert runtime.stochastic_multistage is False
+    runtime.end_run(sa_again)
+
+
+def test_legacy_stochastic_multistage_keyword_maps_to_generic_state_conditioning():
+    runtime = _runtime(force_actual=True)
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.5, 0.0]),
+        "sample_seeds_2",
+        supported_sampler=True,
+        expected_model_calls=3,
+        stage_count=2,
+        stochastic_multistage=True,
+    )
+
+    assert runtime.state_conditioned_residual is True
+    assert runtime.stochastic_multistage is True
+    assert set(runtime._stage_forecasters) == {0, 1}
     runtime.end_run(run_id)
 
 

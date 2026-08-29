@@ -230,9 +230,11 @@ class _RunState:
     total_steps: int
     policy_steps: int
     stage_count: int
-    stochastic_multistage: bool
+    state_conditioned_residual: bool
     separate_stage_histories: bool
     forecastable_stage_indices: tuple[int, ...] | None
+    forced_actual_step_ids: frozenset[int]
+    forced_actual_steps_advance_window: bool
     model_aware_can_force_actual: bool
     sigma_min: float
     sigma_max: float
@@ -331,12 +333,26 @@ class SpectrumH3Runtime:
         return 0 if self._step is None else self._step.stage_index
 
     @property
-    def active_state_residual_mode(self) -> bool:
+    def active_state_conditioned_residual(self) -> bool:
         return bool(self._step is not None and self._step.state_residual_mode)
 
     @property
+    def active_state_residual_mode(self) -> bool:
+        """Backward-compatible alias for the generalized state-conditioned geometry."""
+        return self.active_state_conditioned_residual
+
+    @property
+    def state_conditioned_residual(self) -> bool:
+        return bool(self._run is not None and self._run.state_conditioned_residual)
+
+    @property
     def stochastic_multistage(self) -> bool:
-        return bool(self._run is not None and self._run.stochastic_multistage)
+        """Compatibility view used by SEEDS-specific diagnostics/tests."""
+        return bool(
+            self._run is not None
+            and self._run.state_conditioned_residual
+            and self._run.stage_count > 1
+        )
 
     @property
     def supported_sampler(self) -> bool:
@@ -686,9 +702,12 @@ class SpectrumH3Runtime:
         min_actual_prefix_steps: int = 0,
         expected_model_calls: int | None = None,
         stage_count: int = 1,
-        stochastic_multistage: bool = False,
+        state_conditioned_residual: bool = False,
+        stochastic_multistage: bool | None = None,
         separate_stage_histories: bool | None = None,
         forecastable_stage_indices: tuple[int, ...] | None = None,
+        forced_actual_step_ids: tuple[int, ...] | None = None,
+        forced_actual_steps_advance_window: bool = False,
         model_aware_can_force_actual: bool = True,
     ) -> int:
         if self._run is not None:
@@ -708,20 +727,31 @@ class SpectrumH3Runtime:
                 raise ValueError(f"{name} must be an integer >= 0")
         if isinstance(stage_count, bool) or not isinstance(stage_count, int) or stage_count < 1:
             raise ValueError("stage_count must be an integer >= 1")
-        if stochastic_multistage and stage_count < 2:
-            raise ValueError("stochastic_multistage requires stage_count >= 2")
+        if type(state_conditioned_residual) is not bool:
+            raise ValueError("state_conditioned_residual must be boolean")
+        if type(forced_actual_steps_advance_window) is not bool:
+            raise ValueError("forced_actual_steps_advance_window must be boolean")
         if type(model_aware_can_force_actual) is not bool:
             raise ValueError("model_aware_can_force_actual must be boolean")
+        if stochastic_multistage is not None:
+            if type(stochastic_multistage) is not bool:
+                raise ValueError("stochastic_multistage must be boolean or None")
+            if stochastic_multistage:
+                if stage_count < 2:
+                    raise ValueError("stochastic_multistage requires stage_count >= 2")
+                state_conditioned_residual = True
         if separate_stage_histories is not None and type(separate_stage_histories) is not bool:
             raise ValueError("separate_stage_histories must be boolean or None")
         resolved_stage_histories = (
-            bool(stochastic_multistage)
+            bool(state_conditioned_residual and stage_count > 1)
             if separate_stage_histories is None
             else bool(separate_stage_histories)
         )
-        if resolved_stage_histories and not stochastic_multistage:
+        if resolved_stage_histories and (
+            not state_conditioned_residual or stage_count < 2
+        ):
             raise ValueError(
-                "separate_stage_histories requires stochastic_multistage"
+                "separate_stage_histories requires multistage state-conditioned residual mode"
             )
         if forecastable_stage_indices is not None:
             normalized_forecastable_stages = tuple(forecastable_stage_indices)
@@ -740,6 +770,21 @@ class SpectrumH3Runtime:
                 )
         else:
             normalized_forecastable_stages = None
+        if forced_actual_step_ids is not None:
+            normalized_forced_actual_steps = tuple(forced_actual_step_ids)
+            if len(set(normalized_forced_actual_steps)) != len(normalized_forced_actual_steps):
+                raise ValueError("forced_actual_step_ids must not contain duplicates")
+            if any(
+                isinstance(index, bool)
+                or not isinstance(index, int)
+                or index < 0
+                for index in normalized_forced_actual_steps
+            ):
+                raise ValueError(
+                    "forced_actual_step_ids entries must be nonnegative integer step indices"
+                )
+        else:
+            normalized_forced_actual_steps = ()
         sigma_values = _as_cpu_float64_vector(sigmas)
         schedule_steps = max(0, sigma_values.numel() - 1)
         if expected_model_calls is not None:
@@ -754,6 +799,10 @@ class SpectrumH3Runtime:
             total_steps = expected_model_calls
         else:
             total_steps = schedule_steps
+        if any(index >= total_steps for index in normalized_forced_actual_steps):
+            raise ValueError(
+                "forced_actual_step_ids entries must be smaller than total model-call count"
+            )
         evaluated = sigma_values[:-1]
         finite_schedule = bool(evaluated.numel()) and bool(torch.isfinite(evaluated).all().item())
         sigma_min = float(evaluated.min().item()) if finite_schedule else 0.0
@@ -770,9 +819,11 @@ class SpectrumH3Runtime:
             total_steps=total_steps,
             policy_steps=schedule_steps,
             stage_count=stage_count,
-            stochastic_multistage=bool(stochastic_multistage),
+            state_conditioned_residual=bool(state_conditioned_residual),
             separate_stage_histories=resolved_stage_histories,
             forecastable_stage_indices=normalized_forecastable_stages,
+            forced_actual_step_ids=frozenset(normalized_forced_actual_steps),
+            forced_actual_steps_advance_window=forced_actual_steps_advance_window,
             model_aware_can_force_actual=model_aware_can_force_actual,
             sigma_min=sigma_min,
             sigma_max=sigma_max,
@@ -782,7 +833,9 @@ class SpectrumH3Runtime:
             min_tail_actual_steps=min_tail_actual_steps,
             min_actual_prefix_steps=min(
                 min_actual_prefix_steps,
-                schedule_steps if stochastic_multistage else total_steps,
+                schedule_steps
+                if state_conditioned_residual and stage_count > 1
+                else total_steps,
             ),
         )
         self._step = None
@@ -1020,10 +1073,11 @@ class SpectrumH3Runtime:
         if step_id >= self._run.total_steps:
             raise RuntimeError("predict_noise call count exceeded the supplied sigma schedule")
         coordinate = self.coordinate_for_timestep(timestep)
+        use_multistage_topology = (
+            self._run.state_conditioned_residual and self._run.stage_count > 1
+        )
         stage_index = (
-            step_id % self._run.stage_count
-            if self._run.stochastic_multistage
-            else 0
+            step_id % self._run.stage_count if use_multistage_topology else 0
         )
         if self._run.separate_stage_histories:
             self.forecaster = self._stage_forecasters[stage_index]
@@ -1049,7 +1103,7 @@ class SpectrumH3Runtime:
                 mode="replay",
                 reason="offline smoothing replay",
                 stage_index=stage_index,
-                state_residual_mode=self._run.stochastic_multistage,
+                state_residual_mode=self._run.state_conditioned_residual,
             )
             self._run.next_step_id += 1
             return {
@@ -1060,15 +1114,14 @@ class SpectrumH3Runtime:
                 "reason": "offline smoothing replay",
             }
 
+        use_multistage_topology = (
+            self._run.state_conditioned_residual and self._run.stage_count > 1
+        )
         policy_step_id = (
-            step_id // self._run.stage_count
-            if self._run.stochastic_multistage
-            else step_id
+            step_id // self._run.stage_count if use_multistage_topology else step_id
         )
         policy_total_steps = (
-            self._run.policy_steps
-            if self._run.stochastic_multistage
-            else self._run.total_steps
+            self._run.policy_steps if use_multistage_topology else self._run.total_steps
         )
         effective_tail = max(self.config.tail_actual_steps, self._run.min_tail_actual_steps)
         tail_start = max(0, policy_total_steps - effective_tail)
@@ -1095,6 +1148,9 @@ class SpectrumH3Runtime:
             actual, reason = True, "warmup"
         elif policy_step_id >= tail_start:
             actual, reason = True, "final actual tail"
+        elif step_id in self._run.forced_actual_step_ids:
+            actual, reason = True, "sampler-required exact step"
+            advances_window = self._run.forced_actual_steps_advance_window
         elif (
             self._run.forecastable_stage_indices is not None
             and stage_index not in self._run.forecastable_stage_indices
@@ -1107,7 +1163,7 @@ class SpectrumH3Runtime:
             actual, reason = True, "post-forecast stage-lane refresh"
         elif (
             self.config.bootstrap_first_forecast
-            and not self._run.stochastic_multistage
+            and not self._run.state_conditioned_residual
             and self.config.degree == 1
             and policy_step_id == 1
             and self.forecaster.history_length == 1
@@ -1199,7 +1255,7 @@ class SpectrumH3Runtime:
             mode="actual" if actual else "forecast",
             reason=reason,
             stage_index=stage_index,
-            state_residual_mode=self._run.stochastic_multistage,
+            state_residual_mode=self._run.state_conditioned_residual,
             bootstrap_forecast=bootstrap_forecast,
             rollback_replay=rollback_replay,
             consumes_feedback_refresh=consumes_feedback_refresh,
@@ -2487,7 +2543,7 @@ class SpectrumH3Runtime:
                 and not self._disabled
                 and (
                     step.step_id // self._run.stage_count
-                    if self._run.stochastic_multistage
+                    if self._run.state_conditioned_residual and self._run.stage_count > 1
                     else step.step_id
                 ) >= self.config.warmup_steps
             ):
@@ -2704,6 +2760,17 @@ class SpectrumH3Runtime:
     def end_rollback_replay(self) -> None:
         self._rollback_replay_active = False
 
+    def _feature_geometry_name(self) -> str:
+        if self._run is None or not self._run.state_conditioned_residual:
+            return "absolute_hidden"
+        if self._run.stage_count > 1:
+            return (
+                "state_conditioned_residual_stage_lanes"
+                if self._run.separate_stage_histories
+                else "state_conditioned_residual_shared_history"
+            )
+        return "state_conditioned_residual"
+
     def debug_summary(self) -> str:
         offline_archive_device = (
             self._offline_archive.history_device
@@ -2812,10 +2879,11 @@ class SpectrumH3Runtime:
             f"run_id={self.stats.run_id} sampler={self.stats.sampler_name} "
             f"steps={self.stats.total_steps} "
             f"stage_count={self._run.stage_count if self._run is not None else 1} "
-            f"stochastic_multistage={self._run.stochastic_multistage if self._run is not None else False} "
+            f"state_conditioned_residual={self._run.state_conditioned_residual if self._run is not None else False} "
             f"stage_histories={'separate' if self._run is not None and self._run.separate_stage_histories else 'shared'} "
-            f"feature_geometry={('state_residual_stage_lanes' if self._run.separate_stage_histories else 'state_residual_shared_history') if self._run is not None and self._run.stochastic_multistage else 'absolute_hidden'} "
+            f"feature_geometry={self._feature_geometry_name()} "
             f"forecastable_stages={self._run.forecastable_stage_indices if self._run is not None else None} "
+            f"forced_actual_steps={len(self._run.forced_actual_step_ids) if self._run is not None else 0} "
             f"stage_refresh_pending={sum(self._stage_required_actual_refreshes.values())} "
             f"actual_steps={self.stats.actual_steps} "
             f"forecast_steps={self.stats.forecast_steps} "

@@ -142,9 +142,9 @@ def _apply_exact_state_input_embedding_(
 ) -> torch.Tensor:
     """Add/subtract H3's exact target input embedding without running transformer blocks."""
     if target.ndim != 3 or target.shape[0] != 1:
-        raise ValueError("state-residual target must be a batch-one [1, rows, hidden] tensor")
+        raise ValueError("state-conditioned residual target must be a batch-one [1, rows, hidden] tensor")
     if target.shape[-1] != int(inner.hidden_size):
-        raise ValueError("state-residual target hidden width does not match native H3")
+        raise ValueError("state-conditioned residual target hidden width does not match native H3")
 
     module = _native_module(inner)
     common_dit = importlib.import_module("comfy.ldm.common_dit")
@@ -161,7 +161,7 @@ def _apply_exact_state_input_embedding_(
     total_rows = int(audio_rows.shape[0] + video_rows.shape[0])
     if compact.shape[0] != total_rows:
         raise ValueError(
-            "state-residual target rows do not match native H3 audio/video input rows"
+            "state-conditioned residual target rows do not match native H3 audio/video input rows"
         )
 
     element_size = torch.empty((), dtype=compact.dtype).element_size()
@@ -434,14 +434,14 @@ def _execute_actual(
     actual_target = None
     state_input_target = None
 
-    if runtime.active_state_residual_mode and first_index != last_index:
+    if runtime.active_state_conditioned_residual and first_index != last_index:
         def capture_state_input(args, replacement_context):
             nonlocal state_input_target
             hidden = args.get("img")
             (aa, _), (_, vb) = target_segments(layout)
             if not torch.is_tensor(hidden) or hidden.ndim != 2 or hidden.shape[0] < vb:
                 raise RuntimeError(
-                    "initial MiniMax H3 hidden feature is incompatible with state-residual forecasting"
+                    "initial MiniMax H3 hidden feature is incompatible with state-conditioned residual forecasting"
                 )
             state_input_target = hidden[aa:vb].detach().clone(
                 memory_format=torch.contiguous_format
@@ -468,7 +468,7 @@ def _execute_actual(
         # second full target tensor on the GPU before the required CPU archive.
         target = hidden[aa:vb].unsqueeze(0)
         actual_target = target
-        if runtime.active_state_residual_mode:
+        if runtime.active_state_conditioned_residual:
             try:
                 if state_input_target is None:
                     # This only applies to an unexpected one-block native contract.
@@ -502,7 +502,7 @@ def _execute_actual(
                 runtime.fallback_current_step(
                     run_id,
                     step_id,
-                    f"SEEDS state-residual actual transform failed: {exc}",
+                    f"state-conditioned residual actual transform failed: {exc}",
                 )
                 runtime.observe_actual(run_id, step_id, call_id, target)
         else:
@@ -775,7 +775,7 @@ def diffusion_model_wrapper(
             kwargs,
         )
 
-    if runtime.active_state_residual_mode:
+    if runtime.active_state_conditioned_residual:
         try:
             _apply_exact_state_input_embedding_(
                 predicted,
@@ -790,7 +790,7 @@ def diffusion_model_wrapper(
             runtime.fallback_current_step(
                 int(run_id),
                 int(step_id),
-                f"SEEDS state-residual forecast reconstruction failed: {exc}",
+                f"state-conditioned residual forecast reconstruction failed: {exc}",
             )
             return _execute_actual(
                 executor,
@@ -855,7 +855,7 @@ def diffusion_model_wrapper(
             run_id,
             step_id,
             runtime.active_stage_index,
-            "state_residual" if runtime.active_state_residual_mode else "absolute_hidden",
+            "state_conditioned_residual" if runtime.active_state_conditioned_residual else "absolute_hidden",
             runtime.last_prediction_chunk_count,
             runtime.prediction_history_length,
         )

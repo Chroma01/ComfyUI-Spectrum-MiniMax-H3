@@ -15,6 +15,8 @@ from comfyui_spectrum_h3.sampling import (
     ER_SDE_DEFAULT_NOISE_SAMPLER_DIGEST,
     ER_SDE_KSAMPLER_SAMPLE_DIGEST,
     ER_SDE_NATIVE_FUNCTION_DIGEST,
+    SA_SOLVER_HELPER_DIGESTS,
+    SA_SOLVER_NATIVE_FUNCTION_DIGESTS,
     SEEDS_NATIVE_FUNCTION_DIGESTS,
 )
 
@@ -432,6 +434,83 @@ def test_native_seeds_stage_topology_matches_reviewed_contract(function_name, st
     assert len(_named_calls(function, "model")) == stage_count
     assert len(_named_calls(loops[0], "noise_sampler")) == stage_count
     assert _ast_digest(function) == SEEDS_NATIVE_FUNCTION_DIGESTS[function_name]
+
+
+def test_native_sa_solver_topology_matches_reviewed_pec_pece_contract():
+    function = _native_sampling_functions()["sample_sa_solver"]
+    loops = [node for node in function.body if isinstance(node, (ast.For, ast.AsyncFor))]
+
+    assert len(loops) == 1
+    model_calls = sorted(_named_calls(loops[0], "model"), key=lambda node: node.lineno)
+    callback_calls = sorted(
+        _named_calls(loops[0], "callback"), key=lambda node: node.lineno
+    )
+    noise_calls = sorted(
+        _named_calls(loops[0], "noise_sampler"), key=lambda node: node.lineno
+    )
+    assert len(model_calls) == 2
+    assert len(callback_calls) == 1
+    assert len(noise_calls) == 1
+    assert model_calls[0].lineno < callback_calls[0].lineno < model_calls[1].lineno
+    pece_branch = next(
+        node
+        for node in ast.walk(loops[0])
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "use_pece"
+    )
+    assert model_calls[1] in list(ast.walk(pece_branch))
+    assert _ast_digest(function) == SA_SOLVER_NATIVE_FUNCTION_DIGESTS[
+        "sample_sa_solver"
+    ]
+
+
+def test_native_sa_solver_pece_delegates_once_with_pece_enabled():
+    function = _native_sampling_functions()["sample_sa_solver_pece"]
+    calls = _named_calls(function, "sample_sa_solver")
+
+    assert len(calls) == 1
+    use_pece = next(keyword for keyword in calls[0].keywords if keyword.arg == "use_pece")
+    assert isinstance(use_pece.value, ast.Constant)
+    assert use_pece.value.value is True
+    assert _ast_digest(function) == SA_SOLVER_NATIVE_FUNCTION_DIGESTS[
+        "sample_sa_solver_pece"
+    ]
+
+
+def test_native_sa_solver_math_helpers_match_reviewed_contract():
+    helpers = {
+        node.name: node
+        for node in _native_tree("comfy/k_diffusion/sa_solver.py").body
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+
+    for name, expected_digest in SA_SOLVER_HELPER_DIGESTS.items():
+        assert _ast_digest(helpers[name]) == expected_digest
+
+
+@pytest.mark.parametrize("mutation", ("extra_model_call", "remove_noise_draw"))
+def test_sa_solver_topology_mutations_change_fail_closed_digest(mutation):
+    function = copy.deepcopy(_native_sampling_functions()["sample_sa_solver"])
+    loop = next(node for node in function.body if isinstance(node, ast.For))
+
+    if mutation == "extra_model_call":
+        first_model_assignment = next(
+            node
+            for node in loop.body
+            if isinstance(node, ast.Assign)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "model"
+        )
+        loop.body.insert(loop.body.index(first_model_assignment) + 1, copy.deepcopy(first_model_assignment))
+    else:
+        noise_call = _named_calls(loop, "noise_sampler")[0]
+        noise_call.func = ast.Name(id="changed_noise_source", ctx=ast.Load())
+
+    assert _ast_digest(function) != SA_SOLVER_NATIVE_FUNCTION_DIGESTS[
+        "sample_sa_solver"
+    ]
 
 
 @pytest.mark.parametrize("function_name", RES_VARIANTS)

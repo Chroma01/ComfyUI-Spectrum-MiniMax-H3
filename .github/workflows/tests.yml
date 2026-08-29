@@ -108,6 +108,7 @@ jobs:
             tests/test_continuum_interop.py \
             tests/test_er_sde_solver_dense_output.py \
             tests/test_er_sde_stochastic_compensation.py \
+            tests/test_sa_solver_state_conditioning.py \
             tests/test_seeds_deterministic_contract.py \
             tests/test_generic_correction.py \
             tests/test_generic_correction_calibration.py \
@@ -151,7 +152,8 @@ jobs:
             tests/test_sampling.py \
             tests/test_model_aware.py \
             tests/test_native_equivalence.py \
-            tests/test_er_sde_stochastic_compensation.py
+            tests/test_er_sde_stochastic_compensation.py \
+            tests/test_sa_solver_state_conditioning.py
 
       - name: Run tests against native MiniMax H3
         env:
@@ -170,4 +172,5 @@ jobs:
             --ignore=tests/test_sampling.py \
             --ignore=tests/test_model_aware.py \
             --ignore=tests/test_native_equivalence.py \
-            --ignore=tests/test_er_sde_stochastic_compensation.py
+            --ignore=tests/test_er_sde_stochastic_compensation.py \
+            --ignore=tests/test_sa_solver_state_conditioning.py

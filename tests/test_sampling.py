@@ -49,6 +49,8 @@ def _sampler(function_name: str) -> SimpleNamespace:
         "sample_res_multistep_cfg_pp",
         "sample_seeds_2",
         "sample_seeds_3",
+        "sample_sa_solver",
+        "sample_sa_solver_pece",
     ),
 )
 def test_reviewed_samplers_are_supported(function_name):
@@ -117,6 +119,27 @@ def test_non_res_policy_keeps_one_refresh_and_user_tail(function_name):
     assert min_tail_actual_steps(sampler) == 0
 
 
+@pytest.mark.parametrize("function_name", ("sample_sa_solver", "sample_sa_solver_pece"))
+def test_sa_policy_separates_stochastic_tail_burst_from_deterministic_refresh(function_name):
+    sampler = _sampler(function_name)
+    sampler.extra_options = {}
+
+    assert max_consecutive_forecasts(sampler) == 1
+    assert min_actual_steps_after_forecast(sampler) == 0
+    assert min_tail_actual_steps(sampler) == 0
+
+    sampler.extra_options = {"s_noise": 0.0}
+    assert max_consecutive_forecasts(sampler) == 1
+    assert min_actual_steps_after_forecast(sampler) == 4
+
+    sampler.extra_options = {
+        "s_noise": 0.0,
+        "predictor_order": 2,
+        "corrector_order": 0,
+    }
+    assert min_actual_steps_after_forecast(sampler) == 2
+
+
 def test_unsupported_sampler_has_no_forecast_streak_policy():
     sampler = _sampler("sample_euler_ancestral")
 
@@ -144,6 +167,68 @@ def test_seeds_expected_model_calls_tracks_internal_stages(
         _seeds_expected_model_calls(_sampler(function_name), torch.tensor(sigmas))
         == expected
     )
+
+
+class _FakeSASampling:
+    noise_scale = 1.0
+
+    @staticmethod
+    def percent_to_sigma(percent):
+        return {0.2: 0.8, 0.8: 0.2}[percent]
+
+
+def test_sa_stochastic_protection_matches_native_tau_input_without_history_preroll():
+    sampler = _sampler("sample_sa_solver")
+    sampler.extra_options = {}
+    sigmas = torch.tensor([1.0, 0.9, 0.8, 0.7, 0.6, 0.5, 0.4, 0.3, 0.2, 0.1, 0.0])
+
+    forced, stochastic, reason = sampling_module._sa_solver_stochastic_protection(
+        sampler,
+        sigmas,
+        _FakeSASampling(),
+    )
+
+    assert reason is None
+    assert stochastic == (3, 4, 5, 6, 7, 8)
+    # Stochastic inputs remain observable, but the solver-aware adapter now
+    # handles them by isolating forecasted denoisers from persistent Adams
+    # history instead of blanket-forcing the whole interval actual.
+    assert forced == ()
+
+
+def test_sa_stochastic_protection_respects_zero_noise_and_zero_eta():
+    sigmas = torch.tensor([1.0, 0.8, 0.6, 0.4, 0.2, 0.0])
+
+    sampler = _sampler("sample_sa_solver")
+    sampler.extra_options = {"s_noise": 0.0}
+    forced, stochastic, reason = sampling_module._sa_solver_stochastic_protection(
+        sampler,
+        sigmas,
+        _FakeSASampling(),
+    )
+    assert reason is None
+    assert forced == ()
+    assert stochastic == ()
+
+    class ZeroEtaSampling(_FakeSASampling):
+        pass
+
+    native_sa_solver = pytest.importorskip(
+        "comfy.k_diffusion.sa_solver",
+        reason="native SA tau provenance requires an installed ComfyUI",
+    )
+
+    sampler.extra_options = {
+        "tau_func": native_sa_solver.get_tau_interval_func(0.8, 0.2, eta=0.0),
+    }
+    forced, stochastic, reason = sampling_module._sa_solver_stochastic_protection(
+        sampler,
+        sigmas,
+        ZeroEtaSampling(),
+    )
+    assert reason is None
+    assert forced == ()
+    assert stochastic == ()
 
 
 @pytest.mark.parametrize(
@@ -279,7 +364,7 @@ def test_stochastic_seeds_outer_wrapper_enters_state_residual_spectrum(monkeypat
     assert calls[0][4] is False
     assert runtime.active_run_id is None
     assert "running the untouched native sampler" not in caplog.text
-    assert "feature_geometry=state_residual_shared_history" in caplog.text
+    assert "feature_geometry=state_conditioned_residual_shared_history" in caplog.text
     assert "stage_histories=shared" in caplog.text
 
 
@@ -331,7 +416,7 @@ def test_stochastic_seeds_offline_request_runs_one_causal_spectrum_pass(monkeypa
     assert active_runs[0][0] is not None
     assert active_runs[0][1] is True
     assert active_runs[0][2] is None
-    assert "one causal state-residual Spectrum pass" in caplog.text
+    assert "one causal state-conditioned Spectrum pass" in caplog.text
 
 
 @pytest.mark.parametrize(

@@ -57,7 +57,8 @@ SUPPORTED_SINGLE_CALL_SAMPLERS = frozenset(
 )
 
 SEEDS_SAMPLERS = frozenset({"sample_seeds_2", "sample_seeds_3"})
-SUPPORTED_SAMPLERS = SUPPORTED_SINGLE_CALL_SAMPLERS | SEEDS_SAMPLERS
+SA_SOLVER_SAMPLERS = frozenset({"sample_sa_solver", "sample_sa_solver_pece"})
+SUPPORTED_SAMPLERS = SUPPORTED_SINGLE_CALL_SAMPLERS | SEEDS_SAMPLERS | SA_SOLVER_SAMPLERS
 SEEDS_STAGE_COUNTS = {"sample_seeds_2": 2, "sample_seeds_3": 3}
 SEEDS_NATIVE_FUNCTION_DIGESTS = {
     "sample_seeds_2": "e7bcf519718453f77e7ade9b71678c1b593472c8e9b0af142f64f97a9267f383",
@@ -66,6 +67,41 @@ SEEDS_NATIVE_FUNCTION_DIGESTS = {
 SEEDS_TRACKED_OPTIONS = {
     "sample_seeds_2": frozenset({"eta", "s_noise", "noise_sampler", "r", "solver_type"}),
     "sample_seeds_3": frozenset({"eta", "s_noise", "noise_sampler", "r_1", "r_2"}),
+}
+
+
+SA_SOLVER_NATIVE_FUNCTION_DIGESTS = {
+    "sample_sa_solver": "37bd2f94f27426b9e3e6f0cc2a0f439c95d3fec927339e0a7cc2c64e731647a4",
+    "sample_sa_solver_pece": "6ce4b3d604ef789d69a8abf832cf93637646e387039e494e37bf9ed35e9b23a0",
+}
+SA_SOLVER_HELPER_DIGESTS = {
+    "compute_exponential_coeffs": "d1bcd6cfa194ceec7a4e497c205ba59dfb3824d2816a5e159df67b57845ce72e",
+    "compute_simple_stochastic_adams_b_coeffs": "46d46ac17ec32e6c0a047d0f45d9e0e3734efb9fbf64b2fb984aa9311354c4c6",
+    "compute_stochastic_adams_b_coeffs": "f2480f0fc36f70f48909779e9604fa9dcb4e2a475b0040fd83c6e9e01f65e6e2",
+    "get_tau_interval_func": "f301a5d271a219a7f8b709e264327477945ddb7b2cadd40d700392c987afb3bb",
+}
+SA_SOLVER_TRACKED_OPTIONS = {
+    "sample_sa_solver": frozenset(
+        {
+            "tau_func",
+            "s_noise",
+            "noise_sampler",
+            "predictor_order",
+            "corrector_order",
+            "use_pece",
+            "simple_order_2",
+        }
+    ),
+    "sample_sa_solver_pece": frozenset(
+        {
+            "tau_func",
+            "s_noise",
+            "noise_sampler",
+            "predictor_order",
+            "corrector_order",
+            "simple_order_2",
+        }
+    ),
 }
 
 RES_MULTISTEP_SAMPLERS = frozenset(
@@ -175,6 +211,310 @@ def _seeds_stage_schedule_reason(sigmas: Any) -> str | None:
         return "SEEDS sigma schedule ends at a negative sigma"
     if bool((values[1:] >= values[:-1]).any().item()):
         return "SEEDS sigma schedule is not strictly descending"
+    return None
+
+
+def _sa_solver_expected_model_calls(sampler: Any, sigmas: Any) -> int | None:
+    """Count native SA-Solver denoiser calls, including active PECE evaluations."""
+    name = sampler_name(sampler)
+    if name not in SA_SOLVER_SAMPLERS:
+        return None
+    if not torch.is_tensor(sigmas) or sigmas.ndim != 1:
+        return None
+    options = getattr(sampler, "extra_options", {}) or {}
+    if not isinstance(options, dict):
+        return None
+    corrector_order = options.get("corrector_order", 4)
+    if type(corrector_order) is not int or corrector_order < 0:
+        return None
+    use_pece = name == "sample_sa_solver_pece" or options.get("use_pece", False) is True
+    outer_steps = max(0, int(sigmas.numel()) - 1)
+    if not use_pece or corrector_order == 0 or outer_steps == 0:
+        return outer_steps
+    return 2 * outer_steps - 1
+
+
+def _sa_solver_prefix_model_calls(
+    sampler: Any,
+    sigmas: Any,
+    outer_prefix: int,
+) -> int | None:
+    """Translate Continuum's outer-step prefix into native SA model-call space."""
+    if not torch.is_tensor(sigmas) or sigmas.ndim != 1:
+        return None
+    outer_steps = max(0, int(sigmas.numel()) - 1)
+    prefix_steps = min(max(0, int(outer_prefix)), outer_steps)
+    if prefix_steps == 0:
+        return 0
+    return _sa_solver_expected_model_calls(sampler, sigmas[: prefix_steps + 1])
+
+
+def _sa_solver_tau_values(tau_func: Any) -> dict[str, float] | None:
+    """Return reviewed native tau closure values without executing the callback."""
+    if tau_func is None:
+        return None
+
+    try:
+        import comfy.k_diffusion.sa_solver as native_sa_solver
+    except ImportError:
+        return None
+
+    if getattr(tau_func, "__module__", None) != "comfy.k_diffusion.sa_solver":
+        return None
+    if getattr(tau_func, "__qualname__", None) != (
+        "get_tau_interval_func.<locals>.tau_func"
+    ):
+        return None
+    code = getattr(tau_func, "__code__", None)
+    if code is None or tuple(code.co_freevars) != (
+        "end_sigma",
+        "eta",
+        "start_sigma",
+    ):
+        return None
+    if getattr(tau_func, "__globals__", None) is not vars(native_sa_solver):
+        return None
+    outer_code = getattr(native_sa_solver.get_tau_interval_func, "__code__", None)
+    if outer_code is None or code not in outer_code.co_consts:
+        return None
+    closure = getattr(tau_func, "__closure__", None) or ()
+    if len(closure) != 3:
+        return None
+
+    values: dict[str, float] = {}
+    for name, cell in zip(code.co_freevars, closure, strict=True):
+        try:
+            value = cell.cell_contents
+        except ValueError:
+            return None
+        if type(value) not in (int, float):
+            return None
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            return None
+        values[name] = numeric
+    return values
+
+
+def _sa_solver_tau_func_is_reviewed(tau_func: Any) -> bool:
+    if tau_func is None:
+        return True
+    values = _sa_solver_tau_values(tau_func)
+    return values is not None and values["eta"] >= 0.0
+
+
+def _sa_solver_is_stochastic(sampler: Any) -> bool:
+    """Conservatively detect whether native SA may inject noise during this run."""
+    options = getattr(sampler, "extra_options", {}) or {}
+    if not isinstance(options, dict):
+        return True
+    s_noise = options.get("s_noise", 1.0)
+    if type(s_noise) not in (int, float) or not math.isfinite(float(s_noise)):
+        return True
+    if float(s_noise) <= 0.0:
+        return False
+    tau_func = options.get("tau_func")
+    if tau_func is None:
+        return True
+    values = _sa_solver_tau_values(tau_func)
+    if values is None:
+        return True
+    return values["eta"] > 0.0
+
+
+def _sa_solver_stochastic_protection(
+    sampler: Any,
+    sigmas: Any,
+    model_sampling: Any,
+) -> tuple[tuple[int, ...] | None, tuple[int, ...] | None, str | None]:
+    """Resolve native SA stochastic-input steps for telemetry and fail-closed review.
+
+    Spectrum's SA adapter no longer blanket-forces these calls actual. The
+    previous policy attacked the symptom by removing most usable forecasts.
+    Instead the solver-aware adapter prevents a forecasted denoiser from entering
+    persistent Adams history: a forecast is an ephemeral predictor input for its
+    current interval only, while exact H3 evaluations are the only values kept as
+    multistep history. Fresh stochastic x_pred states can therefore be forecast
+    without recursively poisoning later Adams stencils.
+    """
+    if not torch.is_tensor(sigmas) or sigmas.ndim != 1 or sigmas.numel() < 2:
+        return None, None, "SA-Solver sigma schedule is not a one-dimensional tensor"
+    options = getattr(sampler, "extra_options", {}) or {}
+    if not isinstance(options, dict):
+        return None, None, "SA-Solver sampler options are not a dictionary"
+
+    try:
+        configured_s_noise = float(options.get("s_noise", 1.0))
+        noise_scale = float(getattr(model_sampling, "noise_scale", 1.0))
+        effective_s_noise = configured_s_noise * noise_scale
+    except (TypeError, ValueError):
+        return None, None, "SA-Solver effective s_noise is not numeric"
+    if not math.isfinite(effective_s_noise) or effective_s_noise < 0.0:
+        return None, None, "SA-Solver effective s_noise is not finite and nonnegative"
+    if effective_s_noise == 0.0:
+        return (), (), None
+
+    tau_func = options.get("tau_func")
+    if tau_func is None:
+        try:
+            start_sigma = float(model_sampling.percent_to_sigma(0.2))
+            end_sigma = float(model_sampling.percent_to_sigma(0.8))
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            return None, None, f"SA-Solver default tau interval is unavailable: {exc}"
+        eta = 1.0
+    else:
+        values = _sa_solver_tau_values(tau_func)
+        if values is None:
+            return None, None, "SA-Solver tau interval provenance is unavailable"
+        start_sigma = values["start_sigma"]
+        end_sigma = values["end_sigma"]
+        eta = values["eta"]
+
+    if not all(math.isfinite(value) for value in (start_sigma, end_sigma, eta)):
+        return None, None, "SA-Solver tau interval contains nonfinite values"
+    if eta <= 0.0:
+        return (), (), None
+
+    sigma_values = sigmas.detach().reshape(-1).to(device="cpu", dtype=torch.float64)
+    if not bool(torch.isfinite(sigma_values).all().item()):
+        return None, None, "SA-Solver sigma schedule contains nonfinite values"
+    outer_steps = max(0, int(sigma_values.numel()) - 1)
+    stochastic_input_steps = tuple(
+        step_id
+        for step_id in range(1, outer_steps)
+        if start_sigma >= float(sigma_values[step_id].item()) >= end_sigma
+    )
+    if not stochastic_input_steps:
+        return (), (), None
+
+    return (), stochastic_input_steps, None
+
+
+def _sa_solver_option_contract(name: str, options: Any) -> str | None:
+    """Validate the native SA option surface without executing user callbacks."""
+    if name not in SA_SOLVER_SAMPLERS:
+        return f"{name!r} is not a reviewed SA-Solver sampler"
+    if not isinstance(options, dict):
+        return "SA-Solver sampler options are not a dictionary"
+
+    unknown = set(options) - SA_SOLVER_TRACKED_OPTIONS[name]
+    if unknown:
+        return f"SA-Solver sampler has unreviewed options: {sorted(unknown)}"
+
+    s_noise = options.get("s_noise", 1.0)
+    if type(s_noise) not in (int, float) or not math.isfinite(float(s_noise)):
+        return "SA-Solver s_noise must be a finite numeric value"
+    if float(s_noise) < 0.0:
+        return "SA-Solver s_noise must be nonnegative"
+
+    for option_name, default, minimum in (
+        ("predictor_order", 3, 1),
+        ("corrector_order", 4, 0),
+    ):
+        value = options.get(option_name, default)
+        if type(value) is not int or not minimum <= value <= 6:
+            return f"SA-Solver {option_name} must be an integer in [{minimum}, 6]"
+
+    if type(options.get("simple_order_2", False)) is not bool:
+        return "SA-Solver simple_order_2 must be boolean"
+
+    use_pece = name == "sample_sa_solver_pece"
+    if name == "sample_sa_solver":
+        configured_use_pece = options.get("use_pece", False)
+        if type(configured_use_pece) is not bool:
+            return "SA-Solver use_pece must be boolean"
+        use_pece = configured_use_pece
+    if use_pece and options.get("corrector_order", 4) > 0:
+        return (
+            "SA-Solver PECE with an active corrector has duplicate-sigma "
+            "predicted/corrected states and is not reviewed for Spectrum forecasting"
+        )
+
+    noise_sampler = options.get("noise_sampler")
+    if noise_sampler is not None and not callable(noise_sampler):
+        return "SA-Solver noise_sampler must be callable or None"
+    if not _sa_solver_tau_func_is_reviewed(options.get("tau_func")):
+        return (
+            "SA-Solver tau_func must be None or the reviewed native "
+            "get_tau_interval_func closure"
+        )
+    return None
+
+
+def _sa_solver_sampler_contract(sampler: Any) -> tuple[bool, str | None]:
+    """Validate native SA-Solver topology, solver helpers, and adapter ownership."""
+    import comfy.k_diffusion.sa_solver as native_sa_solver
+    import comfy.k_diffusion.sampling as native_sampling
+    import comfy.samplers
+
+    name = sampler_name(sampler)
+    if name not in SA_SOLVER_SAMPLERS:
+        return False, f"{name!r} is not a reviewed SA-Solver sampler"
+
+    function = getattr(sampler, "sampler_function", None)
+    if function is not getattr(native_sampling, name, None):
+        return False, f"sampler function is not native ComfyUI {name}"
+    if function_ast_digest(function) != SA_SOLVER_NATIVE_FUNCTION_DIGESTS[name]:
+        return False, f"native {name} implementation is not a reviewed revision"
+    if (
+        function_ast_digest(native_sampling.sample_sa_solver)
+        != SA_SOLVER_NATIVE_FUNCTION_DIGESTS["sample_sa_solver"]
+    ):
+        return False, "native sample_sa_solver core is not a reviewed revision"
+    for helper_name, expected_digest in SA_SOLVER_HELPER_DIGESTS.items():
+        helper = getattr(native_sa_solver, helper_name, None)
+        if function_ast_digest(helper) != expected_digest:
+            return False, f"native SA-Solver helper {helper_name} is unreviewed"
+    if (
+        function_ast_digest(native_sampling.default_noise_sampler)
+        != ER_SDE_DEFAULT_NOISE_SAMPLER_DIGEST
+    ):
+        return False, "native default_noise_sampler implementation is not reviewed"
+
+    if type(sampler) is not comfy.samplers.KSAMPLER:
+        return False, "SA-Solver sampler object is not native ComfyUI KSAMPLER"
+    if (
+        comfy.samplers.KSAMPLER.__module__ != "comfy.samplers"
+        or comfy.samplers.KSAMPLER.__name__ != "KSAMPLER"
+    ):
+        return False, "native ComfyUI KSAMPLER class provenance is unreviewed"
+    if (
+        comfy.samplers.KSamplerX0Inpaint.__module__ != "comfy.samplers"
+        or comfy.samplers.KSamplerX0Inpaint.__name__ != "KSamplerX0Inpaint"
+    ):
+        return False, "native KSamplerX0Inpaint adapter provenance is unreviewed"
+    sample_contract = _ksampler_sample_contract(sampler)
+    if not sample_contract.accepted:
+        return False, (
+            f"KSAMPLER.sample contract rejected: {sample_contract.failure}; "
+            f"{sample_contract.provenance.log_fields()}"
+        )
+
+    options = getattr(sampler, "extra_options", {}) or {}
+    option_reason = _sa_solver_option_contract(name, options)
+    if option_reason is not None:
+        return False, option_reason
+    return True, None
+
+
+def _native_sa_solver_preflight_reason(
+    sampler: Any,
+    model_options: dict[str, Any] | None,
+) -> str | None:
+    """Resolve reviewed SA failures before Spectrum retains any run state."""
+    supported, reason = _sa_solver_sampler_contract(sampler)
+    if not supported:
+        return reason or "native SA-Solver contract is unproven"
+
+    import comfy.patcher_extension
+
+    wrappers = comfy.patcher_extension.get_all_wrappers(
+        comfy.patcher_extension.WrappersMP.SAMPLER_SAMPLE,
+        model_options or {},
+        is_model_options=True,
+    )
+    if len(wrappers) != 1 or wrappers[0] is not sampler_sample_wrapper:
+        return "another SAMPLER_SAMPLE wrapper makes SA-Solver ordering unproven"
     return None
 
 
@@ -348,6 +688,10 @@ def sampler_supports_seeded_replay(sampler: Any) -> bool:
         return False
 
     name = sampler_name(sampler)
+    if name in SA_SOLVER_SAMPLERS:
+        # SA-Solver is a multistep method: replaying altered denoiser values
+        # changes its Adams history even when the RNG itself is reproducible.
+        return False
     if name in SEEDS_SAMPLERS:
         options = getattr(sampler, "extra_options", {}) or {}
         if _seeds_option_contract(name, options) is not None:
@@ -408,6 +752,490 @@ def _copy_ksampler_with_options(
     except Exception as exc:  # noqa: BLE001 - fail closed on custom runtime state
         return None, f"KSAMPLER copied-state validation failed: {type(exc).__name__}: {exc}"
     return copied, None
+
+
+def _sa_predict_causal_denoised(
+    actual_preds: list[torch.Tensor],
+    actual_lambdas: list[torch.Tensor],
+    actual_steps: list[int],
+    *,
+    target_lambda: torch.Tensor,
+    target_step: int,
+    continuum_active: bool = False,
+) -> tuple[torch.Tensor, str, tuple[int, ...], torch.Tensor]:
+    """Predict SA's denoised variable directly from exact actual anchors.
+
+    Fresh SA predictor noise changes the model input in a direction that cannot be
+    reconstructed exactly when the H3 transformer is skipped. During an active
+    stochastic interval, do not feed the hidden-feature forecast into SA's Adams
+    equations. Instead extrapolate the solver-space denoised trajectory from exact
+    H3 anchors only. The extrapolation is causal and bounded to one previous
+    anchor interval; any untrusted geometry degenerates to a latest-actual hold.
+    """
+    if not (
+        len(actual_preds) == len(actual_lambdas) == len(actual_steps)
+        and actual_preds
+    ):
+        raise RuntimeError(
+            "stochastic SA dense output requires aligned non-empty actual anchors"
+        )
+
+    latest_value = actual_preds[-1]
+    latest_lambda = actual_lambdas[-1]
+    latest_step = int(actual_steps[-1])
+    if latest_step >= int(target_step):
+        raise RuntimeError(
+            "stochastic SA dense-output anchor is not strictly earlier than target"
+        )
+    if int(target_step) != latest_step + 1:
+        raise RuntimeError(
+            "stochastic SA dense output requires the latest actual anchor immediately "
+            f"before the forecast (anchor={latest_step}, forecast={target_step})"
+        )
+
+    zero = target_lambda.new_zeros(())
+    if continuum_active:
+        return (
+            latest_value.clone(memory_format=torch.contiguous_format),
+            "latest_actual_hold_continuum",
+            (latest_step,),
+            zero,
+        )
+    if len(actual_preds) == 1:
+        return (
+            latest_value.clone(memory_format=torch.contiguous_format),
+            "latest_actual_hold",
+            (latest_step,),
+            zero,
+        )
+
+    previous_value = actual_preds[-2]
+    previous_lambda = actual_lambdas[-2]
+    previous_step = int(actual_steps[-2])
+    if (
+        previous_value.shape != latest_value.shape
+        or previous_value.device != latest_value.device
+        or previous_value.dtype != latest_value.dtype
+    ):
+        raise RuntimeError("stochastic SA dense-output actual anchors are incompatible")
+
+    # Consecutive exact anchors usually mean warmup, a hard transition, or an
+    # externally forced refresh. There is no crossed forecast interval to justify
+    # a secant extrapolation yet, so hold the newest exact denoised value.
+    if latest_step - previous_step == 1:
+        return (
+            latest_value.clone(memory_format=torch.contiguous_format),
+            "latest_actual_hold_consecutive_anchors",
+            (latest_step,),
+            zero,
+        )
+
+    denominator = latest_lambda - previous_lambda
+    advance = target_lambda - latest_lambda
+    alpha = advance / denominator
+    scale = torch.maximum(
+        torch.maximum(previous_lambda.abs(), latest_lambda.abs()),
+        torch.ones_like(latest_lambda),
+    )
+    valid = (
+        torch.isfinite(alpha)
+        & torch.isfinite(denominator)
+        & (denominator.abs() > 1e-12 * scale)
+        & (denominator * advance >= 0.0)
+        & (alpha >= -1e-6)
+        & (alpha <= 1.0 + 1e-6)
+    )
+    bounded_alpha = alpha.clamp(0.0, 1.0)
+    weight = torch.where(valid, bounded_alpha, torch.zeros_like(bounded_alpha))
+    weight = weight.to(device=latest_value.device, dtype=latest_value.dtype)
+    predicted = torch.lerp(latest_value, previous_value, -weight)
+    return (
+        predicted,
+        "lambda_bounded_extrapolation",
+        (previous_step, latest_step),
+        weight,
+    )
+
+
+def _sample_sa_solver_forecast_isolated(
+    runtime: SpectrumH3Runtime,
+    model: Any,
+    x: torch.Tensor,
+    sigmas: torch.Tensor,
+    *,
+    extra_args: dict[str, Any] | None = None,
+    callback: Any = None,
+    disable: bool = False,
+    tau_func: Any = None,
+    s_noise: float = 1.0,
+    noise_sampler: Any = None,
+    predictor_order: int = 3,
+    corrector_order: int = 4,
+    use_pece: bool = False,
+    simple_order_2: bool = False,
+    continuum_active: bool = False,
+) -> torch.Tensor:
+    """Run reviewed SA equations without persisting forecasted denoisers in Adams history.
+
+    Exact H3 evaluations are retained with their real lambda coordinates.
+    Forecasted denoisers are ephemeral: they participate in the native current-step
+    PEC corrector and predictor, but they are never inserted into persistent
+    multistep history. The next exact evaluation therefore re-anchors both the
+    Spectrum forecaster and the SA Adams stencil instead of recursively consuming
+    old forecasts.
+
+    Stochastic SA owns its predictor noise separately from the denoiser history.
+    The exact H3 model can respond to the random increment already present in
+    x_pred; a skipped transformer cannot reconstruct that response. During active
+    stochastic intervals, a Spectrum feature forecast is therefore used only to
+    complete the runtime transaction; SA itself consumes a bounded causal
+    solver-space denoised prediction built from exact actual anchors.
+
+    Continuum continuation chunks are a stricter regime because part of the H3
+    target is an exact protected prefix while the remaining temporal region is
+    generated. The first Continuum hold experiment removed secant extrapolation
+    only inside SA's stochastic interval, but real media retained the same
+    oscillation/flashing artifact. That run still used raw Spectrum denoisers at
+    the non-stochastic forecast endpoints (steps 2 and 17 in the 19-step default
+    schedule). Continuum therefore uses the newest exact denoised anchor as a
+    zero-order dense output for every forecast coordinate, not only stochastic
+    ones. This completely removes hidden-feature forecast values from the SA
+    numerical trajectory for continuation chunks while preserving the 11/8 NFE
+    budget. Native x_pred, stochastic noise, corrector equations, predictor
+    equations, and RNG draws remain unchanged.
+    """
+    if use_pece and corrector_order > 0:
+        raise RuntimeError("active SA-Solver PECE is not supported by the isolated-history adapter")
+    if len(sigmas) <= 1:
+        return x
+
+    import comfy.k_diffusion.sa_solver as native_sa_solver
+    import comfy.k_diffusion.sampling as native_sampling
+    from tqdm.auto import trange
+
+    extra_args = {} if extra_args is None else extra_args
+    seed = extra_args.get("seed", None)
+    noise_sampler = (
+        native_sampling.default_noise_sampler(x, seed=seed)
+        if noise_sampler is None
+        else noise_sampler
+    )
+    s_in = x.new_ones([x.shape[0]])
+
+    model_sampling = model.inner_model.model_patcher.get_model_object("model_sampling")
+    s_noise = s_noise * getattr(model_sampling, "noise_scale", 1.0)
+    sigmas = native_sampling.offset_first_sigma_for_snr(sigmas, model_sampling)
+    lambdas = native_sampling.sigma_to_half_log_snr(
+        sigmas,
+        model_sampling=model_sampling,
+    )
+
+    if tau_func is None:
+        start_sigma = model_sampling.percent_to_sigma(0.2)
+        end_sigma = model_sampling.percent_to_sigma(0.8)
+        tau_func = native_sa_solver.get_tau_interval_func(
+            start_sigma,
+            end_sigma,
+            eta=1.0,
+        )
+
+    max_used_order = max(predictor_order, corrector_order)
+    x_pred = x
+    h = 0.0
+    tau_t = 0.0
+    noise = 0.0
+    actual_preds: list[torch.Tensor] = []
+    actual_lambdas: list[torch.Tensor] = []
+    actual_steps: list[int] = []
+    lower_order_to_end = sigmas[-1].item() == 0
+
+    for i in trange(len(sigmas) - 1, disable=disable):
+        raw_denoised = model(
+            x_pred,
+            sigmas[i] * s_in,
+            **extra_args,
+        )
+
+        mode = runtime.last_completed_mode
+        if mode not in {"actual", "forecast"}:
+            raise RuntimeError(
+                "Spectrum SA adapter could not determine whether the H3 evaluation "
+                f"at outer step {i} was actual or forecast"
+            )
+        actual = mode == "actual"
+        denoised = raw_denoised
+        solver_space_forecast = bool(
+            not actual
+            and (
+                continuum_active
+                or (tau_t > 0 and s_noise > 0)
+            )
+        )
+        if solver_space_forecast:
+            denoised, dense_mode, anchor_steps, dense_alpha = _sa_predict_causal_denoised(
+                actual_preds,
+                actual_lambdas,
+                actual_steps,
+                target_lambda=lambdas[i],
+                target_step=i,
+                continuum_active=continuum_active,
+            )
+            if runtime.config.debug:
+                alpha_value = float(dense_alpha.detach().to(device="cpu").item())
+                LOG.warning(
+                    "Spectrum H3 SA dense output step=%s scope=%s mode=%s "
+                    "anchor_steps=%s alpha=%.8f raw_feature_forecast=ignored "
+                    "solver_history=actual_only",
+                    i,
+                    "continuum_all_forecasts" if continuum_active else "stochastic",
+                    dense_mode,
+                    anchor_steps,
+                    alpha_value,
+                )
+
+        if callback is not None:
+            callback(
+                {
+                    "x": x_pred,
+                    "i": i,
+                    "sigma": sigmas[i],
+                    "sigma_hat": sigmas[i],
+                    "denoised": denoised,
+                }
+            )
+
+        if actual:
+            actual_preds.append(denoised)
+            actual_lambdas.append(lambdas[i])
+            actual_steps.append(i)
+            if len(actual_preds) > max_used_order:
+                actual_preds = actual_preds[-max_used_order:]
+                actual_lambdas = actual_lambdas[-max_used_order:]
+                actual_steps = actual_steps[-max_used_order:]
+
+        stencil_preds = list(actual_preds)
+        stencil_lambdas = list(actual_lambdas)
+        if not actual:
+            stencil_preds.append(denoised)
+            stencil_lambdas.append(lambdas[i])
+        if len(stencil_preds) > max_used_order:
+            stencil_preds = stencil_preds[-max_used_order:]
+            stencil_lambdas = stencil_lambdas[-max_used_order:]
+        if not stencil_preds:
+            raise RuntimeError("Spectrum SA adapter has no denoiser value for the active predictor")
+
+        predictor_order_used = min(predictor_order, len(stencil_preds))
+        if i == 0 or (sigmas[i + 1] == 0 and not use_pece):
+            corrector_order_used = 0
+        else:
+            # A forecast is not persistent Adams evidence, but it is still the
+            # current SA endpoint estimate. Native PEC uses that endpoint in the
+            # current corrector before constructing the next predictor state.
+            # Dropping this correction causes the forecast error to appear one
+            # step later in the next exact model input.
+            corrector_order_used = min(corrector_order, len(stencil_preds))
+
+        if lower_order_to_end:
+            predictor_order_used = min(
+                predictor_order_used,
+                len(sigmas) - 2 - i,
+            )
+            corrector_order_used = min(
+                corrector_order_used,
+                len(sigmas) - 1 - i,
+            )
+
+        if corrector_order_used == 0:
+            x = x_pred
+        else:
+            curr_lambdas = torch.stack(
+                stencil_lambdas[-corrector_order_used:]
+            )
+            b_coeffs = native_sa_solver.compute_stochastic_adams_b_coeffs(
+                sigmas[i],
+                curr_lambdas,
+                lambdas[i - 1],
+                lambdas[i],
+                tau_t,
+                simple_order_2,
+                is_corrector_step=True,
+            )
+            pred_mat = torch.stack(
+                stencil_preds[-corrector_order_used:],
+                dim=1,
+            )
+            corr_res = torch.tensordot(
+                pred_mat,
+                b_coeffs,
+                dims=([1], [0]),
+            )
+            x = (
+                sigmas[i]
+                / sigmas[i - 1]
+                * (-(tau_t**2) * h).exp()
+                * x
+                + corr_res
+            )
+            if tau_t > 0 and s_noise > 0:
+                x = x + noise
+
+        if sigmas[i + 1] == 0:
+            x_pred = denoised
+            continue
+
+        tau_t = tau_func(sigmas[i + 1])
+        curr_lambdas = torch.stack(
+            stencil_lambdas[-predictor_order_used:]
+        )
+        b_coeffs = native_sa_solver.compute_stochastic_adams_b_coeffs(
+            sigmas[i + 1],
+            curr_lambdas,
+            lambdas[i],
+            lambdas[i + 1],
+            tau_t,
+            simple_order_2,
+            is_corrector_step=False,
+        )
+        pred_mat = torch.stack(
+            stencil_preds[-predictor_order_used:],
+            dim=1,
+        )
+        pred_res = torch.tensordot(
+            pred_mat,
+            b_coeffs,
+            dims=([1], [0]),
+        )
+        h = lambdas[i + 1] - lambdas[i]
+        x_pred = (
+            sigmas[i + 1]
+            / sigmas[i]
+            * (-(tau_t**2) * h).exp()
+            * x
+            + pred_res
+        )
+
+        if tau_t > 0 and s_noise > 0:
+            noise = (
+                noise_sampler(sigmas[i], sigmas[i + 1])
+                * sigmas[i + 1]
+                * (-2 * tau_t**2 * h).expm1().neg().sqrt()
+                * s_noise
+            )
+            x_pred = x_pred + noise
+
+    return x_pred
+
+
+def _run_solver_aware_sa(
+    executor: Any,
+    runtime: SpectrumH3Runtime,
+    model_wrap: Any,
+    sigmas: torch.Tensor,
+    extra_args: dict[str, Any],
+    callback: Any,
+    noise: torch.Tensor,
+    latent_image: Any,
+    denoise_mask: Any,
+    disable_pbar: bool,
+) -> torch.Tensor:
+    """Execute SA through the reviewed isolated-history adapter."""
+    sampler = executor.class_obj
+    name = sampler_name(sampler)
+    if len(executor.wrappers) != 1:
+        runtime.disable_forecasting_for_run(
+            "another SAMPLER_SAMPLE wrapper makes SA isolated-history ordering unproven"
+        )
+        return executor(
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+
+    options = dict(getattr(sampler, "extra_options", {}) or {})
+    copied, copy_failure = _copy_ksampler_with_options(sampler, options)
+    if copy_failure is not None or copied is None:
+        runtime.disable_forecasting_for_run(
+            copy_failure or "SA KSAMPLER copy failed"
+        )
+        return executor(
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
+
+    use_pece = bool(
+        name == "sample_sa_solver_pece"
+        or options.get("use_pece", False) is True
+    )
+    continuum_active = _continuum_actual_prefix(
+        (extra_args or {}).get("model_options")
+    ) > 0
+    if use_pece and int(options.get("corrector_order", 4)) > 0:
+        raise RuntimeError(
+            "active SA-Solver PECE reached the isolated-history adapter after preflight"
+        )
+
+    def spectrum_sa_function(
+        model,
+        x,
+        run_sigmas,
+        extra_args=None,
+        callback=None,
+        disable=False,
+        **run_options,
+    ):
+        return _sample_sa_solver_forecast_isolated(
+            runtime,
+            model,
+            x,
+            run_sigmas,
+            extra_args=extra_args,
+            callback=callback,
+            disable=disable,
+            use_pece=use_pece,
+            continuum_active=continuum_active,
+            **run_options,
+        )
+
+    spectrum_sa_function.__name__ = f"{name}_spectrum_isolated_history"
+    copied.sampler_function = spectrum_sa_function
+    if getattr(sampler, "sampler_function", None) is getattr(
+        copied,
+        "sampler_function",
+        None,
+    ):
+        raise RuntimeError("SA isolated-history adapter mutated the original sampler")
+
+    if runtime.config.debug:
+        LOG.warning(
+            "Spectrum H3 SA adapter mode=isolated_adams_history "
+            "persistent=actual_only forecast_use=current_corrector+predictor_ephemeral "
+            "forecast_corrector=ephemeral_current_only "
+            "stochastic_forecast=solver_space_causal_dense_output "
+            "continuum_dense_mode=%s continuum_dense_scope=%s",
+            "latest_actual_hold" if continuum_active else "lambda_bounded_extrapolation",
+            "all_forecasts" if continuum_active else "stochastic_only",
+        )
+    return copied.sample(
+        model_wrap,
+        sigmas,
+        extra_args,
+        callback,
+        noise,
+        latent_image,
+        denoise_mask,
+        disable_pbar,
+    )
 
 
 def _refdelta_sampler_contract(
@@ -547,11 +1375,31 @@ def _native_er_sde_preflight_reason(
 
 
 def max_consecutive_forecasts(sampler: Any) -> int | None:
+    name = sampler_name(sampler)
+    if name in SA_SOLVER_SAMPLERS and _sa_solver_is_stochastic(sampler):
+        # Native SA stores every denoised result in pred_list and feeds that
+        # history back into both its corrector and predictor. Real H3 media
+        # validation showed that a multi-forecast tail can therefore become
+        # self-referential and catastrophically corrupt x_pred. Keep stochastic
+        # SA forecasts isolated so every skipped denoiser is bracketed by exact
+        # solver observations instead of allowing a forecast-only Adams window.
+        return 1
     return 1 if sampler_is_supported(sampler) else None
 
 
 def min_actual_steps_after_forecast(sampler: Any) -> int:
-    return 1 if sampler_name(sampler) in SUPPORTED_SAMPLERS else 0
+    name = sampler_name(sampler)
+    if name in SA_SOLVER_SAMPLERS:
+        if _sa_solver_is_stochastic(sampler):
+            return 0
+        options = getattr(sampler, "extra_options", {}) or {}
+        if isinstance(options, dict):
+            predictor_order = options.get("predictor_order", 3)
+            corrector_order = options.get("corrector_order", 4)
+            if type(predictor_order) is int and type(corrector_order) is int:
+                return max(1, predictor_order, corrector_order)
+        return 4
+    return 1 if name in SUPPORTED_SAMPLERS else 0
 
 
 def min_tail_actual_steps(sampler: Any) -> int:
@@ -669,6 +1517,30 @@ def outer_sample_wrapper(
     runtime = binding.runtime
     name = sampler_name(sampler)
     expected_model_calls = None
+    if name in SA_SOLVER_SAMPLERS:
+        preflight_reason = _native_sa_solver_preflight_reason(
+            sampler,
+            getattr(guider, "model_options", None),
+        )
+        expected_model_calls = _sa_solver_expected_model_calls(sampler, sigmas)
+        if preflight_reason is not None or expected_model_calls is None:
+            reason = preflight_reason or "SA-Solver model-call topology is unavailable"
+            LOG.warning(
+                "Spectrum H3 disabled for this SA-Solver run; running the untouched "
+                "native sampler because its predictor/corrector contract is unavailable: %s",
+                reason,
+            )
+            return executor(
+                noise,
+                latent_image,
+                sampler,
+                sigmas,
+                denoise_mask,
+                callback,
+                disable_pbar,
+                seed,
+                latent_shapes=latent_shapes,
+            )
     if name in SEEDS_SAMPLERS:
         preflight_reason = _native_seeds_preflight_reason(
             sampler,
@@ -735,10 +1607,60 @@ def outer_sample_wrapper(
     continuum_prefix = _continuum_actual_prefix(getattr(guider, "model_options", None))
     continuum_log_emitted = False
     stochastic_seeds = name in SEEDS_SAMPLERS and _seeds_is_stochastic(sampler)
+    stochastic_sa = name in SA_SOLVER_SAMPLERS and _sa_solver_is_stochastic(sampler)
+    state_conditioned_residual = stochastic_seeds or stochastic_sa
+    sa_forced_actual_steps: tuple[int, ...] = ()
+    sa_stochastic_input_steps: tuple[int, ...] = ()
+    if name in SA_SOLVER_SAMPLERS:
+        try:
+            model_sampling = guider.model_patcher.get_model_object("model_sampling")
+        except (AttributeError, RuntimeError, TypeError, ValueError) as exc:
+            LOG.warning(
+                "Spectrum H3 disabled for this SA-Solver run; running the untouched "
+                "native sampler because model_sampling is unavailable: %s",
+                exc,
+            )
+            return executor(
+                noise,
+                latent_image,
+                sampler,
+                sigmas,
+                denoise_mask,
+                callback,
+                disable_pbar,
+                seed,
+                latent_shapes=latent_shapes,
+            )
+        protected, stochastic_steps, protection_reason = _sa_solver_stochastic_protection(
+            sampler,
+            sigmas,
+            model_sampling,
+        )
+        if protection_reason is not None or protected is None or stochastic_steps is None:
+            reason = protection_reason or "SA-Solver stochastic protection is unavailable"
+            LOG.warning(
+                "Spectrum H3 disabled for this SA-Solver run; running the untouched "
+                "native sampler because its stochastic-state schedule is unavailable: %s",
+                reason,
+            )
+            return executor(
+                noise,
+                latent_image,
+                sampler,
+                sigmas,
+                denoise_mask,
+                callback,
+                disable_pbar,
+                seed,
+                latent_shapes=latent_shapes,
+            )
+        sa_stochastic_input_steps = stochastic_steps
+        sa_forced_actual_steps = protected
     profile_eligible = sampler_is_supported(sampler) and (
         not runtime.config.offline_smoothing_replay
         or sampler_supports_seeded_replay(sampler)
         or stochastic_seeds
+        or name in SA_SOLVER_SAMPLERS
     )
     if runtime.config.model_aware_mode != "off" and profile_eligible:
         try:
@@ -787,7 +1709,7 @@ def outer_sample_wrapper(
     ):
         nonlocal continuum_log_emitted
         phase_prefix = _continuum_prefix_for_phase(continuum_prefix, phase)
-        if expected_model_calls is not None and not stochastic_seeds:
+        if name in SEEDS_SAMPLERS and expected_model_calls is not None and not stochastic_seeds:
             expanded_prefix = _seeds_prefix_model_calls(
                 sampler,
                 run_sigmas,
@@ -806,14 +1728,20 @@ def outer_sample_wrapper(
             min_actual_prefix_steps=phase_prefix,
             expected_model_calls=expected_model_calls,
             stage_count=SEEDS_STAGE_COUNTS.get(name, 1),
-            stochastic_multistage=stochastic_seeds,
+            state_conditioned_residual=state_conditioned_residual,
             separate_stage_histories=False if stochastic_seeds else None,
             forecastable_stage_indices=(
                 tuple(range(1, SEEDS_STAGE_COUNTS[name]))
                 if stochastic_seeds
                 else None
             ),
-            model_aware_can_force_actual=not stochastic_seeds,
+            forced_actual_step_ids=(
+                sa_forced_actual_steps if name in SA_SOLVER_SAMPLERS else None
+            ),
+            forced_actual_steps_advance_window=bool(
+                name in SA_SOLVER_SAMPLERS and stochastic_sa
+            ),
+            model_aware_can_force_actual=not (stochastic_seeds or stochastic_sa),
         )
         if phase_prefix > 0 and runtime.supported_sampler and not continuum_log_emitted:
             LOG.warning(
@@ -828,18 +1756,22 @@ def outer_sample_wrapper(
             runtime.disable_experiment(
                 "ER-SDE is reviewed only for ordinary Spectrum and offline smoothing replay"
             )
-        if stochastic_seeds and (
+        if state_conditioned_residual and (
             runtime.config.anchor_residual_feedback
             or runtime.config.selective_rollback_correction
         ):
             runtime.disable_experiment(
-                "stochastic SEEDS uses stage-lane state-residual forecasting; "
-                "rollback/residual experiments are not reviewed for this geometry"
+                "state-conditioned sampler forecasting is not reviewed with "
+                "rollback/residual experiments"
             )
         if runtime.config.debug:
             LOG.warning(
                 "Spectrum H3 run start phase=%s run_id=%s sampler=%s steps=%s supported=%s "
-                "seeds_stochastic=%s stage_count=%s feature_geometry=%s stage_histories=%s "
+                "seeds_stochastic=%s sa_stochastic=%s stage_count=%s feature_geometry=%s "
+                "stage_histories=%s sa_stochastic_input_steps=%s "
+                "sa_forced_actual_steps=%s sa_post_forecast_refresh=%s "
+                "sa_max_forecast_streak=%s sa_exact_window_credit=%s "
+                "sa_adams_history=%s "
                 "model_aware_force_actual=%s",
                 phase,
                 run_id,
@@ -847,10 +1779,27 @@ def outer_sample_wrapper(
                 runtime.stats.total_steps,
                 runtime.supported_sampler,
                 stochastic_seeds,
+                stochastic_sa,
                 SEEDS_STAGE_COUNTS.get(name, 1),
-                "state_residual_shared_history" if stochastic_seeds else "absolute_hidden",
+                (
+                    "state_conditioned_residual_shared_history"
+                    if stochastic_seeds
+                    else "state_conditioned_residual"
+                    if state_conditioned_residual
+                    else "absolute_hidden"
+                ),
                 "shared" if stochastic_seeds else "single",
-                not stochastic_seeds,
+                sa_stochastic_input_steps,
+                sa_forced_actual_steps,
+                min_actual_steps_after_forecast(sampler) if name in SA_SOLVER_SAMPLERS else 0,
+                max_consecutive_forecasts(sampler) if name in SA_SOLVER_SAMPLERS else 0,
+                bool(name in SA_SOLVER_SAMPLERS and stochastic_sa),
+                (
+                    "actual_only_persistent+ephemeral_forecast"
+                    if name in SA_SOLVER_SAMPLERS
+                    else "-"
+                ),
+                not (stochastic_seeds or stochastic_sa),
             )
         started = time.perf_counter()
         try:
@@ -919,7 +1868,22 @@ def outer_sample_wrapper(
             LOG.warning(
                 "Spectrum H3 offline smoothing replay is disabled for stochastic SEEDS "
                 "because replay must not replace its Markov-preserving noise-conditioned "
-                "stage evaluations; running one causal state-residual Spectrum pass"
+                "stage evaluations; running one causal state-conditioned Spectrum pass"
+            )
+            return execute_run(
+                noise,
+                latent_image,
+                sigmas,
+                denoise_mask,
+                callback,
+                disable_pbar,
+                phase="single_pass_replay_fallback",
+            )
+        if name in SA_SOLVER_SAMPLERS:
+            LOG.warning(
+                "Spectrum H3 offline smoothing replay is disabled for SA-Solver because "
+                "replaying changed denoiser values would change native Adams history; "
+                "running one causal Spectrum pass"
             )
             return execute_run(
                 noise,
@@ -1463,6 +2427,19 @@ def sampler_sample_wrapper(
         )
     runtime = binding.runtime
     sampler = executor.class_obj
+    if sampler_name(sampler) in SA_SOLVER_SAMPLERS:
+        return _run_solver_aware_sa(
+            executor,
+            runtime,
+            model_wrap,
+            sigmas,
+            extra_args,
+            callback,
+            noise,
+            latent_image,
+            denoise_mask,
+            disable_pbar,
+        )
     if sampler_name(sampler) in ER_SDE_SAMPLERS:
         return _run_tracked_er_sde(
             executor,

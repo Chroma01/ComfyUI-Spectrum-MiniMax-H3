@@ -230,6 +230,77 @@ def test_stochastic_seeds_state_residual_forecast_uses_exact_current_input_and_s
     runtime.end_run(run_id)
 
 
+def test_sa_solver_state_conditioned_forecast_uses_exact_current_input_and_skips_blocks():
+    _, _, PackedLayout = _native_imports()
+    model, blocks = _tiny_state_residual_model()
+    base_x, context, payload = _inputs(PackedLayout)
+    runtime = SpectrumH3Runtime(
+        SpectrumH3Config(
+            degree=1,
+            max_history=4,
+            model_aware_mode="off",
+            warmup_steps=0,
+            tail_actual_steps=0,
+            bootstrap_first_forecast=False,
+            window_size=2.0,
+            flex_window=0.0,
+            offline_smoothing_replay=False,
+        )
+    )
+    run_id = runtime.start_run(
+        torch.tensor([1.0, 0.7, 0.4, 0.0]),
+        "sample_sa_solver",
+        supported_sampler=True,
+        max_consecutive_forecasts=1,
+        min_actual_steps_after_forecast=0,
+        expected_model_calls=3,
+        stage_count=1,
+        state_conditioned_residual=True,
+    )
+
+    for index, sigma in enumerate((1.0, 0.7)):
+        x = [
+            base_x[0] + 0.12 * index,
+            base_x[1] - 0.09 * index,
+        ]
+        output, decision = _wrapped_call(
+            model,
+            runtime,
+            sigma,
+            sigma * 1000.0,
+            x,
+            context,
+            payload,
+        )
+        assert decision["actual"]
+        assert all(torch.isfinite(part).all() for part in output)
+
+    calls_before_forecast = [block.calls for block in blocks]
+    forecast_x = [
+        base_x[0] + 0.55,
+        base_x[1] - 0.35,
+    ]
+    output, decision = _wrapped_call(
+        model,
+        runtime,
+        0.4,
+        400.0,
+        forecast_x,
+        context,
+        payload,
+    )
+
+    assert decision["actual"] is False
+    assert runtime.active_stage_index == 0
+    assert runtime.state_conditioned_residual is True
+    assert runtime.stochastic_multistage is False
+    assert [block.calls for block in blocks] == calls_before_forecast
+    assert all(torch.isfinite(part).all() for part in output)
+    assert runtime.stats.actual_transformer_calls == 2
+    assert runtime.stats.forecast_model_calls == 1
+    runtime.end_run(run_id)
+
+
 def test_forced_actual_wrapper_is_native_equivalent_and_does_not_mutate_options():
     _, _, PackedLayout = _native_imports()
     model, _ = _tiny_model()
