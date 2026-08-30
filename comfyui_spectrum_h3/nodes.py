@@ -282,6 +282,21 @@ class SpectrumApplyMiniMaxH3:
                         ),
                     },
                 ),
+                # Appended last so existing saved workflow widget arrays retain
+                # the positional meaning of every older Spectrum input.
+                "sa_pece_forecast_policy": (
+                    ["max_speed", "balanced", "stable_start"],
+                    {
+                        "default": "balanced",
+                        "tooltip": (
+                            "Active SA-Solver PECE only. balanced is the released default after matched production testing; "
+                            "it keeps P0/P1 exact (clean 10-step topology: 11 actual / 8 forecast). max_speed protects only P0 "
+                            "(10/9) and trades one more actual evaluation for speed, while stable_start keeps P0/P1/P2 exact "
+                            "(12/7). Continuum, hard patch transitions, fallbacks, force-actual conditions, and a larger "
+                            "warmup_steps value always remain authoritative."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -318,6 +333,7 @@ class SpectrumApplyMiniMaxH3:
         generic_correction_limiter="hard_clip",
         generic_correction_limit=0.40,
         generic_correction_attenuation="no_attenuation",
+        sa_pece_forecast_policy="balanced",
     ):
         if not enabled:
             return (model,)
@@ -370,6 +386,7 @@ class SpectrumApplyMiniMaxH3:
             generic_correction_attenuation=str(generic_correction_attenuation),
             generic_correction_limiter=str(generic_correction_limiter),
             generic_correction_limit=float(generic_correction_limit),
+            sa_pece_forecast_policy=str(sa_pece_forecast_policy),
             debug=bool(debug),
         ).validate()
         patched = model.clone()

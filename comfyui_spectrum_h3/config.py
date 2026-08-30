@@ -32,6 +32,7 @@ class SpectrumH3Config:
     generic_correction_limiter: str = "hard_clip"
     generic_correction_limit: float = 0.40
     generic_correction_attenuation: str = "no_attenuation"
+    sa_pece_forecast_policy: str = "balanced"
 
     def __post_init__(self) -> None:
         trajectory_modes = {
@@ -175,6 +176,14 @@ class SpectrumH3Config:
                 "generic_correction_attenuation must be 'mode_default', "
                 "'no_attenuation', 'general_confidence', 'correction_reliability', "
                 "or 'combined_conservative'"
+            )
+        if not isinstance(self.sa_pece_forecast_policy, str) or self.sa_pece_forecast_policy not in {
+            "balanced",
+            "stable_start",
+            "max_speed",
+        }:
+            raise ValueError(
+                "sa_pece_forecast_policy must be 'balanced', 'stable_start', or 'max_speed'"
             )
         if self.generic_correction_limiter not in {
             "rational",
