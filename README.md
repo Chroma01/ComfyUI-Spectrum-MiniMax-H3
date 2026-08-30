@@ -10,6 +10,13 @@ Spectrum is an **approximate accelerator**. Forecasted steps change the denoisin
 
 Full release details are kept in [RELEASE_NOTES.md](RELEASE_NOTES.md) and the GitHub release pages.
 
+### v0.2.23 — Active SA-Solver PECE + RefDelta multi-backend composition
+
+- Adds full active SA-Solver PECE acceleration with explicit predicted/corrected phase ownership and actual-only persistent endpoints.
+- Makes **`balanced` the default PECE forecast policy** after matched production testing; `max_speed` remains the higher-speed option and `stable_start` the more conservative option.
+- Adds Spectrum composition for RefDelta Solver v0.6.0 SEEDS-2/3, SA-Solver PEC, and SA-Solver PECE backends while preserving RefDelta's actual-only evidence ownership.
+- Final production testing with DiffAid, Untwist-RoPE and H3 Continuum produced acceptable decoded media with both balanced and max-speed PECE; balanced was perceptually preferred in the tested workflow.
+
 ### v0.2.22 — Native SEEDS-2/3 and SA-Solver support
 
 - Adds reviewed native Spectrum support for stochastic SEEDS-2/3 using exact-current-state input reconstruction plus transformer-residual forecasting, with the outer stochastic SEEDS stage kept exact.
@@ -109,6 +116,7 @@ generic_correction_mode = coordinate_rls
 generic_correction_attenuation = no_attenuation
 generic_correction_limiter = hard_clip
 generic_correction_limit = 0.40
+sa_pece_forecast_policy = balanced
 anchor_residual_feedback = false
 selective_rollback_correction = false
 ```
@@ -198,11 +206,52 @@ Forecasting is fail-closed and allowlisted for reviewed sampler contracts.
 | RES multistep | `sample_res_multistep` | Conservative cadence with protected native tail. |
 | RES multistep CFG++ | `sample_res_multistep_cfg_pp` | Same RES safeguards. |
 | SEEDS-2 | `sample_seeds_2` | Stochastic outer stage stays exact; internal stage uses exact-current-state + transformer-residual forecasting with shared interleaved history. |
+| RefDelta SEEDS-2 | `sample_refdelta_seeds_2` | Same Spectrum SEEDS stage policy; RefDelta keeps actual-only outer trajectory evidence and reuses one stochastic gate across the native correlated SEEDS noise segments. |
 | SEEDS-3 | `sample_seeds_3` | Same state-conditioned residual architecture; more conservative because two internal stages occur between exact outer anchors. |
+| RefDelta SEEDS-3 | `sample_refdelta_seeds_3` | Same Spectrum SEEDS-3 stage policy with RefDelta outer-trajectory correction and one frozen gate across all three native stochastic segments. |
 | SA-Solver PEC | `sample_sa_solver` | Actual-only persistent Adams history plus causal solver-space dense output; isolated forecasts re-anchor on the next exact H3 evaluation. |
+| RefDelta SA-Solver PEC | `sample_refdelta_sa_solver` | RefDelta trajectory/stochastic control composed around Spectrum's actual-only isolated PEC adapter. |
 | SA-Solver PECE | `sample_sa_solver` / `sample_sa_solver_pece` | Active correctors use explicit predicted/corrected phases; P0 plus exact corrected endpoints own shared persistent history, while later predicted phases are solver-space forecasts unless a correctness boundary promotes them. |
+| RefDelta SA-Solver PECE | `sample_refdelta_sa_solver_pece` | Same Spectrum active-PECE endpoint topology and user-selected PECE forecast policy; RefDelta keeps P0/C_i actual endpoint evidence and uses the corrected endpoint to own trajectory/stochastic state. |
 
 Unknown or changed sampler contracts fall back to native execution rather than guessing.
+
+### RefDelta sampler-family composition
+
+The RefDelta Stability Sampler can select `er_sde`, `seeds_2`, `seeds_3`,
+`sa_solver`, or `sa_solver_pece`. Spectrum recognizes the corresponding RefDelta
+sampler functions through a separate versioned backend contract. The existing ER-SDE exact-increment contract remains
+unchanged.
+
+For RefDelta SEEDS, Spectrum still owns the reviewed state-conditioned internal-stage
+forecast topology. RefDelta observes/corrects the outer denoiser trajectory only. Its
+stochastic controller resolves one gate for the outer interval and applies that same gate
+to each native SEEDS noise segment, so Spectrum forecasting does not alter the correlated
+noise construction.
+
+For RefDelta SA-Solver PEC, Spectrum's isolated-history PEC adapter remains the solver
+owner: only actual denoisers enter persistent Adams history and forecast denoisers are
+ephemeral current-interval inputs.
+
+For RefDelta SA-Solver PECE, the same active-PECE adapter used by native
+`sample_sa_solver_pece` remains authoritative. Spectrum owns predicted/corrected phase
+scheduling, solver-space forecast substitution, Continuum protection, external hard
+transitions, and `sa_pece_forecast_policy`. RefDelta wraps the model/noise path around
+that adapter and mirrors native endpoint replacement for its own evidence:
+
+```text
+persistent RefDelta evidence = P0, C1, C2, ...
+ephemeral RefDelta PECE calls = P1, P2, P3, ...
+```
+
+A predicted P_i may be an actual H3 evaluation or a Spectrum forecast, but it never becomes
+a second same-coordinate RefDelta history anchor. Every persistent PECE endpoint must be
+actual; a forecasted C_i fails closed.
+
+The backend bridge classifies each completed Spectrum logical model call as actual or
+forecast. RefDelta uses only actual outer calls as trajectory anchors. Offline smoothing
+replay is intentionally disabled for RefDelta SEEDS/SA composition because the backend
+evidence contract is defined on the live causal trajectory.
 
 For SEEDS-2/3, every denoiser stage is a real MiniMax H3 model-evaluation opportunity and therefore a Spectrum logical model call. A terminal-zero schedule contains `2N - 1` H3 evaluations for SEEDS-2 and `3N - 2` for SEEDS-3 when the outer sampler has `N` sigma intervals.
 

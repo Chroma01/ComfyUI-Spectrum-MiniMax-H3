@@ -1,3 +1,68 @@
+# Spectrum MiniMax H3 v0.2.23
+
+v0.2.23 completes the SA-Solver PECE and RefDelta multi-backend integration and makes **`balanced` the default active-PECE forecast policy** after matched MiniMax-H3 production testing.
+
+## Active SA-Solver PECE
+
+Spectrum now models native ComfyUI PECE as explicit predicted/corrected evaluations:
+
+```text
+P0
+P1 C1
+P2 C2
+...
+```
+
+- `P0` and exact corrected `C_i` evaluations own persistent Spectrum/Adams history.
+- Later predicted `P_i` evaluations are ephemeral current-corrector inputs and never become persistent Adams evidence.
+- Forecasted predicted phases use causal solver-space dense output derived only from exact persistent endpoints; Spectrum's raw hidden-feature forecast is not consumed numerically by SA at that boundary.
+- Every corrected phase remains an exact H3 re-anchor.
+- Native sigma/tau/noise/RNG ordering, stochastic variance, predictor/corrector equations, PECE endpoint replacement, callbacks, and terminal behavior remain unchanged.
+- H3 Continuum prefixes and DiffAid/Untwist hard transitions remain authoritative actual-evaluation boundaries.
+
+## PECE quality/speed policy
+
+`sa_pece_forecast_policy` exposes three reviewed start cadences:
+
+- **`balanced` (default):** P0/P1 exact; clean 10-outer topology is 11 actual / 8 forecast.
+- `max_speed`: P0 exact; clean 10-outer topology is 10 actual / 9 forecast.
+- `stable_start`: P0/P1/P2 exact; clean 10-outer topology is 12 actual / 7 forecast.
+
+Real production stacks may be more conservative because Continuum prefixes, external hard transitions, user warmup, fallbacks, and force-actual conditions take precedence.
+
+Final matched 10-outer testing with runtime LoRA/DoRA hooks, DiffAid, Untwist-RoPE, RefDelta SA-Solver PECE, Spectrum full/model-aware mode, and H3 Continuum produced acceptable decoded output with both `max_speed` and `balanced`. The **balanced run was perceptually better** in the tested workflow, so it is now the release default. The early coarse/colored-shape previews seen during the first few denoising steps also occur with other MiniMax-H3 samplers and are not treated as a PECE correctness failure.
+
+The reviewed maximum-speed production trace completed at 12 actual / 7 forecast for the initial chunk and 13 actual / 6 forecast for the Continuum chunk after hard-transition and Continuum promotions, with zero fallbacks, bypasses, rollbacks, speculative calls, discarded actual calls, or external-patch contract failures.
+
+## RefDelta SEEDS / SA-Solver composition
+
+Spectrum now composes with the RefDelta Solver v0.6.0 sampler family:
+
+- `sample_refdelta_seeds_2`;
+- `sample_refdelta_seeds_3`;
+- `sample_refdelta_sa_solver`;
+- `sample_refdelta_sa_solver_pece`.
+
+RefDelta keeps its own reviewed evidence topology while Spectrum owns forecast scheduling. For PECE, RefDelta persistent evidence mirrors native endpoint replacement—`P0, C1, C2, ...`—and later predicted calls remain ephemeral even when a safety boundary makes one actual. Forecasted persistent endpoints fail closed.
+
+RefDelta SEEDS/SA composition remains causal-only under Spectrum, and unsupported multi-GPU clone paths bypass Spectrum rather than weakening the interop contract. ER-SDE's existing exact-gated-increment contract is unchanged.
+
+The cross-repository CI fixture is pinned to RefDelta Solver v0.6.0 commit:
+
+```text
+21d0191d933fedf2885df082d33eb1bc2fffd529
+```
+
+## Scheduler evidence
+
+The companion RefDelta dedicated SA-Solver scheduler media gate also completed. Exact `simple_control` was slightly preferred over `simple_adams_bounded`, while both produced acceptable decoded output. Spectrum does not own that outer scheduler choice; its PECE forecast policy remains independent.
+
+## Validation
+
+The final release branch retains the eight-lane reviewed ComfyUI/Python matrix, native MiniMax-H3 fixtures, RefDelta cross-repository fixtures, Ruff, compileall, and wheel build. Existing Euler, ER-SDE, RES multistep, native SEEDS, ordinary SA-Solver PEC, Continuum, external-patch, generic-correction, and saved-workflow behavior remain isolated from the new active-PECE policy.
+
+---
+
 # Spectrum MiniMax H3 v0.2.22
 
 v0.2.22 adds reviewed native Spectrum support for ComfyUI **SEEDS-2, SEEDS-3, and SA-Solver**, including the stochastic MiniMax H3 paths that required sampler-specific state handling rather than ordinary one-call forecasting.
