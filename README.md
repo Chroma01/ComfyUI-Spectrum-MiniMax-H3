@@ -1,6 +1,12 @@
 # ComfyUI Spectrum MiniMax H3
 
-Training-free feature forecasting for ComfyUI's native **MiniMax H3 audio-video model**.
+A native ComfyUI MiniMax H3 implementation of **Spectrum**, the training-free spectral diffusion feature forecasting method introduced by **Jiaqi Han, Juntong Shi, Puheng Li, Haotian Ye, Qiushan Guo, and Stefano Ermon** in [*Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration*](https://arxiv.org/abs/2603.01623).
+
+**Original Spectrum:** [Paper](https://arxiv.org/abs/2603.01623) · [Project page](https://hanjq17.github.io/Spectrum/) · [Official implementation](https://github.com/hanjq17/Spectrum)
+
+This repository adapts Spectrum to ComfyUI's native **MiniMax H3 audio-video model** and extends the integration around MiniMax H3's packed audio/video representation, ComfyUI sampler contracts, stochastic and multistage samplers, replay, and the other H3-specific compatibility paths documented below. The implementation in this repository is standalone; the Spectrum paper and official implementation are the primary upstream references for the spectral forecasting method.
+
+The core forecasting approach comes from Spectrum: denoiser features are treated as functions over diffusion time and approximated with Chebyshev polynomial bases whose coefficients are fitted online with ridge regression, allowing selected future feature states to be forecast without a full denoiser evaluation.
 
 Spectrum reduces the number of expensive H3 transformer evaluations during sampling. Actual steps run native MiniMax H3 and retain the packed target hidden state after the final transformer block. Forecast steps predict that state from previous actual anchors, skip the H3 transformer blocks for that step, and continue through the native output/sampler path.
 
@@ -217,7 +223,6 @@ For ordinary deterministic/single-call samplers this hidden-state forecast is us
 ## Supported native path
 
 Spectrum targets native ComfyUI `comfy.ldm.minimax.model.MiniMaxH3Model` and the packed MiniMax H3 sampler path.
-
 Supported native generation layouts include:
 
 - text-to-video/audio (`t2va`)
@@ -437,7 +442,6 @@ That is 11 actual evaluations and 9 forecasts. Fallbacks, model-aware scheduling
 - `full` — scheduling plus the validated scalar generic correction.
 
 The shipping full-mode generic controller uses signed coordinate transport with scalar RLS and a hard `±0.40` gain bound. More experimental reliability/regional controller options remain available for research/reproduction but are not the production default.
-
 ## Deterministic external patches
 
 Spectrum consumes versioned pure-data compatibility metadata from reviewed MiniMax H3 patches that deterministically change transformer execution. These contracts are runtime metadata only; Spectrum does not import or hard-depend on the producing custom nodes.
@@ -639,6 +643,44 @@ For bug reports, include:
 ComfyUI serializes node widget values. Updating Spectrum does not rewrite existing serialized workflow widget values to current defaults.
 
 In particular, workflows saved on older releases retain the serialized values they already contain for `offline_smoothing_replay`, model-aware options, or generic-correction settings. Compare the saved node against the defaults above when reproducing behavior across versions.
+
+## Credits
+
+### Spectrum
+
+This project is based on **Spectrum — Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration**, created by:
+
+- **Jiaqi Han**
+- **Juntong Shi**
+- **Puheng Li**
+- **Haotian Ye**
+- **Qiushan Guo**
+- **Stefano Ermon**
+
+Original work:
+
+- **Paper:** [Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration](https://arxiv.org/abs/2603.01623)
+- **Project page:** [hanjq17.github.io/Spectrum](https://hanjq17.github.io/Spectrum/)
+- **Official implementation:** [hanjq17/Spectrum](https://github.com/hanjq17/Spectrum)
+
+Spectrum introduced the training-free spectral feature-forecasting approach used as the foundation of this project: modeling denoiser feature trajectories with Chebyshev polynomial bases, fitting their coefficients with ridge regression, and forecasting future diffusion-step features to avoid selected full network evaluations.
+
+If you use this project in research, please also cite the original Spectrum work:
+
+```bibtex
+@article{han2026adaptive,
+  title={Adaptive Spectral Feature Forecasting for Diffusion Sampling Acceleration},
+  author={Han, Jiaqi and Shi, Juntong and Li, Puheng and Ye, Haotian and Guo, Qiushan and Ermon, Stefano},
+  journal={arXiv preprint arXiv:2603.01623},
+  year={2026}
+}
+```
+
+### ComfyUI
+
+Thanks to the [ComfyUI](https://github.com/Comfy-Org/ComfyUI) maintainers and contributors for the native MiniMax H3 implementation, model-patching infrastructure, sampler APIs, packed latent support, model management, and the surrounding execution framework this integration builds on.
+
+This repository is an independent ComfyUI/MiniMax H3 implementation and integration. No source file from the official Spectrum implementation is vendored here.
 
 ## License
 
